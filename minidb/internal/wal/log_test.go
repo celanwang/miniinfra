@@ -1,12 +1,14 @@
 package wal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -115,15 +117,17 @@ func TestBatchIsWrittenBeforeFirstPublication(t *testing.T) {
 	log := &Log{file: file, queue: make(chan request, 2), done: make(chan struct{})}
 	first := make(chan error, 1)
 	second := make(chan error, 1)
-	expectedEnd := int64(len(magic) + 2*headerSize + len("firstsecond"))
+	large := bytes.Repeat([]byte("x"), maxStagedBytes+1)
+	firstEnd := int64(len(magic) + headerSize + len(large))
+	expectedEnd := firstEnd + int64(headerSize+len("second"))
 	var firstTiming, secondTiming CommitTiming
 	enqueued := time.Now()
-	log.queue <- request{payload: []byte("first"), result: first, timing: &firstTiming, enqueued: enqueued, publish: func(end int64) {
+	log.queue <- request{payload: large, result: first, timing: &firstTiming, enqueued: enqueued, publish: func(end int64) {
 		info, err := os.Stat(path)
 		if err != nil || info.Size() != expectedEnd {
 			t.Errorf("first publication did not follow the batch write: %v %v", info, err)
 		}
-		if end != int64(len(magic)+headerSize+len("first")) {
+		if end != firstEnd {
 			t.Errorf("wrong first transaction end: %d", end)
 		}
 	}}
@@ -143,6 +147,52 @@ func TestBatchIsWrittenBeforeFirstPublication(t *testing.T) {
 		t.Fatalf("invalid batch timings: %+v and %+v", firstTiming, secondTiming)
 	}
 }
+
+func TestBatchStagingIsBoundedAndPreservesFrames(t *testing.T) {
+	nearlyFull := bytes.Repeat([]byte("x"), maxStagedBytes-headerSize-1)
+	large := bytes.Repeat([]byte("y"), maxStagedBytes+1)
+	small, tail := []byte("short"), []byte("tail")
+	batch := []request{{payload: nearlyFull}, {payload: small}, {payload: large}, {payload: tail}}
+	staging := make([]byte, 0, maxStagedBytes)
+	var got, expected bytes.Buffer
+	var lengths []int
+	writer := walWriterFunc(func(p []byte) (int, error) {
+		lengths = append(lengths, len(p))
+		if len(p) > maxStagedBytes {
+			if &p[0] != &large[0] {
+				t.Error("oversized payload was copied")
+			}
+		} else if cap(p) != maxStagedBytes || &p[0] != &staging[:cap(staging)][0] {
+			t.Error("staged write used a different backing buffer")
+		}
+		return got.Write(p)
+	})
+	if err := writeBatch(writer, batch, staging); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeBatch(writer, batch[len(batch)-1:], staging); err != nil {
+		t.Fatal(err)
+	}
+	wantLengths := []int{maxStagedBytes - 1, 2*headerSize + len(small), len(large), headerSize + len(tail), headerSize + len(tail)}
+	if !slices.Equal(lengths, wantLengths) {
+		t.Fatalf("write lengths = %v, want %v", lengths, wantLengths)
+	}
+	batch = append(batch, request{payload: tail})
+	for _, item := range batch {
+		header := binary.BigEndian.AppendUint32(nil, uint32(len(item.payload)))
+		header = binary.BigEndian.AppendUint32(header, crc32.ChecksumIEEE(item.payload))
+		header = binary.BigEndian.AppendUint32(header, crc32.ChecksumIEEE(header))
+		expected.Write(header)
+		expected.Write(item.payload)
+	}
+	if !bytes.Equal(got.Bytes(), expected.Bytes()) {
+		t.Fatal("mixed batch changed WAL frame bytes")
+	}
+}
+
+type walWriterFunc func([]byte) (int, error)
+
+func (write walWriterFunc) Write(p []byte) (int, error) { return write(p) }
 
 func TestWriteFailurePreventsPublication(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wal")
