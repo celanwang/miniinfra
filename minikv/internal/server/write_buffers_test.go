@@ -61,6 +61,12 @@ func TestLargeWritesKeepBufferOwnershipAndFrameBoundary(t *testing.T) {
 	c.value(t, payload)
 	c.exchange(t, set(replace, ""), "STORED\n")
 	c.exchange(t, set(wrong, " NX"), "EXISTS\n")
+	before := s.cache.Stats(0).UsedBytes
+	adjacent := strings.Repeat("d", len(replace)-1)
+	c.exchange(t, set(adjacent, ""), "STORED\n")
+	if bytes := s.cache.Stats(0).UsedBytes; bytes != before-1 {
+		t.Fatalf("adjacent write charged %d bytes, want %d", bytes, before-1)
+	}
 
 	// A rejected frame followed by a GET on the same connection must leave
 	// both the existing value and the next request frame intact.
@@ -71,7 +77,7 @@ func TestLargeWritesKeepBufferOwnershipAndFrameBoundary(t *testing.T) {
 		done <- err
 	}()
 	c.line(t, "NO_SPACE\n")
-	c.value(t, replace)
+	c.value(t, adjacent)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -82,5 +88,5 @@ func TestLargeWritesKeepBufferOwnershipAndFrameBoundary(t *testing.T) {
 	waitBudget(t, &s.inbound, 0)
 	other := s.pipe(t)
 	other.send(t, "GET 1\nk")
-	other.value(t, replace)
+	other.value(t, adjacent)
 }

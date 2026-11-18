@@ -21,7 +21,7 @@ type pressurePhase struct {
 	P99Microseconds float64
 }
 
-func runPressure(target target) map[string]any {
+func runPressure(target target, lengths string) map[string]any {
 	result := make(map[string]any)
 	prefill := fill(target, "fill", 32, 100000, 1024)
 	result["Prefill"] = prefill
@@ -102,7 +102,8 @@ func runPressure(target target) map[string]any {
 			statuses := make(map[outcome]int)
 			writeResults[i] = statuses
 			for k := i; k < 256; k += writers {
-				cmd := target.makeCommand(fmt.Sprintf("large%06d", k), value, largeSize)
+				size := pressureWriteSize(lengths, k)
+				cmd := target.makeCommand(fmt.Sprintf("large%06d", k), value[:size], size)
 				_, status := client.execute(cmd, 0, 0)
 				statuses[status]++
 			}
@@ -177,4 +178,16 @@ func readRuntime(client *http.Client) map[string]float64 {
 		return nil
 	}
 	return result
+}
+
+func pressureWriteSize(lengths string, index int) int {
+	switch lengths {
+	case "repeated":
+		sizes := [...]int{256 << 10, 512 << 10, largeSize - 1, largeSize}
+		return sizes[(index/8+index)%len(sizes)]
+	case "adjacent":
+		return largeSize - index
+	default:
+		return largeSize
+	}
 }

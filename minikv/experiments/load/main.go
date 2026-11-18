@@ -461,11 +461,15 @@ func main() {
 	rate := flag.Int("rate", 10000, "ordinary offered requests per second")
 	window := flag.Duration("duration", 6*time.Second, "offered workload duration")
 	tick := flag.Duration("tick", time.Millisecond, "fixed arrival batch interval")
+	lengths := flag.String("pressure-lengths", "fixed", "fixed, repeated, or adjacent pressure writes")
 	flag.Parse()
 	t := target{address: "127.0.0.1:7321", redis: *redis}
 	encoder := json.NewEncoder(os.Stdout)
 	if *profile == "pressure" && !*redis {
-		if err := encoder.Encode(runPressure(t)); err != nil {
+		if *lengths != "fixed" && *lengths != "repeated" && *lengths != "adjacent" {
+			log.Fatal("invalid pressure length pattern")
+		}
+		if err := encoder.Encode(runPressure(t, *lengths)); err != nil {
 			log.Fatal(err)
 		}
 		return

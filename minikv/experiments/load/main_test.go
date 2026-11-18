@@ -28,3 +28,21 @@ func TestScheduleCountsPartialLastInterval(t *testing.T) {
 		t.Fatalf("normal = %+v, auxiliary = %+v", normal, auxiliary)
 	}
 }
+
+func TestPressureWriteSizes(t *testing.T) {
+	repeated := make(map[int]int)
+	adjacent := make(map[int]bool)
+	for i := 0; i < 256; i++ {
+		repeated[pressureWriteSize("repeated", i)]++
+		size := pressureWriteSize("adjacent", i)
+		if size > largeSize || size <= largeSize-256 || adjacent[size] {
+			t.Fatalf("invalid adjacent size %d at %d", size, i)
+		}
+		adjacent[size] = true
+	}
+	for _, size := range []int{256 << 10, 512 << 10, largeSize - 1, largeSize} {
+		if repeated[size] != 64 {
+			t.Fatalf("size %d repeated %d times, want 64", size, repeated[size])
+		}
+	}
+}
