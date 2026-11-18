@@ -38,7 +38,7 @@ func Open(dir string, restore func(string) error, replay func([]byte) error) (_ 
 	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, err
 	}
-	if err := syncDirectory(filepath.Dir(dir)); err != nil {
+	if err := syncDirectory(filepath.Dir(filepath.Clean(dir))); err != nil {
 		return nil, err
 	}
 	lock, err := os.OpenFile(filepath.Join(dir, "LOCK"), os.O_CREATE|os.O_RDWR, 0o600)
@@ -100,6 +100,12 @@ func Open(dir string, restore func(string) error, replay func([]byte) error) (_ 
 			return nil, fmt.Errorf("%w: journal position %d: %v", ErrCorrupt, pos, err)
 		}
 		pos += size
+	}
+	// A process can exit between renaming HEAD and syncing its directory.
+	// Make the recovered generation durable before exposing it or collecting
+	// the files needed to read the previous generation.
+	if err := syncDirectory(dir); err != nil {
+		return nil, fmt.Errorf("sync recovered HEAD: %w", err)
 	}
 	if info.Size() > j.end {
 		if err := j.file.Truncate(j.end); err != nil {
