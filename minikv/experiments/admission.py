@@ -88,7 +88,17 @@ def peer(binary, image, arm):
             else:
                 raise RuntimeError(f"cache peer did not start: {arm}")
             binding = subprocess.check_output(["docker", "port", name, "7321/tcp"], text=True)
-            yield int(binding.strip().rsplit(":", 1)[1])
+            port = int(binding.strip().rsplit(":", 1)[1])
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=.5):
+                        break
+                except OSError:
+                    if proc.poll() is not None or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.05)
+            yield port
             proc.stdin.close()
             if proc.wait(timeout=5) != 0:
                 raise RuntimeError(f"cache peer failed: {proc.stdout.read()}")
