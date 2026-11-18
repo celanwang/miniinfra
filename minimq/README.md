@@ -32,3 +32,5 @@ The [checkpoint experiment](docs/checkpoint-experiment.md) covers repeatable bac
 The [scheduled release experiment](docs/scheduling-experiment.md) covers simultaneous deadlines, foreground traffic, and broker restarts.
 
 The [lease expiration experiment](docs/retry-experiment.md) measures lock contention during retry and dead-letter batches.
+
+The [dead-letter page experiment](docs/dead-letter-page-experiment.md) measures cursor pages and concurrent delivery traffic.

@@ -186,6 +186,11 @@ type operationTiming struct {
 	checkpoint                checkpointTiming
 	retry                     retryTiming
 	commit                    commitTiming
+	page                      deadLetterPageTiming
+}
+
+type deadLetterPageTiming struct {
+	selectIDs, clone time.Duration
 }
 
 type checkpointTiming struct {
