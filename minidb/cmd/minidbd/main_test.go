@@ -179,13 +179,7 @@ func TestOrderSurvivesLostReplyAndAbruptRestart(t *testing.T) {
 	proxy, dropped := dropCommitResponse(t, addr)
 	connection := client.Open(proxy)
 	defer connection.Close()
-	tx := begin(t, connection)
-	execute(t, tx, "insert into orders values (?, ?, ?)", 42, "r42", "1:2,2:3")
-	const deduct = "update inventory set available = available - ? where sku = ? and available >= ?"
-	if a, b := execute(t, tx, deduct, 2, 1, 2), execute(t, tx, deduct, 3, 2, 3); a != 1 || b != 1 {
-		t.Fatalf("could not reserve both items: %d and %d", a, b)
-	}
-	execute(t, tx, "insert into items values (42, 1, 2), (42, 2, 3)")
+	tx := reserveOrder(t, connection)
 	var id int64
 	if err := db.QueryRowContext(t.Context(), "select id from orders where request_id = ?", "r42").Scan(&id); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("second connection saw uncommitted order: %v, %v", id, err)
@@ -216,6 +210,24 @@ func TestOrderSurvivesLostReplyAndAbruptRestart(t *testing.T) {
 	if err := retry.Rollback(); err != nil {
 		t.Fatal(err)
 	}
+	assertOrderRecovered(t, recovered)
+}
+
+func reserveOrder(t *testing.T, db *sql.DB) *sql.Tx {
+	t.Helper()
+	tx := begin(t, db)
+	execute(t, tx, "insert into orders values (?, ?, ?)", 42, "r42", "1:2,2:3")
+	const deduct = "update inventory set available = available - ? where sku = ? and available >= ?"
+	if a, b := execute(t, tx, deduct, 2, 1, 2), execute(t, tx, deduct, 3, 2, 3); a != 1 || b != 1 {
+		t.Fatalf("could not reserve both items: %d and %d", a, b)
+	}
+	execute(t, tx, "insert into items values (42, 1, 2), (42, 2, 3)")
+	return tx
+}
+
+func assertOrderRecovered(t *testing.T, recovered *sql.DB) {
+	t.Helper()
+	var id int64
 	for _, stmt := range []string{
 		"select id, digest from orders where id = 42",
 		"select id, digest from orders where request_id = 'r42'",
