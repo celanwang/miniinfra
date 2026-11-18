@@ -81,6 +81,11 @@ func (p *Partition) restore(path string) error {
 	p.acknowledgments, p.dead = image.Acks, image.Dead
 	if image.Redrives != nil {
 		p.redrives = image.Redrives
+		for _, task := range image.Redrives {
+			if sub := p.subscriptions[task.Subscription]; sub != nil {
+				sub.redriveCount++
+			}
+		}
 	}
 	if image.RedriveReceipts != nil {
 		p.redriveReceipts = image.RedriveReceipts

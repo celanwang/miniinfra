@@ -156,10 +156,12 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 			expired = expired[:limit.Messages]
 		}
 	}
+	scanRedrives := name == ""
 	for subName, sub := range p.subscriptions {
 		if name != "" && name != subName {
 			continue
 		}
+		scanRedrives = scanRedrives || sub.redriveCount != 0
 		if stats != nil {
 			stats.visited += len(sub.Tasks)
 		}
@@ -169,13 +171,15 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 			}
 		}
 	}
-	if stats != nil {
-		stats.visited += len(p.redrives)
-	}
-	for _, task := range p.redrives {
-		if (name == "" || name == task.Subscription) && task.State.Lease.Token != "" &&
-			!now.Lower.Before(task.State.Lease.Deadline) {
-			collect(task.update())
+	if scanRedrives {
+		if stats != nil {
+			stats.visited += len(p.redrives)
+		}
+		for _, task := range p.redrives {
+			if (name == "" || name == task.Subscription) && task.State.Lease.Token != "" &&
+				!now.Lower.Before(task.State.Lease.Deadline) {
+				collect(task.update())
+			}
 		}
 	}
 	if stats != nil {
