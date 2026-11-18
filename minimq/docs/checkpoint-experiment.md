@@ -206,3 +206,56 @@ The two default runs corroborate the recent-read penalty. The Pull and ACK perce
 Keep recent short tails inline and seal by the usual segment size and retention rules. Subscription progress governs task eligibility and retention. A later `Read` can still request a retained offset after every task has been acknowledged. A reader's temporary segment reference covers only its current operation. The existing task and reader state therefore provide no boundary for predicting future historical reads.
 
 The regression test checks the inline layout with an outstanding lease and after all recent tasks settle. It also verifies receipt recovery, normal sealing after additional publication, and an offset gap after retention. The restored binary opened a directory containing an actual early-sealed prefix and an inline suffix written by `69bce55`, and verified history and ACK receipts in that directory.
+
+## Idle checkpoints with retained dead letters
+
+Reuse the on-disk [dead-letter fixture](dead-letter-page-experiment.md). Its two sizes contain 576 and 11,328 letters in total. The checkpoint holds five subscriptions and the letters, and the WAL starts empty. The clock is fixed at the fixture's time during each idle measurement. The benchmark opens the existing partition through normal recovery, then checks that idle rounds leave HEAD byte-for-byte equal and issue zero sync calls.
+
+```sh
+idle_checkpoint_dir=$(mktemp -d)
+mkdir "$idle_checkpoint_dir/fixture"
+GOWORK=off MINIMQ_DEAD_PAGE_SEED="$idle_checkpoint_dir/fixture" go test -run '^TestSeedDeadLetterPageFixture$' -count=1 .
+GOWORK=off MINIMQ_IDLE_CHECKPOINT_FIXTURE="$idle_checkpoint_dir/fixture" go test -run '^$' -bench '^BenchmarkIdleCheckpoint$' -benchtime=192x .
+cp -R "$idle_checkpoint_dir/fixture" "$idle_checkpoint_dir/active"
+GOWORK=off MINIMQ_IDLE_CHECKPOINT_ACTIVE_DIR="$idle_checkpoint_dir/active" go test -run '^TestIdleCheckpointActiveControl$' -count=1 -v .
+cp -R "$idle_checkpoint_dir/fixture" "$idle_checkpoint_dir/wire"
+GOWORK=off MINIMQ_IDLE_CHECKPOINT_TCP_DIR="$idle_checkpoint_dir/wire" go test -run '^TestIdleCheckpointsOverTCP$' -count=1 -v ./cmd/minimqd
+```
+
+Set `MINIMQ_DEAD_PAGE_ROWS=128` when seeding to create the smaller control. Use a fresh copy for each active or TCP run because both perform durable operations during setup. The active control first publishes a checkpoint with a subscription registration in the WAL and all the letters still valid. It then advances the trusted time to the letters' retention boundary with an empty WAL and verifies a new generation, all letters removed, and the registration recovered.
+
+The TCP control uses the production routes on a loopback listener. It publishes, claims and acknowledges a real delivery, then checkpoints it. Each measured phase sends 160 empty Pulls and 160 retries of the prior ACK. They keep the WAL empty. The quiet phase has no concurrent checkpoint call. The comparison phase forces 32 explicit idle Compact calls at 10 ms intervals to sample overlap. It checks that HEAD is byte-identical, then restarts via the normal daemon entry point and rechecks the stored page, ACK receipt and empty Pull.
+
+The measured baseline `0eff974` adds the workload to `c12d6e8`. The lazy-copy candidate was `2adec63`. Runs interleaved separate test binaries on macOS 15.5 arm64, Go 1.27.3 and local APFS. Each timed loopback and kernel run used the shared benchmark lock. One-minute load averages at trial starts ranged from 2.1 to 2.4. There were three runs per version at the larger size and two at the smaller size. Kernel figures are medians of per-run means. TCP figures are medians of per-run percentiles.
+
+| Retained dead letters | Idle lock hold, baseline → lazy copy | Allocated per idle call |
+| --- | ---: | ---: |
+| 576 | 28.24 → 9.01 µs | about 147,332 → 0 B |
+| 11,328 | 447.30 → 159.97 µs | about 2,793,506 → 0 B |
+
+| Active checkpoints, 11,328 starting letters | Prepare, baseline → lazy copy | Entire lock hold, baseline → lazy copy |
+| --- | ---: | ---: |
+| New WAL registration | 969 → 209 µs | 44.00 → 43.86 ms |
+| Expiry with an empty WAL | 708 → 855 µs | 20.83 → 20.87 ms |
+
+Both active controls issued six syncs per checkpoint. The large image was 13,398,705 bytes with the retained letters and 1,240 bytes after removal, before the checksum. In the small fixture, the active WAL control measured 28.11 → 30.35 ms of lock hold and 20.39 → 22.26 ms of sync time. The smaller sample includes storage variation.
+
+| TCP, 11,328 retained letters | Baseline P50 / P99 | Lazy copy P50 / P99 |
+| --- | ---: | ---: |
+| Quiet empty Pull | 145 / 496 µs | 158 / 691 µs |
+| Quiet repeated ACK | 145 / 416 µs | 157 / 505 µs |
+| Empty Pull during forced idle calls | 225 / 3,012 µs | 347 / 1,352 µs |
+| Repeated ACK during forced idle calls | 209 / 2,656 µs | 348 / 801 µs |
+
+The forced overlap lowered P99 and raised P50 for both endpoints. These TCP measurements describe the artificial high-frequency overlap. The lock hold and allocation measurements describe individual Compact calls. The normal daemon schedules one call every 30 seconds.
+
+Keep the lazy copy. Each metadata map is scanned once and shared while it needs no removals. The first actual expiry clones that map for the image, and deletions affect only the copy before HEAD is durable. The normal checkpoint path still evaluates WAL contents, tail sealing, receipt and dead-letter expiry, subscription floors and active reader pins. The benchmark's zero allocations apply to this fixture with no retained history segments. Checkpoints can still copy segment metadata and encode live state when publishing.
+
+The boundary tests cover new WAL contents, expiry exactly at the cutoff and a capacity failure before publication, scheduled receipts with due items, an outstanding redrive after receipt cleanup, full and aged tails with an empty WAL, and history retention across an active read. The baseline fixture opens with the new implementation. The original `c12d6e8` binary also reopened the candidate's active control after it pruned the expired letters, and recovered the registration from the prior active generation.
+
+```sh
+idle_old_dir=$(mktemp -d)
+git -C .. archive c12d6e8 minimq | tar -xf - -C "$idle_old_dir"
+cp idle_checkpoint_test.go "$idle_old_dir/minimq/"
+(cd "$idle_old_dir/minimq" && GOWORK=off MINIMQ_IDLE_CHECKPOINT_VERIFY_DIR="$idle_checkpoint_dir/active" go test -run '^TestVerifyIdleCheckpointActiveControl$' -count=1 -v .)
+```

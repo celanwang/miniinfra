@@ -119,6 +119,24 @@ func checkpointStart(stats *checkpointTiming) time.Time {
 	return time.Time{}
 }
 
+func pruneCheckpointEntries[V any](entries map[string]V, expired func(string, V) bool) map[string]V {
+	var pruned map[string]V
+	for key, value := range entries {
+		if !expired(key, value) {
+			continue
+		}
+		if pruned == nil {
+			// Keep the live map intact until the checkpoint is published.
+			pruned = maps.Clone(entries)
+		}
+		delete(pruned, key)
+	}
+	if pruned == nil {
+		return entries
+	}
+	return pruned
+}
+
 func (p *Partition) compact(now TimeBounds) error {
 	var stats *checkpointTiming
 	if p.timings != nil {
@@ -127,18 +145,18 @@ func (p *Partition) compact(now TimeBounds) error {
 	start := checkpointStart(stats)
 	image := checkpoint{
 		Sequence: p.sequence, TimeLower: now.Lower, First: p.firstOffset, Reserved: p.reserved,
-		Segments:  append([]segment(nil), p.segments...),
-		Publishes: maps.Clone(p.publishes), Acks: maps.Clone(p.acknowledgments),
-		Subscriptions: p.subscriptions, Scheduled: p.scheduled, Dead: maps.Clone(p.dead),
-		Redrives: p.redrives, RedriveReceipts: maps.Clone(p.redriveReceipts),
+		Segments: append([]segment(nil), p.segments...), Subscriptions: p.subscriptions,
+		Scheduled: p.scheduled, Redrives: p.redrives,
 	}
-	maps.DeleteFunc(image.Publishes, func(id string, r publishReceipt) bool {
+	image.Publishes = pruneCheckpointEntries(p.publishes, func(id string, r publishReceipt) bool {
 		_, pending := p.scheduled[id]
 		return !pending && !now.Lower.Before(r.Expires)
 	})
-	maps.DeleteFunc(image.Acks, func(_ string, r ackReceipt) bool { return !now.Lower.Before(r.Expires) })
-	maps.DeleteFunc(image.Dead, func(_ string, d DeadLetter) bool { return !now.Lower.Before(d.Expires) })
-	maps.DeleteFunc(image.RedriveReceipts, func(_ string, r redriveReceipt) bool { return !now.Lower.Before(r.Expires) })
+	image.Acks = pruneCheckpointEntries(p.acknowledgments, func(_ string, r ackReceipt) bool { return !now.Lower.Before(r.Expires) })
+	image.Dead = pruneCheckpointEntries(p.dead, func(_ string, d DeadLetter) bool { return !now.Lower.Before(d.Expires) })
+	image.RedriveReceipts = pruneCheckpointEntries(p.redriveReceipts, func(_ string, r redriveReceipt) bool {
+		return !now.Lower.Before(r.Expires)
+	})
 	if stats != nil {
 		stats.prepare = time.Since(start)
 	}
