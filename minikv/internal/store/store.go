@@ -150,6 +150,9 @@ func (s *Store) set(key, value []byte, ttl time.Duration, onlyMissing, copyValue
 	defer sh.mu.Unlock()
 
 	now := s.now()
+	if ttl > time.Duration(math.MaxInt64)-now {
+		return Invalid
+	}
 	i, exists := sh.index[string(key)]
 	if onlyMissing && exists && !sh.entries[i].expired(now) {
 		return Exists
@@ -172,9 +175,6 @@ func (s *Store) set(key, value []byte, ttl time.Duration, onlyMissing, copyValue
 		return NoSpace
 	}
 
-	if ttl > time.Duration(math.MaxInt64)-now {
-		return Invalid
-	}
 	if copyValue {
 		next.value = make([]byte, len(value))
 		copy(next.value, value)
