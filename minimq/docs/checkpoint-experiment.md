@@ -259,3 +259,42 @@ git -C .. archive c12d6e8 minimq | tar -xf - -C "$idle_old_dir"
 cp idle_checkpoint_test.go "$idle_old_dir/minimq/"
 (cd "$idle_old_dir/minimq" && GOWORK=off MINIMQ_IDLE_CHECKPOINT_VERIFY_DIR="$idle_checkpoint_dir/active" go test -run '^TestVerifyIdleCheckpointActiveControl$' -count=1 -v .)
 ```
+
+## Retiring tail segments
+
+The fixture publishes 32 messages of 64 KiB through the Go API and checkpoints them as an inline tail. Every trial opens a fresh copy with an empty WAL. The expired controls advance the trusted lower bound to the retention boundary and use segment widths of 256 and 32. The recent control opens the same data with width 32 before expiry. The protected control publishes an identical workload with a subscription that still needs the messages and opens at the expiry boundary.
+
+```sh
+retiring_tail_dir=$(mktemp -d)
+mkdir "$retiring_tail_dir/ordinary" "$retiring_tail_dir/protected"
+GOWORK=off MINIMQ_TAIL_RETIRE_SEED="$retiring_tail_dir/ordinary" go test -run '^TestSeedRetiringTailCheckpoint$' -count=1 .
+GOWORK=off MINIMQ_TAIL_RETIRE_SEED="$retiring_tail_dir/protected" MINIMQ_TAIL_RETIRE_PROTECT=1 go test -run '^TestSeedRetiringTailCheckpoint$' -count=1 .
+GOWORK=off MINIMQ_TAIL_RETIRE_FIXTURE="$retiring_tail_dir/ordinary" MINIMQ_TAIL_RETIRE_PROTECTED_FIXTURE="$retiring_tail_dir/protected" go test -run '^$' -bench '^BenchmarkRetiringTailCheckpoint$' -benchtime=6x .
+GOWORK=off go test -run '^TestRetiringTailCheckpointOverTCP$' -count=1 -v ./cmd/minimqd
+```
+
+The timing harness compiles separate test binaries at the measured baseline `5ebb7f5` and candidate `bcde9fd`. It runs each with `-test.run '^$' -test.bench '^BenchmarkRetiringTailCheckpoint$' -test.benchtime=6x` using the same directories above. Four alternating runs per version use an arm64 macOS 15.5 host, Go 1.27.3 and local APFS. The runs used the shared benchmark lock and started at one-minute load averages around 4.5–4.8. Fixture copying and recovery are outside the measured interval. Each table cell is a median of per-run means.
+
+| Empty WAL and 32 messages | Allocation, baseline → candidate | JSON encoding | Framing | Entire lock hold |
+| --- | ---: | ---: | ---: | ---: |
+| Expired partial segment | 8,861,952 → 61,537 B | 1.24 → 0.055 ms | 0.82 → 0 ms | 24.50 → 21.99 ms |
+| Expired full segment | 8,843,363 → 61,408 B | 1.30 → 0.058 ms | 0.94 → 0 ms | 25.01 → 22.75 ms |
+| Recent full segment | 8.87 → 8.87 MB | 1.32 → 1.36 ms | 0.93 → 0.96 ms | 30.21 → 30.98 ms |
+| Expired partial with a protecting subscription | 8.90 → 8.89 MB | 1.36 → 1.32 ms | 0.92 → 0.89 ms | 31.13 → 30.53 ms |
+
+JSON encoding includes the image. Both expired controls produce a 9,333-byte image before the checksum and stage zero segments under both policies. Their sync times remain roughly 21 ms. Both retained controls stage one segment under each policy. The recent full-segment sync median increased from 26.42 to 27.36 ms in these trials, alongside the smaller increase in total lock hold.
+
+Keep the deferred encoding. The checkpoint builds the same segment descriptors and decides the removable prefix once, using the subscription floors, active reader pin, and retention boundary. It encodes only retained new segments. When a segment blocks prefix removal, the checkpoint keeps it and every later segment. A reader that releases its pin after prefix selection can leave reclamation to the next round. The metadata is committed with the existing publication sequence and capacity accounting.
+
+The regression checks the instant before and at the retention boundary, a mixed sealed and inline suffix behind a retired prefix, an older live segment blocking a later expired tail, and separate capacity and staging failures. After the failed staging, reopening the original HEAD recovers every old body from the checkpoint and WAL. Existing active read tests exercise the pin, and process interruption tests exercise checkpoint sync boundaries.
+
+The TCP test publishes five messages through the production routes, verifies the retired prefix returns HTTP 410 with first offset 2, and checks all remaining bodies through the normal daemon after reopening. The original and candidate independently produced byte-identical HEAD, checkpoint, journal and retained segment files for this fixture. Each broker also reopened the other's output and checked it through TCP. To check the candidate-written directory with the original broker, save the fixture and use the same test driver in an archive of the old code.
+
+```sh
+mkdir "$retiring_tail_dir/wire"
+GOWORK=off MINIMQ_TAIL_RETIRE_TCP_DIR="$retiring_tail_dir/wire" go test -run '^TestRetiringTailCheckpointOverTCP$' -count=1 -v ./cmd/minimqd
+retiring_tail_old=$(mktemp -d)
+git -C .. archive dd3bac8 minimq | tar -xf - -C "$retiring_tail_old"
+cp cmd/minimqd/retiring_tail_test.go "$retiring_tail_old/minimq/cmd/minimqd/"
+(cd "$retiring_tail_old/minimq" && GOWORK=off MINIMQ_TAIL_RETIRE_TCP_VERIFY_DIR="$retiring_tail_dir/wire" go test -run '^TestReadRetiredTailWithBroker$' -count=1 -v ./cmd/minimqd)
+```
