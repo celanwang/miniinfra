@@ -157,6 +157,7 @@ type Partition struct {
 	journal       *journal.Journal
 	closed        bool
 	failed        error
+	timings       *partitionTimings
 
 	sequence        uint64
 	timeLower       time.Time
@@ -175,6 +176,51 @@ type Partition struct {
 	redriveReceipts map[string]redriveReceipt
 	segments        []segment
 	checkpointBytes int64
+}
+
+type operationTiming struct {
+	arrived, locked, finished time.Time
+	syncTime                  time.Duration
+	syncCalls                 int
+}
+
+// An optional observer, installed before opening the workload to concurrent
+// calls. Its counters are updated under the partition lock.
+type partitionTimings struct {
+	record func(string, operationTiming)
+	time   time.Duration
+	calls  int
+}
+
+func (p *Partition) observe(record func(string, operationTiming)) {
+	timings := &partitionTimings{record: record}
+	p.timings = timings
+	p.journal.ObserveSync = func(elapsed time.Duration) {
+		timings.time += elapsed
+		timings.calls++
+	}
+}
+
+func (p *Partition) beginOperation() operationTiming {
+	if p.timings == nil {
+		p.mu.Lock()
+		return operationTiming{}
+	}
+	arrived := time.Now()
+	p.mu.Lock()
+	return operationTiming{
+		arrived: arrived, locked: time.Now(), syncTime: p.timings.time, syncCalls: p.timings.calls,
+	}
+}
+
+func (p *Partition) endOperation(operation string, sample operationTiming) {
+	if timing := p.timings; timing != nil {
+		sample.finished = time.Now()
+		sample.syncTime = timing.time - sample.syncTime
+		sample.syncCalls = timing.calls - sample.syncCalls
+		timing.record(operation, sample)
+	}
+	p.mu.Unlock()
 }
 
 // Open loads the partition in dir and takes exclusive ownership until Close.

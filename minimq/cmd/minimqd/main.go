@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/celanwang/miniinfra/minimq"
+	"github.com/celanwang/miniinfra/minimq/internal/maintenance"
 )
 
 func main() {
@@ -79,25 +80,16 @@ func run(ctx context.Context, dir, address string, cfg minimq.Config) (err error
 }
 
 func maintain(ctx context.Context, p *minimq.Partition) {
-	due := time.NewTicker(250 * time.Millisecond)
-	compaction := time.NewTicker(30 * time.Second)
-	defer due.Stop()
-	defer compaction.Stop()
 	limit := minimq.Limits{Messages: minimq.MaxBatchMessages, Bytes: minimq.MaxBatchBytes}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-due.C:
-			_, scheduleErr := p.AdvanceScheduled(limit)
-			_, retryErr := p.AdvanceRetries(limit)
-			if err := errors.Join(scheduleErr, retryErr); err != nil {
-				log.Printf("delivery maintenance: %v", err)
-			}
-		case <-compaction.C:
-			if err := p.Compact(); err != nil {
-				log.Printf("checkpoint: %v", err)
-			}
+	maintenance.Run(ctx, func() {
+		_, scheduleErr := p.AdvanceScheduled(limit)
+		_, retryErr := p.AdvanceRetries(limit)
+		if err := errors.Join(scheduleErr, retryErr); err != nil {
+			log.Printf("delivery maintenance: %v", err)
 		}
-	}
+	}, func() {
+		if err := p.Compact(); err != nil {
+			log.Printf("checkpoint: %v", err)
+		}
+	})
 }

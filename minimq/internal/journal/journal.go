@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const (
@@ -26,6 +27,9 @@ type Journal struct {
 	generation uint64
 	end        int64
 	failed     error
+
+	// ObserveSync is optional. Set it before serving requests.
+	ObserveSync func(time.Duration)
 }
 
 func generationPath(dir, name string, generation uint64) string {
@@ -140,10 +144,10 @@ func (j *Journal) start() error {
 	if err != nil {
 		return err
 	}
-	if err := j.file.Sync(); err != nil {
+	if err := j.sync(j.file); err != nil {
 		return err
 	}
-	if err := syncDirectory(j.dir); err != nil {
+	if err := openAndSync(j.dir, j.sync); err != nil {
 		return err
 	}
 	return j.installHead(1, 0)
@@ -214,7 +218,7 @@ func (j *Journal) append(frame []byte) error {
 	if _, err := j.file.WriteAt(frame, j.end); err != nil {
 		return err
 	}
-	if err := j.file.Sync(); err != nil {
+	if err := j.sync(j.file); err != nil {
 		return err
 	}
 	end := j.end + int64(len(frame))
@@ -231,7 +235,7 @@ func (j *Journal) installHead(generation uint64, end int64) error {
 	binary.LittleEndian.PutUint64(data[4:], generation)
 	binary.LittleEndian.PutUint64(data[12:], uint64(end))
 	binary.LittleEndian.PutUint32(data[20:], crc32.ChecksumIEEE(data[:20]))
-	return InstallFile(j.dir, filepath.Join(j.dir, "HEAD"), data)
+	return j.InstallFile(filepath.Join(j.dir, "HEAD"), data)
 }
 
 func (j *Journal) Checkpoint(data []byte) error {
@@ -247,18 +251,18 @@ func (j *Journal) Checkpoint(data []byte) error {
 
 func (j *Journal) checkpoint(data []byte) error {
 	next := j.generation + 1
-	if err := InstallFile(j.dir, generationPath(j.dir, "checkpoint", next), data); err != nil {
+	if err := j.InstallFile(generationPath(j.dir, "checkpoint", next), data); err != nil {
 		return err
 	}
 	file, err := os.OpenFile(generationPath(j.dir, "journal", next), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
-	if err := file.Sync(); err != nil {
+	if err := j.sync(file); err != nil {
 		file.Close()
 		return err
 	}
-	if err := syncDirectory(j.dir); err != nil {
+	if err := openAndSync(j.dir, j.sync); err != nil {
 		file.Close()
 		return err
 	}
@@ -295,7 +299,7 @@ func (j *Journal) Collect(historyFiles map[string]bool) error {
 		changed = true
 	}
 	if changed {
-		return syncDirectory(j.dir)
+		return openAndSync(j.dir, j.sync)
 	}
 	return nil
 }
@@ -314,15 +318,15 @@ func ownedFile(name, prefix string) bool {
 }
 
 // InstallFile makes data durable before publishing its name.
-func InstallFile(dir, path string, data []byte) error {
-	temp, err := os.CreateTemp(dir, ".minimq-*")
+func (j *Journal) InstallFile(path string, data []byte) error {
+	temp, err := os.CreateTemp(j.dir, ".minimq-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(temp.Name())
 	_, writeErr := temp.Write(data)
 	if writeErr == nil {
-		writeErr = temp.Sync()
+		writeErr = j.sync(temp)
 	}
 	if err := errors.Join(writeErr, temp.Close()); err != nil {
 		return err
@@ -330,15 +334,29 @@ func InstallFile(dir, path string, data []byte) error {
 	if err := os.Rename(temp.Name(), path); err != nil {
 		return err
 	}
-	return syncDirectory(dir)
+	return openAndSync(j.dir, j.sync)
 }
 
 func syncDirectory(dir string) error {
+	return openAndSync(dir, (*os.File).Sync)
+}
+
+func openAndSync(dir string, syncFile func(*os.File) error) error {
 	f, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
-	return errors.Join(f.Sync(), f.Close())
+	return errors.Join(syncFile(f), f.Close())
+}
+
+func (j *Journal) sync(f *os.File) error {
+	if j.ObserveSync == nil {
+		return f.Sync()
+	}
+	start := time.Now()
+	err := f.Sync()
+	j.ObserveSync(time.Since(start))
+	return err
 }
 
 func (j *Journal) Close() error {
