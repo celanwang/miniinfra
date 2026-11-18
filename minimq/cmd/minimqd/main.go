@@ -25,6 +25,9 @@ func main() {
 	flag.DurationVar(&cfg.HistoryRetention, "history-retention", 0, "history retention (0 uses the default)")
 	flag.DurationVar(&cfg.DeadRetention, "dead-retention", 0, "dead-letter retention (0 uses the default)")
 	flag.Parse()
+	if flag.NArg() != 0 {
+		log.Fatalf("unexpected positional argument %q", flag.Arg(0))
+	}
 	if *uncertainty < 0 {
 		log.Fatal("clock error bound must be nonnegative")
 	}
@@ -40,15 +43,16 @@ func main() {
 }
 
 func run(ctx context.Context, dir, address string, cfg minimq.Config) (err error) {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
 	p, err := minimq.Open(dir, cfg)
 	if err != nil {
 		return err
 	}
 	defer func() { err = errors.Join(err, p.Close()) }()
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		return err
-	}
 	server := &http.Server{
 		Handler: routes(p), ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
