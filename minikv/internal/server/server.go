@@ -45,6 +45,20 @@ func DefaultConfig() Config {
 	}
 }
 
+var errInvalidConfig = errors.New("invalid server configuration")
+
+// Validate checks the connection limits and timeouts.
+func (c Config) Validate() error {
+	if c.MaxConnections < 1 || c.MaxKeyBytes < 1 ||
+		c.MaxValueBytes < 1 || c.InboundBytes < 1 || c.OutboundBytes < 1 ||
+		c.InboundPerConn < 1 || c.OutboundPerConn < 1 ||
+		c.ReadTimeout <= 0 || c.WriteTimeout <= 0 ||
+		c.SweepInterval <= 0 || c.SweepBatch < 1 {
+		return errInvalidConfig
+	}
+	return nil
+}
+
 type budget struct {
 	limit int64
 	used  atomic.Int64
@@ -82,12 +96,11 @@ type Server struct {
 }
 
 func New(cache *store.Store, config Config) (*Server, error) {
-	if cache == nil || config.MaxConnections < 1 || config.MaxKeyBytes < 1 ||
-		config.MaxValueBytes < 1 || config.InboundBytes < 1 || config.OutboundBytes < 1 ||
-		config.InboundPerConn < 1 || config.OutboundPerConn < 1 ||
-		config.ReadTimeout <= 0 || config.WriteTimeout <= 0 ||
-		config.SweepInterval <= 0 || config.SweepBatch < 1 {
-		return nil, errors.New("invalid server configuration")
+	if cache == nil {
+		return nil, errInvalidConfig
+	}
+	if err := config.Validate(); err != nil {
+		return nil, err
 	}
 	return &Server{
 		cache:    cache,
