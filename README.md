@@ -8,6 +8,6 @@ We call it *mini* because we keep each project focused on one job. We start with
 
 ## Projects
 
-- **minidb** is a relational database for transactional applications.
-- **minikv** is an in-memory key-value store for low-latency access to application data.
-- **minimq** is a message queue for reliable, asynchronous communication between services.
+- [**minidb**](minidb/README.md) is a relational database for transactional applications.
+- [**minikv**](minikv/README.md) is an in-memory key-value store for low-latency access to application data.
+- [**minimq**](minimq/README.md) is a message queue for reliable, asynchronous communication between services.
