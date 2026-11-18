@@ -42,6 +42,12 @@ func selectRows(ctx context.Context, view engine.Snapshot, stmt statement) (Resu
 	if err != nil {
 		return Result{}, err
 	}
+	var keep func([]engine.Value) bool
+	if len(scans) == 1 && len(where) != 0 {
+		// All operands are bound to this row or to literals. Table access
+		// and projection still happen outside the scan predicate.
+		keep = func(row []engine.Value) bool { return matches(where, row) }
+	}
 
 	result := Result{}
 	var projections []boundValue
@@ -71,7 +77,7 @@ func selectRows(ctx context.Context, view engine.Snapshot, stmt statement) (Resu
 			return err
 		}
 		if depth == len(scans) {
-			if !matches(where, prefix) {
+			if keep == nil && !matches(where, prefix) {
 				return nil
 			}
 			if len(result.Rows) == maxRows {
@@ -94,7 +100,7 @@ func selectRows(ctx context.Context, view engine.Snapshot, stmt statement) (Resu
 				break
 			}
 		}
-		rows, _, err := view.Rows(ctx, plan.table, columns, values)
+		rows, _, err := view.RowsMatching(ctx, plan.table, columns, values, keep)
 		if err != nil {
 			return err
 		}

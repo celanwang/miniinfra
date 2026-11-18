@@ -2,6 +2,7 @@ package query
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/celanwang/miniinfra/minidb/internal/engine"
@@ -77,4 +78,60 @@ func TestOrderQueriesAndPartialRollback(t *testing.T) {
 	if _, err := first.Execute(t.Context(), "commit", nil); !errors.Is(err, ErrTransaction) {
 		t.Fatalf("failed explicit transaction could commit: %v", err)
 	}
+}
+
+func TestSingleTableFilterAgreesWithIndexAndJoin(t *testing.T) {
+	db, err := engine.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	writer, reader := NewSession(db), NewSession(db)
+	defer writer.Close()
+	defer reader.Close()
+	exec := func(session *Session, stmt string, args ...engine.Value) Result {
+		t.Helper()
+		result, err := session.Execute(t.Context(), stmt, args)
+		if err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+		return result
+	}
+	exec(writer, "create table offers (id int primary key, unindexed int, indexed int, candidate int, note text, approved bool, index by_key (indexed))")
+	exec(writer, "insert into offers values (1,3,3,3,null,true), (2,3,3,null,'null operand',true), (3,3,3,4,'unapproved',false), (4,null,null,4,'null key',true), (5,8,8,8,'other key',true)")
+	const heap = "select o.note, 7, o.id from offers o where o.unindexed = ? and o.candidate >= o.unindexed and o.approved = true"
+	const indexed = "select o.note, 7, o.id from offers o where o.indexed = ? and o.candidate >= o.indexed and o.approved = true"
+	const join = "select o.note, 7, o.id from offers o join offers i on i.id = o.id where i.indexed = ? and o.candidate >= i.indexed and o.approved = true"
+	check := func(session *Session, stmt string, filter engine.Value, want []engine.Value) {
+		t.Helper()
+		result := exec(session, stmt, filter)
+		if want == nil {
+			if len(result.Rows) != 0 {
+				t.Fatalf("%s returned rows for NULL: %v", stmt, result.Rows)
+			}
+			return
+		}
+		if len(result.Rows) != 1 || !slices.Equal(result.Rows[0], want) || !slices.Equal(result.Columns, []string{"note", "value", "id"}) {
+			t.Fatalf("%s returned %+v, want %v", stmt, result, want)
+		}
+	}
+	old := []engine.Value{{}, engine.Int(7), engine.Int(1)}
+	updated := []engine.Value{engine.String("replacement"), engine.Int(7), engine.Int(2)}
+	for _, stmt := range []string{heap, indexed, join} {
+		check(reader, stmt, engine.Int(3), old)
+		check(reader, stmt, engine.Value{}, nil)
+	}
+	exec(reader, "begin")
+	exec(writer, "begin")
+	exec(writer, "update offers set approved = false where id = 1")
+	exec(writer, "update offers set candidate = 5, note = 'replacement' where id = 2")
+	for _, stmt := range []string{heap, indexed, join} {
+		check(reader, stmt, engine.Int(3), old)
+		check(writer, stmt, engine.Int(3), updated)
+	}
+	exec(writer, "commit")
+	for _, stmt := range []string{heap, indexed, join} {
+		check(reader, stmt, engine.Int(3), updated)
+	}
+	exec(reader, "rollback")
 }

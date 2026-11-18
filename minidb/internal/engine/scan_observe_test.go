@@ -41,6 +41,15 @@ func (db *DB) PinnedScan(table string) func() bool {
 	return nil
 }
 
+func (db *DB) ScanLatchFree(table string) bool {
+	tbl, ok := db.table(table, db.published.Load())
+	if !ok || !tbl.mu.TryLock() {
+		return false
+	}
+	tbl.mu.Unlock()
+	return true
+}
+
 type ScanMaterialization struct {
 	Rows    int
 	Indexed bool
