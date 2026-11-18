@@ -172,6 +172,11 @@ func EncodeFrame(payload []byte) ([]byte, error) {
 }
 
 func ReadFrame(reader io.Reader, remaining int64) ([]byte, int64, error) {
+	return ReadFrameInto(reader, remaining, nil)
+}
+
+// ReadFrameInto validates a frame and reuses scratch when it has enough capacity.
+func ReadFrameInto(reader io.Reader, remaining int64, scratch []byte) ([]byte, int64, error) {
 	var header [8]byte
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		return nil, 0, fmt.Errorf("%w: frame header: %v", ErrCorrupt, err)
@@ -180,7 +185,11 @@ func ReadFrame(reader io.Reader, remaining int64) ([]byte, int64, error) {
 	if size == 0 || size > maxFrame || size+8 > remaining {
 		return nil, 0, fmt.Errorf("%w: invalid frame length", ErrCorrupt)
 	}
-	data := make([]byte, int(size))
+	data := scratch
+	if cap(data) < int(size) {
+		data = make([]byte, int(size))
+	}
+	data = data[:size]
 	if _, err := io.ReadFull(reader, data); err != nil {
 		return nil, 0, fmt.Errorf("%w: frame body: %v", ErrCorrupt, err)
 	}

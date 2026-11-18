@@ -39,7 +39,9 @@ func (p *Partition) Fail(name, worker, instance, token, reason string) (FailureR
 		return FailureResult{}, err
 	}
 	tx := transaction{Lower: now.Lower}
-	result, err := p.recordFailure(&tx, update, reason, now.Upper, now.Upper)
+	reader := historyReader{dir: p.journal.Dir()}
+	defer reader.close()
+	result, err := p.recordFailure(&tx, &reader, update, reason, now.Upper, now.Upper)
 	if err != nil {
 		return FailureResult{}, err
 	}
@@ -49,7 +51,7 @@ func (p *Partition) Fail(name, worker, instance, token, reason string) (FailureR
 	return result, nil
 }
 
-func (p *Partition) recordFailure(tx *transaction, update taskUpdate, reason string, at, settledAt time.Time) (FailureResult, error) {
+func (p *Partition) recordFailure(tx *transaction, reader *historyReader, update taskUpdate, reason string, at, settledAt time.Time) (FailureResult, error) {
 	cfg := p.subscriptions[update.Subscription].Config
 	if update.State.Attempts < cfg.MaxAttempts {
 		update.State.Lease = leaseState{}
@@ -63,11 +65,19 @@ func (p *Partition) recordFailure(tx *transaction, update taskUpdate, reason str
 	if err != nil {
 		return FailureResult{}, err
 	}
+	task := p.redrives[update.Redrive]
+	msg := task.Message
+	if update.Redrive == "" {
+		msg, err = p.readHistoryLocked(reader, update.Offset, p.locateHistory(update.Offset))
+		if err != nil {
+			return FailureResult{}, err
+		}
+	}
 	tx.Dead = append(tx.Dead, DeadLetter{
 		ID: id, Subscription: update.Subscription, Instance: update.instance(),
-		Message: p.messageForTask(update), Attempts: update.State.Attempts,
+		Message: msg, Attempts: update.State.Attempts,
 		Reason: reason, DeadAt: settledAt, Expires: settledAt.Add(p.config.DeadRetention),
-		SourceDeadLetterID: p.redrives[update.Redrive].SourceDeadLetterID,
+		SourceDeadLetterID: task.SourceDeadLetterID,
 	})
 	tx.ReserveDelta -= update.State.Remaining
 	update.State = taskState{Finished: true}
@@ -121,15 +131,21 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 		return a.instance() < b.instance()
 	})
 	tx := transaction{Lower: now.Lower}
+	reader := historyReader{dir: p.journal.Dir()}
+	defer reader.close()
 	for _, update := range expired {
 		size := 0
 		if update.State.Attempts >= p.subscriptions[update.Subscription].Config.MaxAttempts {
-			size = len(p.messageForTask(update).Body)
+			if update.Redrive != "" {
+				size = len(p.redrives[update.Redrive].Message.Body)
+			} else {
+				size = p.locateHistory(update.Offset).record.bodyBytes
+			}
 		}
 		if len(tx.Tasks) == limit.Messages || size > limit.Bytes {
 			break
 		}
-		if _, err := p.recordFailure(&tx, update, "lease expired", update.State.Lease.Deadline, now.Upper); err != nil {
+		if _, err := p.recordFailure(&tx, &reader, update, "lease expired", update.State.Lease.Deadline, now.Upper); err != nil {
 			return 0, err
 		}
 		limit.Bytes -= size

@@ -159,7 +159,8 @@ type Partition struct {
 	sequence        uint64
 	timeLower       time.Time
 	firstOffset     uint64
-	history         []storedMessage
+	tailOffset      uint64
+	tail            []storedMessage
 	publishes       map[string]publishReceipt
 	subscriptions   map[string]*subscription
 	acknowledgments map[string]ackReceipt
@@ -227,7 +228,7 @@ func (p *Partition) clock() (TimeBounds, error) {
 }
 
 func (p *Partition) nextOffset() uint64 {
-	return p.firstOffset + uint64(len(p.history))
+	return p.tailOffset + uint64(len(p.tail))
 }
 
 func (p *Partition) apply(tx transaction) error {
@@ -268,7 +269,7 @@ func (p *Partition) applyPublication(pub publication, acceptedSequence uint64) e
 	if pub.Message.Offset != p.nextOffset() {
 		return fmt.Errorf("%w: unexpected message offset", ErrCorrupt)
 	}
-	p.history = append(p.history, storedMessage{Message: pub.Message, AcceptedSequence: acceptedSequence})
+	p.tail = append(p.tail, storedMessage{Message: pub.Message, AcceptedSequence: acceptedSequence})
 	p.publishes[pub.Message.ID] = pub.Receipt
 	return nil
 }
@@ -354,16 +355,21 @@ func (p *Partition) Read(offset uint64, limit Limits) (HistoryPage, error) {
 		return HistoryPage{}, &OffsetGap{Requested: offset, First: p.firstOffset}
 	}
 	page := HistoryPage{Next: offset}
+	reader := historyReader{dir: p.journal.Dir()}
+	defer reader.close()
 	for page.Next < p.nextOffset() && len(page.Messages) < limit.Messages {
-		msg := p.history[page.Next-p.firstOffset].Message
-		if len(msg.Body) > limit.Bytes {
+		loc := p.locateHistory(page.Next)
+		if loc.record.bodyBytes > limit.Bytes {
 			if len(page.Messages) == 0 {
-				return HistoryPage{}, fmt.Errorf("%w: next message requires %d bytes", ErrInvalid, len(msg.Body))
+				return HistoryPage{}, fmt.Errorf("%w: next message requires %d bytes", ErrInvalid, loc.record.bodyBytes)
 			}
 			break
 		}
-		limit.Bytes -= len(msg.Body)
-		msg.Body = bytes.Clone(msg.Body)
+		msg, err := p.readHistoryLocked(&reader, page.Next, loc)
+		if err != nil {
+			return HistoryPage{}, err
+		}
+		limit.Bytes -= loc.record.bodyBytes
 		page.Messages = append(page.Messages, msg)
 		page.Next++
 	}
