@@ -1,6 +1,9 @@
 package server
 
-import "sync"
+import (
+	"slices"
+	"sync"
+)
 
 const (
 	minReusableWriteBytes = 64 << 10
@@ -35,10 +38,7 @@ func (p *writeBuffers) take(size int) []byte {
 		p.mu.Lock()
 		for i, value := range p.idle {
 			if len(value) == size {
-				last := len(p.idle) - 1
-				p.idle[i] = p.idle[last]
-				p.idle[last] = nil
-				p.idle = p.idle[:last]
+				p.idle = slices.Delete(p.idle, i, i+1)
 				p.bytes -= int64(size)
 				p.mu.Unlock()
 				return value
@@ -57,8 +57,13 @@ func (p *writeBuffers) put(value []byte) {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if size <= p.limit-p.bytes {
-		p.idle = append(p.idle, value)
-		p.bytes += size
+	// Reclaim the oldest idle capacities so an inactive size cannot
+	// keep a newly active size out of the pool.
+	drop := 0
+	for size > p.limit-p.bytes {
+		p.bytes -= int64(cap(p.idle[drop]))
+		drop++
 	}
+	p.idle = append(slices.Delete(p.idle, 0, drop), value)
+	p.bytes += size
 }

@@ -113,3 +113,32 @@ func TestRoundedReceiveCapacityUsesAndReturnsInboundBudget(t *testing.T) {
 		})
 	}
 }
+
+func TestWriteBuffersAdmitsNewSizeAfterFullOldPool(t *testing.T) {
+	for _, sizes := range [][2]int{{1 << 20, 512 << 10}, {512 << 10, 1 << 20}} {
+		t.Run(fmt.Sprint(sizes[0]), func(t *testing.T) {
+			p := writeBuffers{limit: maxIdleWriteBytes}
+			for range int(p.limit) / sizes[0] {
+				p.put(make([]byte, sizes[0]))
+			}
+			if p.bytes != p.limit {
+				t.Fatalf("first size retained %d bytes, want %d", p.bytes, p.limit)
+			}
+			next := p.take(sizes[1])
+			p.put(next)
+			oldReleased := (sizes[1] + sizes[0] - 1) / sizes[0] * sizes[0]
+			wantBytes := p.limit - int64(oldReleased) + int64(sizes[1])
+			var capacity int64
+			for _, idle := range p.idle {
+				capacity += int64(cap(idle))
+			}
+			if p.bytes != wantBytes || p.bytes != capacity || p.bytes > p.limit {
+				t.Fatalf("idle accounting %d, actual %d, want %d with limit %d", p.bytes, capacity, wantBytes, p.limit)
+			}
+			reused := p.take(sizes[1])
+			if &next[0] != &reused[0] {
+				t.Fatalf("full pool retained the old size and discarded the new %d-byte buffer", sizes[1])
+			}
+		})
+	}
+}
