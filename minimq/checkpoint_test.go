@@ -1,8 +1,11 @@
 package minimq
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +13,120 @@ import (
 	"testing"
 	"time"
 )
+
+func publishLargeCheckpointTail(t *testing.T, p *Partition) []byte {
+	t.Helper()
+	body := bytes.Repeat([]byte{'x'}, MaxMessageBytes)
+	for i := range MaxBatchBytes / MaxMessageBytes {
+		if _, err := p.Publish(PublishRequest{ID: fmt.Sprintf("tail-%d", i), Body: body}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func TestCheckpointSealsRepeatedPrefixAndRetainsSparseSuffix(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cfg := Config{Clock: testClock(&now), HistoryRetention: time.Hour}
+	p := openTest(t, dir, cfg)
+	registerTest(t, p, "notify", SubscriptionConfig{LeaseDuration: 2 * time.Hour})
+	body := publishLargeCheckpointTail(t, p)
+	prefix := uint64(MaxBatchBytes / MaxMessageBytes)
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.segments) != 0 || uint64(len(p.tail)) != prefix {
+		t.Fatal("idle checkpoint sealed the tail")
+	}
+	now = now.Add(30 * time.Minute)
+	leases, err := p.Pull("notify", "worker", Limits{Messages: 2, Bytes: 2 * len(body)})
+	if err != nil || len(leases) != 2 {
+		t.Fatalf("pull before sealing: %d, %v", len(leases), err)
+	}
+	ackTest(t, p, "notify", "worker", leases[0], AckAccepted)
+	if got := publishTest(t, p, "sparse"); got.Offset != prefix {
+		t.Fatalf("sparse offset = %d, want %d", got.Offset, prefix)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, cfg)
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.segments) != 1 || uint64(p.segments[0].Count) != prefix ||
+		len(p.tail) != 1 || p.tail[0].Offset != prefix {
+		t.Fatalf("segments = %d, tail = %d; want one sealed prefix and one inline suffix", len(p.segments), len(p.tail))
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, cfg)
+	page, err := p.Read(prefix-1, Limits{Messages: 2, Bytes: 2 * len(body)})
+	if err != nil || len(page.Messages) != 2 || !bytes.Equal(page.Messages[0].Body, body) || string(page.Messages[1].Body) != "sparse" {
+		t.Fatalf("read across checkpoint prefix and suffix: next=%d, count=%d, %v", page.Next, len(page.Messages), err)
+	}
+	ackTest(t, p, "notify", "worker", leases[0], AckPreviouslyAccepted)
+	ackTest(t, p, "notify", "worker", leases[1], AckAccepted)
+	now = now.Add(30 * time.Minute)
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := p.Status(); status.FirstOffset != 0 {
+		t.Fatalf("unsettled records lost retention: %+v", status)
+	}
+	remaining, err := p.Pull("notify", "worker", Limits{Messages: MaxBatchMessages, Bytes: MaxBatchBytes})
+	if err != nil || len(remaining) != int(prefix)-1 {
+		t.Fatalf("remaining deliveries = %d, %v", len(remaining), err)
+	}
+	for _, d := range remaining {
+		ackTest(t, p, "notify", "worker", d, AckAccepted)
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	var gap *OffsetGap
+	if _, err := p.Read(prefix-1, pageLimit); !errors.As(err, &gap) || gap.First != prefix {
+		t.Fatalf("expired settled history: %v", err)
+	}
+	page, err = p.Read(prefix, pageLimit)
+	if err != nil || len(page.Messages) != 1 || string(page.Messages[0].Body) != "sparse" {
+		t.Fatalf("sparse history after collection: %+v, %v", page, err)
+	}
+}
+
+func TestCheckpointKeepsInlineTailWhenEarlySealCannotFit(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	p := openTest(t, t.TempDir(), Config{Clock: testClock(&now)})
+	publishLargeCheckpointTail(t, p)
+	registerTest(t, p, "late", SubscriptionConfig{})
+	p.observe(func(string, operationTiming) {})
+	clock, err := p.clock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Obtain the exact inline staging requirement without writing a file.
+	p.config.CapacityBytes = 1
+	if err := p.compact(clock, 0); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("inline capacity preflight = %v", err)
+	}
+	p.config.CapacityBytes = p.storageBytes() + int64(p.timings.checkpoint.imageBytes+sha256.Size+8192)
+	if prefix := p.checkpointedTailPrefix(); prefix == 0 {
+		t.Fatal("tail did not qualify for sealing")
+	} else if err := p.compact(clock, prefix); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("early segment capacity preflight = %v", err)
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.segments) != 0 || len(p.tail) != MaxBatchBytes/MaxMessageBytes || p.journal.End() != 0 {
+		t.Fatal("capacity fallback did not install the inline checkpoint")
+	}
+}
 
 func TestCheckpointProcessExitAtSyncBoundaries(t *testing.T) {
 	const crashCode = 74
