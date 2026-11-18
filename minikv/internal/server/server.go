@@ -152,7 +152,7 @@ func (s *Server) sweep(ctx context.Context) {
 func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReaderSize(conn, headerBytes)
-	keyBuffer := make([]byte, s.config.MaxKeyBytes)
+	var keyBuffer []byte
 	reply := make([]byte, 0, 32)
 	for {
 		if conn.SetReadDeadline(time.Now().Add(s.config.ReadTimeout)) != nil {
@@ -170,29 +170,33 @@ func (s *Server) serveConn(conn net.Conn) {
 			_ = s.writeStatus(conn, reply, "BAD_REQUEST\n")
 			return
 		}
-		if req.keyBytes > len(keyBuffer) || req.valueBytes > s.config.MaxValueBytes {
+		if req.keyBytes > s.config.MaxKeyBytes || req.valueBytes > s.config.MaxValueBytes {
 			_ = s.writeStatus(conn, reply, "TOO_LARGE\n")
 			return
 		}
-		if !s.handle(conn, reader, keyBuffer[:req.keyBytes], reply, req) {
+		if !s.handle(conn, reader, &keyBuffer, reply, req) {
 			return
 		}
 	}
 }
 
-func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, reply []byte, req request) bool {
+func (s *Server) handle(conn net.Conn, reader *bufio.Reader, keyBuffer *[]byte, reply []byte, req request) bool {
 	bufferSize := s.writes.rounded(req.valueBytes, s.config.MaxValueBytes)
-	inBytes, reserved := s.reserveInbound(len(key), bufferSize)
+	inBytes, reserved := s.reserveInbound(req.keyBytes, bufferSize)
 	if !reserved && bufferSize != req.valueBytes {
 		bufferSize = req.valueBytes
-		inBytes, reserved = s.reserveInbound(len(key), bufferSize)
+		inBytes, reserved = s.reserveInbound(req.keyBytes, bufferSize)
 	}
 	if !reserved {
 		_ = s.writeStatus(conn, reply, "BUSY\n")
 		return false
 	}
 
-	value, result, err := s.receive(reader, key, req, bufferSize)
+	if req.keyBytes > cap(*keyBuffer) {
+		const initialKeyBufferBytes = 128
+		*keyBuffer = make([]byte, max(req.keyBytes, min(initialKeyBufferBytes, s.config.MaxKeyBytes)))
+	}
+	value, result, err := s.receive(reader, (*keyBuffer)[:req.keyBytes], req, bufferSize)
 	s.inbound.release(inBytes)
 	if err != nil {
 		return false

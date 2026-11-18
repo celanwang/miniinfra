@@ -56,15 +56,26 @@ func TestReceiveGETKeyAllocations(t *testing.T) {
 }
 
 func TestTCPReusesBinaryKeyBufferAcrossShards(t *testing.T) {
-	cache, err := store.New(store.Config{Shards: 4, BytesPerShard: 4 << 10, EntriesPerShard: 4, Samples: 4})
+	for _, maxKeyBytes := range []int{1024, 64 << 10} {
+		t.Run(fmt.Sprint(maxKeyBytes), func(t *testing.T) {
+			testTCPReusesBinaryKeyBuffer(t, maxKeyBytes)
+		})
+	}
+}
+
+func testTCPReusesBinaryKeyBuffer(t *testing.T, maxKeyBytes int) {
+	t.Helper()
+	cache, err := store.New(store.Config{Shards: 4, BytesPerShard: 2 * int64(maxKeyBytes), EntriesPerShard: 4, Samples: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(cache, DefaultConfig())
+	cfg := DefaultConfig()
+	cfg.MaxKeyBytes = maxKeyBytes
+	s, err := New(cache, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	long := "\x00\n\xff" + strings.Repeat("namespace:", 102) + "x"
+	long := "\x00\n\xff" + strings.Repeat("n", maxKeyBytes-3)
 	short := ""
 	for i := range 256 {
 		key := string([]byte{'\n', 0, byte(i)})
@@ -78,7 +89,7 @@ func TestTCPReusesBinaryKeyBufferAcrossShards(t *testing.T) {
 	}
 	address, _ := s.listenTestTCP(t)
 	c := dialTestTCP(t, address)
-	for _, entry := range []struct{ key, value string }{{long, "long"}, {short, "short"}} {
+	for _, entry := range []struct{ key, value string }{{short, "short"}, {long, "long"}} {
 		c.exchange(t, fmt.Sprintf("SET %d %d NONE\n%s%s", len(entry.key), len(entry.value), entry.key, entry.value), "STORED\n")
 	}
 	c.exchange(t, fmt.Sprintf("SET %d 1 NONE NX\n%sx", len(long), long), "EXISTS\n")

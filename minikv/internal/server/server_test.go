@@ -356,15 +356,21 @@ func TestTCPPipelinePreservesOrderAndContinuesAfterRejection(t *testing.T) {
 func TestTCPPipelineClosesOnIncompleteRequest(t *testing.T) {
 	for _, tc := range []struct {
 		name, suffix, rejected string
+		inboundLimit, pending  int64
 	}{
-		{"truncated", "SET 1 5 NONE\nkxx", ""},
-		{"inbound busy", "SET 1 8 NONE\nk12345678SET 1 1 NONE\nzZ", "BUSY\n"},
+		{"truncated", "SET 1 5 NONE\nkxx", "", 8, 0},
+		{"partial long key", "GET 512\nkpartial", "", 1024, 512},
+		{"inbound busy", "SET 1 8 NONE\nk12345678SET 1 1 NONE\nzZ", "BUSY\n", 8, 0},
+		{"long key exceeds inbound budget", "GET 512\n", "BUSY\n", 8, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := testServer(t, 4, func(c *Config) { c.InboundPerConn = 8 })
+			s := testServer(t, 4, func(c *Config) { c.InboundPerConn = tc.inboundLimit })
 			address, _ := s.listenTestTCP(t)
 			c := dialTestTCP(t, address)
 			c.send(t, "SET 1 3 NONE\nkold"+tc.suffix)
+			if tc.pending != 0 {
+				waitBudget(t, &s.inbound, tc.pending)
+			}
 			if err := c.Conn.(*net.TCPConn).CloseWrite(); err != nil {
 				t.Fatal(err)
 			}
@@ -392,6 +398,7 @@ func TestUnconsumedRequestClosesConnection(t *testing.T) {
 		status string
 	}{
 		{"SET 1 17 1000\n", "TOO_LARGE\n"},
+		{"GET 1025\n", "TOO_LARGE\n"},
 		{"SET 1 3 0\n", "BAD_REQUEST\n"},
 		{"SET 1 3 9223372036855\n", "BAD_REQUEST\n"},
 		{strings.Repeat("X", headerBytes), "BAD_REQUEST\n"},
