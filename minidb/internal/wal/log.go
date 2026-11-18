@@ -15,10 +15,11 @@ import (
 )
 
 const (
-	magic      = "MINIDB-WAL-1\n"
-	headerSize = 12
-	MaxPayload = 16 << 20
-	maxBatch   = 64
+	magic           = "MINIDB-WAL-1\n"
+	headerSize      = 12
+	MaxPayload      = 16 << 20
+	maxBatch        = 64
+	groupCommitWait = 200 * time.Microsecond
 )
 
 var (
@@ -208,32 +209,33 @@ func (log *Log) submit(item request) error {
 func (log *Log) run(end int64) {
 	defer close(log.done)
 	var failure error
+	var waitingDuringSync bool
 	for first := range log.queue {
 		if first.checkpoint != nil {
 			failure = log.checkpoint(first, end, failure)
+			waitingDuringSync = false
 			continue
 		}
 		batch := []request{first}
 		var barrier request
-	collect:
 		for len(batch) < maxBatch {
-			select {
-			case next, ok := <-log.queue:
-				if !ok {
-					break collect
-				}
-				if next.checkpoint != nil {
-					barrier = next
-					break collect
-				}
-				batch = append(batch, next)
-			default:
-				break collect
+			next, ok := log.nextRequest(waitingDuringSync && len(batch) == 1)
+			if !ok {
+				break
 			}
+			if next.checkpoint != nil {
+				barrier = next
+				break
+			}
+			batch = append(batch, next)
 		}
 		if failure == nil {
 			failure = log.sync(batch)
 		}
+		// Sample before waking the just-synced clients. A queued request
+		// signals overlap, while a lone client can only enqueue after its
+		// reply. Give a woken client one short chance to join that request.
+		waitingDuringSync = failure == nil && len(log.queue) != 0
 		for _, item := range batch {
 			if failure == nil {
 				end += int64(headerSize + len(item.payload))
@@ -243,11 +245,31 @@ func (log *Log) run(end int64) {
 		}
 		if barrier.checkpoint != nil {
 			failure = log.checkpoint(barrier, end, failure)
+			waitingDuringSync = false
 		}
 	}
 	log.closeErr = errors.Join(failure, log.file.Close())
 	if log.lock != nil {
 		log.closeErr = errors.Join(log.closeErr, log.lock.Close())
+	}
+}
+
+func (log *Log) nextRequest(waitForPeer bool) (request, bool) {
+	select {
+	case next, ok := <-log.queue:
+		return next, ok
+	default:
+	}
+	if !waitForPeer {
+		return request{}, false
+	}
+	timer := time.NewTimer(groupCommitWait)
+	defer timer.Stop()
+	select {
+	case next, ok := <-log.queue:
+		return next, ok
+	case <-timer.C:
+		return request{}, false
 	}
 }
 
