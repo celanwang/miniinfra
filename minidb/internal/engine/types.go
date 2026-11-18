@@ -7,31 +7,23 @@ import (
 	"slices"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/celanwang/miniinfra/minidb/internal/sqltypes"
 )
 
-type Kind uint8
+type Kind = sqltypes.Kind
+type Value = sqltypes.Value
 
 const (
-	Null Kind = iota
-	Integer
-	Text
-	Boolean
+	Null    = sqltypes.Null
+	Integer = sqltypes.Integer
+	Text    = sqltypes.Text
+	Boolean = sqltypes.Boolean
 )
 
-type Value struct {
-	Kind Kind
-	Int  int64
-	Text string
-}
-
-func Int(v int64) Value     { return Value{Kind: Integer, Int: v} }
-func String(v string) Value { return Value{Kind: Text, Text: v} }
-func Bool(v bool) Value {
-	if v {
-		return Value{Kind: Boolean, Int: 1}
-	}
-	return Value{Kind: Boolean}
-}
+func Int(v int64) Value     { return sqltypes.Int(v) }
+func String(v string) Value { return sqltypes.String(v) }
+func Bool(v bool) Value     { return sqltypes.Bool(v) }
 
 type Column struct {
 	Name    string

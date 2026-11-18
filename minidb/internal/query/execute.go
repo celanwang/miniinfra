@@ -7,13 +7,10 @@ import (
 	"slices"
 
 	"github.com/celanwang/miniinfra/minidb/internal/engine"
+	"github.com/celanwang/miniinfra/minidb/internal/sqltypes"
 )
 
-type Result struct {
-	Columns  []string
-	Rows     [][]engine.Value
-	Affected int64
-}
+type Result = sqltypes.Result
 
 var (
 	ErrSyntax      = errors.New("invalid SQL")

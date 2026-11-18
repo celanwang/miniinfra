@@ -79,7 +79,7 @@ func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
 		cancel()
 		response := wire.Response{Result: result}
 		if err != nil {
-			response = wire.Failure(err)
+			response = failureResponse(err)
 		}
 		inTx := session.InTransaction()
 		response.InTransaction = &inTx
@@ -91,7 +91,7 @@ func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
 		}
 	}
 	if readErr != nil && ctx.Err() == nil {
-		send(conn, wire.Failure(fmt.Errorf("read request: %w", readErr)))
+		send(conn, failureResponse(fmt.Errorf("read request: %w", readErr)))
 	}
 }
 
@@ -119,12 +119,31 @@ func readRequests(ctx context.Context, conn net.Conn, requests chan<- wire.Reque
 	}
 }
 
+func failureResponse(err error) wire.Response {
+	code := "execution"
+	switch {
+	case errors.Is(err, engine.ErrUnique):
+		code = "unique"
+	case errors.Is(err, engine.ErrDeadlock):
+		code = "deadlock"
+	case errors.Is(err, engine.ErrLockWait):
+		code = "lock_wait"
+	case errors.Is(err, engine.ErrCommitUnknown):
+		code = "commit_unknown"
+	case errors.Is(err, engine.ErrConstraint):
+		code = "constraint"
+	case errors.Is(err, engine.ErrUnavailable):
+		code = "unavailable"
+	}
+	return wire.Response{Code: code, Message: err.Error()}
+}
+
 func send(conn net.Conn, response wire.Response) bool {
 	data, err := wire.Encode(response)
 	if err != nil {
 		// Oversized successful SELECT results may leave an active transaction.
 		// Close the session after reporting the error so its locks are released.
-		data, _ = wire.Encode(wire.Failure(err))
+		data, _ = wire.Encode(failureResponse(err))
 	}
 	if deadlineErr := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); deadlineErr != nil {
 		return false

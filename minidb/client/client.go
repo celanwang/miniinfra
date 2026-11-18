@@ -12,7 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/celanwang/miniinfra/minidb/internal/engine"
+	"github.com/celanwang/miniinfra/minidb/internal/sqltypes"
 	"github.com/celanwang/miniinfra/minidb/internal/wire"
 )
 
@@ -136,16 +136,16 @@ func (c *connection) request(ctx context.Context, sql string, args []driver.Name
 		}
 		switch value := arg.Value.(type) {
 		case nil:
-			req.Args = append(req.Args, engine.Value{})
+			req.Args = append(req.Args, sqltypes.Value{})
 		case int64:
-			req.Args = append(req.Args, engine.Int(value))
+			req.Args = append(req.Args, sqltypes.Int(value))
 		case string:
 			if !utf8.ValidString(value) {
 				return wire.Response{}, fmt.Errorf("MiniDB text parameter %d must be valid UTF-8", arg.Ordinal)
 			}
-			req.Args = append(req.Args, engine.String(value))
+			req.Args = append(req.Args, sqltypes.String(value))
 		case bool:
-			req.Args = append(req.Args, engine.Bool(value))
+			req.Args = append(req.Args, sqltypes.Bool(value))
 		default:
 			return wire.Response{}, fmt.Errorf("unsupported MiniDB parameter type %T", value)
 		}
@@ -222,7 +222,7 @@ func (c *connection) transportError(ctx context.Context, verb string, possiblySe
 
 type rows struct {
 	columns []string
-	data    [][]engine.Value
+	data    [][]sqltypes.Value
 }
 
 func (r *rows) Columns() []string { return r.columns }
@@ -236,13 +236,13 @@ func (r *rows) Next(out []driver.Value) error {
 	}
 	for i, field := range r.data[0] {
 		switch field.Kind {
-		case engine.Null:
+		case sqltypes.Null:
 			out[i] = nil
-		case engine.Integer:
+		case sqltypes.Integer:
 			out[i] = field.Int
-		case engine.Text:
+		case sqltypes.Text:
 			out[i] = field.Text
-		case engine.Boolean:
+		case sqltypes.Boolean:
 			out[i] = field.Int != 0
 		}
 	}
