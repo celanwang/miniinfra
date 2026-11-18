@@ -4,4 +4,5 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB supports concurrent Read Committed transactions and recovers committed data from checkpoints and the write-ahead log.
 - MiniKV serves a sharded in-memory cache over TCP with per-key expiry and bounded eviction.
