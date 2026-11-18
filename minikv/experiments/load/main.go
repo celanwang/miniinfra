@@ -208,6 +208,7 @@ type result struct {
 	RTTP999Microseconds float64
 	ClientCPUSeconds    float64
 	ServerCPUTicks      int64
+	ServerWriteCalls    *int64 `json:",omitempty"`
 }
 
 type lane struct {
@@ -342,6 +343,7 @@ func runLanes(lanes []lane, rate int, window, tick time.Duration) result {
 	start := time.Now().Add(200 * time.Millisecond)
 	before := cpuSeconds()
 	serverBefore := serverTicks()
+	writesBefore, writesAvailable := serverWriteCalls()
 	ordinaryQ := make(chan arrival, 256)
 	backgroundQ := make(chan arrival, background)
 	var wg sync.WaitGroup
@@ -358,6 +360,10 @@ func runLanes(lanes []lane, rate int, window, tick time.Duration) result {
 	wg.Wait()
 	aggregate.ClientCPUSeconds = cpuSeconds() - before
 	aggregate.ServerCPUTicks = serverTicks() - serverBefore
+	if writesAfter, ok := serverWriteCalls(); writesAvailable && ok {
+		calls := writesAfter - writesBefore
+		aggregate.ServerWriteCalls = &calls
+	}
 	var online, rtt []time.Duration
 	for i, from := range laneCounts {
 		to := &aggregate.Ordinary
@@ -412,6 +418,20 @@ func serverTicks() int64 {
 		log.Fatal(err)
 	}
 	return user + system
+}
+
+func serverWriteCalls() (int64, bool) {
+	data, err := os.ReadFile("/proc/1/io")
+	if err != nil {
+		return 0, false
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if count, ok := strings.CutPrefix(line, "syscw:"); ok {
+			calls, err := strconv.ParseInt(strings.TrimSpace(count), 10, 64)
+			return calls, err == nil
+		}
+	}
+	return 0, false
 }
 
 func diagnostics(t target) (json.RawMessage, error) {

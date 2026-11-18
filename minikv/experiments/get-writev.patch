@@ -1,0 +1,45 @@
+diff --git a/minikv/internal/server/server.go b/minikv/internal/server/server.go
+index 031937d..aaadb61 100644
+--- a/minikv/internal/server/server.go
++++ b/minikv/internal/server/server.go
+@@ -151,0 +152,5 @@ func (s *Server) sweep(ctx context.Context) {
++type valueReply struct {
++	header [32]byte
++	parts  net.Buffers
++}
++
+@@ -156 +161 @@ func (s *Server) serveConn(conn net.Conn) {
+-	replyHeader := make([]byte, 0, 32)
++	reply := valueReply{parts: make(net.Buffers, 2)}
+@@ -177 +182 @@ func (s *Server) serveConn(conn net.Conn) {
+-		if !s.handle(conn, reader, keyBuffer[:req.keyBytes], replyHeader, req) {
++		if !s.handle(conn, reader, keyBuffer[:req.keyBytes], &reply, req) {
+@@ -183 +188 @@ func (s *Server) serveConn(conn net.Conn) {
+-func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, replyHeader []byte, req request) bool {
++func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key []byte, reply *valueReply, req request) bool {
+@@ -202 +207 @@ func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, replyHeader []
+-		err = s.writeValue(conn, replyHeader, value)
++		err = s.writeValue(conn, reply, value)
+@@ -273 +278 @@ func (s *Server) writeStatus(conn net.Conn, status string) error {
+-func (s *Server) writeValue(conn net.Conn, header, value []byte) error {
++func (s *Server) writeValue(conn net.Conn, reply *valueReply, value []byte) error {
+@@ -277 +282 @@ func (s *Server) writeValue(conn net.Conn, header, value []byte) error {
+-	header = append(header[:0], "VALUE "...)
++	header := append(reply.header[:0], "VALUE "...)
+@@ -280 +285,2 @@ func (s *Server) writeValue(conn net.Conn, header, value []byte) error {
+-	if _, err := conn.Write(header); err != nil {
++	if len(value) == 0 {
++		_, err := conn.Write(header)
+@@ -283,5 +289,7 @@ func (s *Server) writeValue(conn net.Conn, header, value []byte) error {
+-	if len(value) > 0 {
+-		_, err := conn.Write(value)
+-		return err
+-	}
+-	return nil
++	parts := reply.parts
++	parts[0], parts[1] = header, value
++	_, err := reply.parts.WriteTo(conn)
++	// WriteTo consumes the slice. Drop the value reference even on a partial write.
++	clear(parts)
++	reply.parts = parts
++	return err
