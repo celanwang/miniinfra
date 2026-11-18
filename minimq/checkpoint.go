@@ -161,7 +161,6 @@ func (p *Partition) compact(now TimeBounds) error {
 		stats.prepare = time.Since(start)
 	}
 
-	var files = make(map[string][]byte)
 	sealed := 0
 	width := p.config.SegmentMessages
 	for sealed < len(p.tail) {
@@ -176,13 +175,7 @@ func (p *Partition) compact(now TimeBounds) error {
 		if count < width && now.Lower.Before(newest.Add(p.config.HistoryRetention)) {
 			break
 		}
-		s := segment{Base: chunk[0].Offset, Count: count, Newest: newest}
-		data, err := encodeSegment(&s, chunk, stats)
-		if err != nil {
-			return err
-		}
-		image.Segments = append(image.Segments, s)
-		files[s.name()] = data
+		image.Segments = append(image.Segments, segment{Base: chunk[0].Offset, Count: count, Newest: newest})
 		sealed += count
 	}
 	floor := p.nextOffset()
@@ -198,16 +191,28 @@ func (p *Partition) compact(now TimeBounds) error {
 		if end > floor || now.Lower.Before(s.Newest.Add(p.config.HistoryRetention)) {
 			break
 		}
-		delete(files, s.name())
 		removed++
 		image.First = end
 	}
 	image.Segments = image.Segments[removed:]
 	image.Tail = p.tail[sealed:]
-	if p.journal.End() == 0 && len(files) == 0 && removed == 0 &&
+	if p.journal.End() == 0 && sealed == 0 && removed == 0 &&
 		len(image.Acks) == len(p.acknowledgments) && len(image.Publishes) == len(p.publishes) &&
 		len(image.Dead) == len(p.dead) && len(image.RedriveReceipts) == len(p.redriveReceipts) {
 		return nil
+	}
+	// The retained entries beyond the old sealed prefix are the only new
+	// segments that will be published. Reclaimed tail chunks need no body.
+	newSegments := image.Segments[max(len(p.segments)-removed, 0):]
+	var files = make(map[string][]byte, len(newSegments))
+	for i := range newSegments {
+		s := &newSegments[i]
+		first := int(s.Base - p.tailOffset)
+		data, err := encodeSegment(s, p.tail[first:first+s.Count], stats)
+		if err != nil {
+			return err
+		}
+		files[s.name()] = data
 	}
 	start = checkpointStart(stats)
 	payload, err := json.Marshal(image)
