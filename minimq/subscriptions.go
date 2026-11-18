@@ -78,6 +78,7 @@ type subscription struct {
 	Floor         uint64
 	Tasks         map[uint64]taskState
 	NextRedriveAt time.Time
+	redriveCount  int // Rebuilt from pending redrives when a checkpoint is opened.
 }
 
 type leaseState struct {
@@ -136,6 +137,7 @@ func (p *Partition) applySubscriptions(tx transaction) error {
 			}
 			if u.State.Finished {
 				delete(p.redrives, u.Redrive)
+				sub.redriveCount--
 			} else {
 				task.State = u.State
 				p.redrives[u.Redrive] = task
@@ -221,7 +223,7 @@ func (p *Partition) Pull(name, worker string, limit Limits) ([]Delivery, error) 
 	}
 	var deliveries []Delivery
 	tx := transaction{Lower: now.Lower}
-	if !now.Lower.Before(sub.NextRedriveAt) {
+	if sub.redriveCount != 0 && !now.Lower.Before(sub.NextRedriveAt) {
 		if task, found := p.readyRedrive(name, now, limit.Bytes); found {
 			update := task.update()
 			update.NextRedriveAt = now.Upper.Add(redriveInterval)

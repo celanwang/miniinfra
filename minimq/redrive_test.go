@@ -72,7 +72,8 @@ func TestRedriveBodySurvivesExternalMutationAndSourceRemoval(t *testing.T) {
 	_, err = p.Redrive("notify", deadID, "operator-1")
 	p.config.CapacityBytes = oldCapacity
 	if status, statusErr := p.Status(); !errors.Is(err, ErrCapacity) || statusErr != nil ||
-		status != before || len(p.redriveReceipts) != 0 || p.journal.End() != oldEnd {
+		status != before || len(p.redriveReceipts) != 0 || p.journal.End() != oldEnd ||
+		p.subscriptions["notify"].redriveCount != 0 {
 		t.Fatalf("rejected redrive changed status, receipt or WAL: %v, %v", err, statusErr)
 	}
 	admit := func(op string) RedriveResult {
@@ -212,4 +213,74 @@ func TestRedriveAfterOriginalSegmentAndDeadLetterAreRemoved(t *testing.T) {
 	if err != nil || page.Next != 2 || len(page.Messages) != 1 || page.Messages[0].ID != "new-notice" {
 		t.Fatalf("redrive changed history: %+v, %v", page, err)
 	}
+}
+
+func TestRedriveExpiryScopesSurviveCheckpointAndWAL(t *testing.T) {
+	now := walFixtureTime
+	dir := t.TempDir()
+	cfg := Config{Clock: testClock(&now)}
+	p := openTest(t, dir, cfg)
+	for _, name := range []string{"alpha", "beta"} {
+		registerTest(t, p, name, SubscriptionConfig{MaxAttempts: 1})
+	}
+	publishTest(t, p, "source")
+	registerTest(t, p, "ordinary", SubscriptionConfig{})
+	admit := func(name, deadID, op string) RedriveResult {
+		t.Helper()
+		got, err := p.Redrive(name, deadID, op)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	sourceIDs := make(map[string]string)
+	var deadline time.Time
+	for _, name := range []string{"alpha", "beta"} {
+		d := pullTest(t, p, name, "worker", 1)[0]
+		failure, err := p.Fail(name, "worker", d.Instance, d.Token, "fixture")
+		if err != nil || failure.DeadLetterID == "" {
+			t.Fatalf("source failure for %s = %+v, %v", name, failure, err)
+		}
+		sourceIDs[name] = failure.DeadLetterID
+		pending := admit(name, failure.DeadLetterID, "checkpoint")
+		d = pullTest(t, p, name, "worker", 1)[0]
+		if d.Instance != pending.Instance {
+			t.Fatalf("first redrive for %s = %+v", name, d)
+		}
+		deadline = d.Deadline
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	fromWAL := admit("beta", sourceIDs["beta"], "wal")
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, cfg)
+	checkCounts := func(alpha, beta int) {
+		t.Helper()
+		if a, b := p.subscriptions["alpha"].redriveCount, p.subscriptions["beta"].redriveCount; a != alpha || b != beta ||
+			len(p.redrives) != alpha+beta || p.subscriptions["ordinary"].redriveCount != 0 {
+			t.Fatalf("redrives for alpha/beta = %d/%d with %d total, want %d/%d", a, b, len(p.redrives), alpha, beta)
+		}
+	}
+	checkCounts(1, 2)
+	now = deadline
+	pullTest(t, p, "ordinary", "worker", 0)
+	checkCounts(1, 2)
+	pullTest(t, p, "alpha", "worker", 0)
+	checkCounts(0, 2)
+	if n, err := p.AdvanceRetries(pageLimit); err != nil || n != 1 {
+		t.Fatalf("global expiry = %d, %v", n, err)
+	}
+	checkCounts(0, 1)
+	d := pullTest(t, p, "beta", "worker", 1)[0]
+	if d.Instance != fromWAL.Instance || d.Attempt != 1 {
+		t.Fatalf("remaining WAL redrive = %+v", d)
+	}
+	failure, err := p.Fail("beta", "worker", d.Instance, d.Token, "fixture")
+	if err != nil || failure.DeadLetterID == "" {
+		t.Fatalf("redrive failure = %+v, %v", failure, err)
+	}
+	checkCounts(0, 0)
 }

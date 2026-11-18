@@ -35,10 +35,12 @@ func (t redriveTask) update() taskUpdate {
 }
 
 func (p *Partition) applyRedrive(r redriveAdmission) error {
-	if _, found := p.redrives[r.Task.Instance]; found || p.subscriptions[r.Task.Subscription] == nil {
+	sub := p.subscriptions[r.Task.Subscription]
+	if _, found := p.redrives[r.Task.Instance]; found || sub == nil {
 		return fmt.Errorf("%w: invalid redrive admission", ErrCorrupt)
 	}
 	p.redrives[r.Task.Instance] = r.Task
+	sub.redriveCount++
 	p.redriveReceipts[r.ReceiptKey] = r.Receipt
 	return nil
 }
