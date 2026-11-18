@@ -160,6 +160,8 @@ type Partition struct {
 	scheduled       map[string]scheduledPublication
 	due             scheduleQueue
 	dead            map[string]DeadLetter
+	segments        []segment
+	checkpointBytes int64
 }
 
 // Open loads the partition in dir and takes exclusive ownership until Close.
@@ -177,9 +179,7 @@ func Open(dir string, config Config) (*Partition, error) {
 		scheduled:       make(map[string]scheduledPublication),
 		dead:            make(map[string]DeadLetter),
 	}
-	j, err := journal.Open(dir, func(string) error {
-		return fmt.Errorf("%w: unexpected checkpoint", ErrCorrupt)
-	}, func(data []byte) error {
+	j, err := journal.Open(dir, p.restore, func(data []byte) error {
 		var tx transaction
 		if err := json.Unmarshal(data, &tx); err != nil {
 			return err
@@ -190,6 +190,10 @@ func Open(dir string, config Config) (*Partition, error) {
 		return nil, err
 	}
 	p.journal = j
+	if err := p.collectFiles(); err != nil {
+		j.Close()
+		return nil, err
+	}
 	return p, nil
 }
 
@@ -263,7 +267,15 @@ func (p *Partition) commit(tx transaction) error {
 	if err != nil {
 		return err
 	}
-	if int64(len(frame))+p.reserved+tx.ReserveDelta > p.config.CapacityBytes-p.journal.End() {
+	budget := p.config.CapacityBytes/2 - 4096
+	if int64(len(frame))+p.reserved+tx.ReserveDelta > budget-p.storageBytes() {
+		return ErrCapacity
+	}
+	available, err := p.journal.Available()
+	if err != nil {
+		return err
+	}
+	if int64(len(frame))+p.reserved+tx.ReserveDelta+8192 > available {
 		return ErrCapacity
 	}
 	if err := p.journal.Append(frame); err != nil {

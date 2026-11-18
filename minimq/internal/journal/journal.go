@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -111,6 +112,17 @@ func Open(dir string, restore func(string) error, replay func([]byte) error) (_ 
 func (j *Journal) start() error {
 	j.generation = 1
 	path := generationPath(j.dir, "journal", 1)
+	entries, err := os.ReadDir(j.dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if ownedFile(name, "checkpoint-") || ownedFile(name, "history-") ||
+			(ownedFile(name, "journal-") && name != filepath.Base(path)) {
+			return fmt.Errorf("%w: HEAD missing for existing partition", ErrCorrupt)
+		}
+	}
 	info, err := os.Stat(path)
 	if err == nil && info.Size() != 0 {
 		return fmt.Errorf("%w: HEAD missing for nonempty journal", ErrCorrupt)
@@ -131,7 +143,16 @@ func (j *Journal) start() error {
 	return j.installHead(1, 0)
 }
 
-func (j *Journal) End() int64 { return j.end }
+func (j *Journal) End() int64  { return j.end }
+func (j *Journal) Dir() string { return j.dir }
+
+func (j *Journal) Available() (int64, error) {
+	var stats syscall.Statfs_t
+	if err := syscall.Statfs(j.dir, &stats); err != nil {
+		return 0, err
+	}
+	return int64(stats.Bavail) * int64(stats.Bsize), nil
+}
 
 func EncodeFrame(payload []byte) ([]byte, error) {
 	if len(payload) == 0 || len(payload) > maxFrame {
@@ -196,6 +217,85 @@ func (j *Journal) installHead(generation uint64, end int64) error {
 	binary.LittleEndian.PutUint64(data[12:], uint64(end))
 	binary.LittleEndian.PutUint32(data[20:], crc32.ChecksumIEEE(data[:20]))
 	return InstallFile(j.dir, filepath.Join(j.dir, "HEAD"), data)
+}
+
+func (j *Journal) Checkpoint(data []byte) error {
+	if j.failed != nil {
+		return j.failed
+	}
+	if err := j.checkpoint(data); err != nil {
+		j.failed = fmt.Errorf("partition requires recovery after checkpoint write: %w", err)
+		return j.failed
+	}
+	return nil
+}
+
+func (j *Journal) checkpoint(data []byte) error {
+	next := j.generation + 1
+	if err := InstallFile(j.dir, generationPath(j.dir, "checkpoint", next), data); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(generationPath(j.dir, "journal", next), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := syncDirectory(j.dir); err != nil {
+		file.Close()
+		return err
+	}
+	if err := j.installHead(next, 0); err != nil {
+		file.Close()
+		return err
+	}
+	previous := j.file
+	j.file, j.generation, j.end = file, next, 0
+	return previous.Close()
+}
+
+// Collect removes obsolete files owned by the partition after HEAD is durable.
+func (j *Journal) Collect(historyFiles map[string]bool) error {
+	entries, err := os.ReadDir(j.dir)
+	if err != nil {
+		return err
+	}
+	journalName := filepath.Base(generationPath(j.dir, "journal", j.generation))
+	checkpointName := filepath.Base(generationPath(j.dir, "checkpoint", j.generation))
+	changed := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || name == journalName || name == checkpointName || historyFiles[name] {
+			continue
+		}
+		if !strings.HasPrefix(name, ".minimq-") && !ownedFile(name, "journal-") &&
+			!ownedFile(name, "checkpoint-") && !ownedFile(name, "history-") {
+			continue
+		}
+		if err := os.Remove(filepath.Join(j.dir, name)); err != nil {
+			return err
+		}
+		changed = true
+	}
+	if changed {
+		return syncDirectory(j.dir)
+	}
+	return nil
+}
+
+func ownedFile(name, prefix string) bool {
+	id, found := strings.CutPrefix(name, prefix)
+	if !found || len(id) != 16 {
+		return false
+	}
+	for _, c := range id {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // InstallFile makes data durable before publishing its name.
