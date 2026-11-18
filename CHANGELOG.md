@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB shares its MVCC cleanup budget across tables so quiet tables do not delay reclamation on busy ones.
 - MiniKV reuses receive buffers for nearby large write sizes to reduce memory pressure when a full cache rejects writes.
 - MiniMQ reads sealed message bodies from disk on demand and protects active history reads during segment reclamation.
 - MiniDB reclaims obsolete row and index versions online and coalesces commits queued during a WAL flush.
