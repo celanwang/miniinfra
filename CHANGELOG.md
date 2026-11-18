@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB reuses snapshot rows during projection, saving one copy per root row in single-table queries and joins.
 - MiniKV reuses the connection reply buffer for short status lines, eliminating their per-response allocation.
 - MiniMQ verifies lease recovery and idempotent acknowledgment retries after a lost reply and broker restart.
 - MiniDB skips redundant secondary index key encoding during uniqueness checks on inserts and updates.
