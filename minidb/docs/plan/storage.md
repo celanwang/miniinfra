@@ -210,3 +210,65 @@ MINIDB_LOCK_LOAD=1 GOMAXPROCS=4 /tmp/minidb-locks \
   -test.run '^TestTCPMultiRowLockLoad$' -test.bench '^BenchmarkLockAcquisition$' \
   -test.benchtime=100000x -test.benchmem -test.count=1 -test.v
 ```
+
+### SQL P99 复验
+
+独立验收用每轮 280 笔订单复测时，逐轮 SQL P99 的中位数由 1.59 ms 升到 2.55 ms。为区分版本影响和同机波动，保持 SQL、两位客户端、`GOMAXPROCS=4` 和数据生成方式，每轮交易数增加到 2,000 笔。两版使用同一份无分段探针的源码 `ce798e6`，A 只用 Go overlay 换回 `bc79470` 的 `internal/engine/locks.go`，B 使用按需定时器。每版各编译一次。只运行无争用子用例。使用同机磁盘基准锁，轮询已知 MiniKV、MiniMQ 进程，有重叠的三轮重跑。
+
+最先连续运行 A/A 和 B/B。SQL P99 分别为 1.764、1.230 ms 和 1.790、1.642 ms，同二进制各差 0.534 ms 和 0.149 ms。随后按 A B B A B A A B 交错运行，四个相邻配对的 B 减 A 差值为 −0.305、−0.179、−0.269 和 −2.415 ms。最后一个配对的 A 为 3.797 ms。汇总 12 轮时，逐轮中位数如下。
+
+| 指标 | A，预建定时器 | B，按需定时器 |
+| --- | ---: | ---: |
+| SQL 中位，ms | 0.434 | 0.434 |
+| SQL P99，ms | 1.659 | 1.416 |
+| COMMIT P99，ms | 9.589 | 9.490 |
+| WAL 排队 P99，ms | 4.752 | 4.720 |
+| 单轮进程 CPU，s | 1.969 | 2.004 |
+| 每单进程级分配次数 | 约 399 | 约 347 |
+
+另用可选分段探针各跑两轮，每轮 1,200 笔。按同一笔订单对齐四条 TCP 写语句。服务端计量解码完毕到开始执行的交接、SQL 执行、执行完毕到准备回复。取锁时间是执行的子集。剩余的客户端往返包括驱动、传输、编解码和其他调度等待，探针分辨不了这几项各自的耗时。
+
+| 同一笔 P99 边界订单 | A，两轮范围 | B，两轮范围 |
+| --- | ---: | ---: |
+| SQL 总计，ms | 1.581–2.044 | 1.157–1.346 |
+| 客户端往返剩余部分，ms | 0.971–1.354 | 0.793–1.082 |
+| 服务端解码后交接，µs | 51–60 | 97–227 |
+| SQL 执行，ms | 0.164–1.019 | 0.133–0.162 |
+| 其中取锁，µs | 34–43 | 15–16 |
+
+两边均没有逻辑行锁或唯一键等待。最慢 1% 内，B 的每笔取锁累计最多 19.3 µs。A 有个别超过 3 ms 的取锁墙钟样本，但锁管理器互斥等待的尾组均值低于 1 µs。全进程 Go 可运行队列延迟的 P99 上界约为 49 µs 和 41 µs，无法按此量给单笔订单归因。P99 附近的大段时间主要落在取锁以外。
+
+较长对照未复现早期的候选端尾延迟升高。保留按需定时器的依据仍是每单约 52 次分配的下降。对照结果没有用于承诺端到端加速。
+
+分段探针保存在 `internal/engine/testdata/lock-tail-observation.patch`。常规构建的服务接口、请求结构及执行路径与 `ed1f850` 一致。恢复常规构建后再按 A B B A 跑四轮，每轮 2,000 笔。两个配对的 SQL P99 分别为 1.329 → 1.340 ms、1.185 → 1.196 ms，均相差约 0.011 ms。B 的每单进程级分配仍约为 347 次，A 为 399 次。
+
+在临时目录构建常规长档。磁盘基准串行运行，A/A、B/B 用各自同一份二进制。
+
+```sh
+repo=$(git rev-parse --show-toplevel)
+scratch=$(mktemp -d)
+git -C "$repo" archive ce798e6 minidb | tar -x -C "$scratch"
+git -C "$repo" show bc79470:minidb/internal/engine/locks.go > "$scratch/old-locks.go"
+python3 - "$scratch" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+(p / "old.json").write_text(json.dumps({"Replace": {
+    str(p / "minidb/internal/engine/locks.go"): str(p / "old-locks.go")
+}}))
+PY
+cd "$scratch/minidb"
+GOWORK=off go test -overlay "$scratch/old.json" -c -o "$scratch/A" ./internal/engine
+GOWORK=off go test -c -o "$scratch/B" ./internal/engine
+for variant in A A B B A B B A B A A B; do
+  MINIDB_LOCK_LOAD=1 MINIDB_LOCK_ORDERS=1000 GOMAXPROCS=4 "$scratch/$variant" \
+    -test.run '^TestTCPMultiRowLockLoad$/^disjoint$' -test.count=1 -test.v
+done
+```
+
+分段档先在临时目录应用补丁，再重编上述两版。运行同一子用例，另设置 `MINIDB_LOCK_ORDERS=600 MINIDB_LOCK_TRACE=1`。
+
+```sh
+git -C "$scratch" apply --unidiff-zero \
+  "$repo/minidb/internal/engine/testdata/lock-tail-observation.patch"
+```
