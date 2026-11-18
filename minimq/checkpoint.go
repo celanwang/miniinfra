@@ -153,8 +153,8 @@ func (p *Partition) compact(now TimeBounds) error {
 	for _, sub := range p.subscriptions {
 		floor = min(floor, sub.Floor)
 	}
-	if p.readStart != nil {
-		floor = min(floor, *p.readStart)
+	if start := p.readStart.Load(); start != nil {
+		floor = min(floor, *start)
 	}
 	removed := 0
 	for _, s := range image.Segments {

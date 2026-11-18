@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -160,7 +161,7 @@ type Partition struct {
 	sequence        uint64
 	timeLower       time.Time
 	firstOffset     uint64
-	readStart       *uint64
+	readStart       atomic.Pointer[uint64]
 	tailOffset      uint64
 	tail            []storedMessage
 	publishes       map[string]publishReceipt
@@ -373,18 +374,20 @@ func (p *Partition) planHistoryRead(offset uint64, limit Limits) ([]historyLocat
 		batch = append(batch, loc)
 	}
 	if batch[0].segment != nil {
-		p.readStart = &offset
+		p.readStart.Store(&offset)
 	}
 	return batch, nil
 }
 
 func (p *Partition) finishHistoryRead(err error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.readStart = nil
-	if err != nil && p.failed == nil {
-		p.failed = err
+	if err != nil {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.failed == nil {
+			p.failed = err
+		}
 	}
+	p.readStart.Store(nil)
 }
 
 func (p *Partition) Read(offset uint64, limit Limits) (HistoryPage, error) {
