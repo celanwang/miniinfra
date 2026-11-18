@@ -111,14 +111,23 @@ type publishReceipt struct {
 }
 
 type transaction struct {
-	Sequence uint64
-	Lower    time.Time
-	Publish  *publication
+	Sequence     uint64
+	Lower        time.Time
+	Publish      *publication
+	Register     *registration
+	Tasks        []taskUpdate
+	Ack          *ackReceipt
+	ReserveDelta int64
 }
 
 type publication struct {
 	Message Message
 	Receipt publishReceipt
+}
+
+type storedMessage struct {
+	Message
+	AcceptedSequence uint64
 }
 
 type Partition struct {
@@ -128,11 +137,14 @@ type Partition struct {
 	closed  bool
 	failed  error
 
-	sequence    uint64
-	timeLower   time.Time
-	firstOffset uint64
-	history     []Message
-	publishes   map[string]publishReceipt
+	sequence        uint64
+	timeLower       time.Time
+	firstOffset     uint64
+	history         []storedMessage
+	publishes       map[string]publishReceipt
+	subscriptions   map[string]*subscription
+	acknowledgments map[string]ackReceipt
+	reserved        int64
 }
 
 // Open loads the partition in dir and takes exclusive ownership until Close.
@@ -143,7 +155,11 @@ func Open(dir string, config Config) (*Partition, error) {
 		config.SegmentMessages > MaxBatchMessages {
 		return nil, ErrInvalid
 	}
-	p := &Partition{config: config, publishes: make(map[string]publishReceipt)}
+	p := &Partition{
+		config: config, publishes: make(map[string]publishReceipt),
+		subscriptions:   make(map[string]*subscription),
+		acknowledgments: make(map[string]ackReceipt),
+	}
 	j, err := journal.Open(dir, func(string) error {
 		return fmt.Errorf("%w: unexpected checkpoint", ErrCorrupt)
 	}, func(data []byte) error {
@@ -190,14 +206,21 @@ func (p *Partition) apply(tx transaction) error {
 		if pub.Message.Offset != p.nextOffset() {
 			return fmt.Errorf("%w: unexpected message offset", ErrCorrupt)
 		}
-		p.history = append(p.history, pub.Message)
+		p.history = append(p.history, storedMessage{Message: pub.Message, AcceptedSequence: tx.Sequence})
 		p.publishes[pub.Message.ID] = pub.Receipt
+	}
+	if err := p.applySubscriptions(tx); err != nil {
+		return err
+	}
+	p.reserved += tx.ReserveDelta
+	if p.reserved < 0 {
+		return fmt.Errorf("%w: negative completion budget", ErrCorrupt)
 	}
 	p.sequence, p.timeLower = tx.Sequence, tx.Lower
 	return nil
 }
 
-func (p *Partition) commit(tx transaction, admission int64) error {
+func (p *Partition) commit(tx transaction) error {
 	tx.Sequence = p.sequence + 1
 	data, err := json.Marshal(tx)
 	if err != nil {
@@ -207,7 +230,7 @@ func (p *Partition) commit(tx transaction, admission int64) error {
 	if err != nil {
 		return err
 	}
-	if int64(len(frame))+admission > p.config.CapacityBytes-p.journal.End() {
+	if int64(len(frame))+p.reserved+tx.ReserveDelta > p.config.CapacityBytes-p.journal.End() {
 		return ErrCapacity
 	}
 	if err := p.journal.Append(frame); err != nil {
@@ -243,11 +266,11 @@ func (p *Partition) Publish(req PublishRequest) (PublishResult, error) {
 		return old.Result, nil
 	}
 	result := PublishResult{ID: req.ID, Offset: p.nextOffset()}
-	tx := transaction{Lower: now.Lower, Publish: &publication{
+	tx := transaction{Lower: now.Lower, ReserveDelta: p.publicationReserve(len(req.Body)), Publish: &publication{
 		Message: Message{ID: req.ID, Offset: result.Offset, Body: bytes.Clone(req.Body), PublishedAt: now.Upper},
 		Receipt: publishReceipt{Digest: digest, Result: result, Expires: now.Upper.Add(p.config.DedupRetention)},
 	}}
-	if err := p.commit(tx, 0); err != nil {
+	if err := p.commit(tx); err != nil {
 		return PublishResult{}, err
 	}
 	return result, nil
@@ -267,7 +290,7 @@ func (p *Partition) Read(offset uint64, limit Limits) (HistoryPage, error) {
 	}
 	page := HistoryPage{Next: offset}
 	for page.Next < p.nextOffset() && len(page.Messages) < limit.Messages {
-		msg := p.history[page.Next-p.firstOffset]
+		msg := p.history[page.Next-p.firstOffset].Message
 		if len(msg.Body) > limit.Bytes {
 			if len(page.Messages) == 0 {
 				return HistoryPage{}, fmt.Errorf("%w: next message requires %d bytes", ErrInvalid, len(msg.Body))
