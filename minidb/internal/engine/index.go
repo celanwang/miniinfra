@@ -100,19 +100,22 @@ func (page *indexPage) insert(key string, v *version, slot int) (string, *indexP
 	return pivot, sibling
 }
 
-func (idx *index) remove(key string, row *version) {
+func (idx *index) remove(row *version) {
 	link := &row.indexLinks[idx.slot]
-	switch {
-	case link.previous != nil:
+	if link.previous != nil {
 		link.previous.indexLinks[idx.slot].next = link.next
-	case link.next != nil:
-		page := idx.root.leaf(key)
-		at, _ := slices.BinarySearch(page.keys, key)
-		page.rows[at] = link.next
-	default:
-		idx.root.removeKey(key)
-		for len(idx.root.children) == 1 {
-			idx.root = idx.root.children[0]
+	} else {
+		// Only removing the head changes the leaf entry for this key.
+		key, _ := key(row.values, idx.def.Columns)
+		if link.next != nil {
+			page := idx.root.leaf(key)
+			at, _ := slices.BinarySearch(page.keys, key)
+			page.rows[at] = link.next
+		} else {
+			idx.root.removeKey(key)
+			for len(idx.root.children) == 1 {
+				idx.root = idx.root.children[0]
+			}
 		}
 	}
 	if link.next != nil {
