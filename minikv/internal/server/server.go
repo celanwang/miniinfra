@@ -50,12 +50,12 @@ type budget struct {
 	used  atomic.Int64
 }
 
-func (b *budget) reserve(n int64) bool {
+func (b *budget) reserve(n int64, attempts int) bool {
 	if n == 0 {
 		return true
 	}
 	// Bound CAS retries so callers holding a shard lock never wait indefinitely.
-	for range 8 {
+	for range attempts {
 		used := b.used.Load()
 		if n > b.limit-used {
 			return false
@@ -233,7 +233,8 @@ func (s *Server) reserveInbound(keySize, valueSize int) (int64, bool) {
 		return 0, false
 	}
 	total := keyBytes + valueBytes
-	return total, s.inbound.reserve(total)
+	// Inbound admission runs outside the shard lock and rejection closes the stream.
+	return total, s.inbound.reserve(total, 16)
 }
 
 func (s *Server) receive(reader *bufio.Reader, key []byte, req request, bufferSize int) ([]byte, store.Result, error) {
@@ -259,7 +260,7 @@ func (s *Server) receive(reader *bufio.Reader, key []byte, req request, bufferSi
 		return nil, result, nil
 	}
 	value, result := s.cache.Get(key, func(n int64) bool {
-		return n <= s.config.OutboundPerConn && s.outbound.reserve(n)
+		return n <= s.config.OutboundPerConn && s.outbound.reserve(n, 8)
 	})
 	return value, result, nil
 }
