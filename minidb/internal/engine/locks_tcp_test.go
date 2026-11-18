@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/celanwang/miniinfra/minidb/client"
 	"github.com/celanwang/miniinfra/minidb/internal/engine"
 )
 
@@ -111,6 +113,58 @@ func TestTCPMultiRowLockLoad(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestTCPUniqueWaitFollowsHolderOutcome(t *testing.T) {
+	for _, outcome := range []string{"commit", "rollback"} {
+		t.Run(outcome, func(t *testing.T) {
+			store, pool, _ := openLockLoad(t)
+			holder, waiter := beginScanWriter(t, pool), beginScanWriter(t, pool)
+			defer holder.Rollback()
+			defer waiter.Rollback()
+			execSQL(t, holder, "insert into lock_orders values (1,'same-request')")
+			execSQL(t, waiter, lockLoadUpdate, 3)
+			result := make(chan error, 1)
+			go func() {
+				_, err := waiter.ExecContext(t.Context(), "insert into lock_orders values (2,'same-request')")
+				result <- err
+			}()
+			until(t, "unique request waiter", 2*time.Second, func() bool {
+				return store.ObserveReclamation().Waiters == 1
+			})
+			var wantID, wantQuantity int64
+			if outcome == "commit" {
+				if err := holder.Commit(); err != nil {
+					t.Fatal(err)
+				}
+				var conflict *client.Error
+				if err := <-result; !errors.As(err, &conflict) || conflict.Code != client.Unique {
+					t.Fatalf("waiter did not see committed unique key: %v", err)
+				}
+				if err := waiter.Commit(); err == nil {
+					t.Fatal("waiter committed after unique conflict")
+				}
+				wantID, wantQuantity = 1, 0
+			} else {
+				if err := holder.Rollback(); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-result; err != nil {
+					t.Fatal(err)
+				}
+				if err := waiter.Commit(); err != nil {
+					t.Fatal(err)
+				}
+				wantID, wantQuantity = 2, 1
+			}
+			if id := readQty(t, pool, "select id from lock_orders where request_no = ?", "same-request"); id != wantID {
+				t.Fatalf("unique key belongs to %d, want %d", id, wantID)
+			}
+			if qty := readQty(t, pool, "select qty from lock_stock where id = ?", 3); qty != wantQuantity {
+				t.Fatalf("waiter's stock has quantity %d, want %d", qty, wantQuantity)
+			}
+		})
+	}
 }
 
 func openLockLoad(t *testing.T) (*engine.DB, *sql.DB, func() engine.CheckpointLoadObservation) {
