@@ -7,7 +7,7 @@ import (
 
 func testStore(t *testing.T, bytes int64, entries, samples int) (*Store, *time.Duration) {
 	t.Helper()
-	s, err := New(Config{1, bytes + int64(entries)*slotBudget, entries, samples})
+	s, err := New(Config{Shards: 1, BytesPerShard: bytes + int64(entries)*slotBudget, EntriesPerShard: entries, Samples: samples})
 	if err != nil {
 		t.Fatal(err)
 	}

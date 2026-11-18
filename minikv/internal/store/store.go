@@ -21,6 +21,7 @@ const (
 	NoSpace
 	Busy
 	Invalid
+	NotCached
 )
 
 const (
@@ -34,6 +35,7 @@ type Config struct {
 	BytesPerShard   int64
 	EntriesPerShard int
 	Samples         int
+	AdmissionWindow time.Duration
 }
 
 type Store struct {
@@ -70,14 +72,23 @@ type shard struct {
 	evicted   uint64
 	expired   uint64
 	rejected  uint64
+	admission *admission
 }
 
 func New(config Config) (*Store, error) {
 	if config.Shards < 1 || config.EntriesPerShard < 1 ||
 		int64(config.EntriesPerShard) > math.MaxUint32 ||
-		config.BytesPerShard <= int64(config.EntriesPerShard)*slotBudget ||
+		config.AdmissionWindow < 0 ||
 		config.Samples < 1 || config.Samples > maxSamples {
 		return nil, errors.New("invalid shard capacity or sample count")
+	}
+
+	reserved := int64(config.EntriesPerShard) * slotBudget
+	if config.AdmissionWindow > 0 {
+		reserved += admissionBytes
+	}
+	if config.BytesPerShard <= reserved {
+		return nil, errors.New("shard byte budget must exceed metadata reservation")
 	}
 
 	start := time.Now()
@@ -90,7 +101,10 @@ func New(config Config) (*Store, error) {
 		sh := &s.shards[i]
 		sh.index = make(map[string]uint32, config.EntriesPerShard)
 		sh.entries = make([]entry, 0, config.EntriesPerShard)
-		sh.usedBytes = int64(config.EntriesPerShard) * slotBudget
+		sh.usedBytes = reserved
+		if config.AdmissionWindow > 0 {
+			sh.admission = &admission{window: config.AdmissionWindow, seed: maphash.MakeSeed()}
+		}
 		sh.byteLimit = config.BytesPerShard
 		sh.samples = config.Samples
 	}
@@ -156,6 +170,10 @@ func (s *Store) Set(key string, value []byte, ttl time.Duration, onlyMissing boo
 			return Invalid
 		}
 		next.deadline = published + ttl
+	}
+	if onlyMissing && sh.admission != nil && len(victims) > 0 &&
+		!sh.entries[victims[len(victims)-1]].expired(now) && !sh.admission.seen(key, now) {
+		return NotCached
 	}
 	sh.order++
 	next.order = sh.order

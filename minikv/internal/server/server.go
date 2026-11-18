@@ -210,6 +210,8 @@ func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, replyHeader []
 		response = "EXISTS\n"
 	case store.NoSpace:
 		response = "NO_SPACE\n"
+	case store.NotCached:
+		response = "NOT_CACHED\n"
 	case store.Busy:
 		response = "BUSY\n"
 	case store.Invalid:
