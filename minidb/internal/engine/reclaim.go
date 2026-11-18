@@ -36,7 +36,7 @@ func (db *DB) reclaimStep() (examined, removed int) {
 		return 0, 0
 	}
 
-	oldest := db.oldestSnapshot()
+	views := db.captureReclaimViews()
 	db.catalog.RLock()
 	// The catalog appends tables without changing existing entries.
 	tables := db.tableOrder
@@ -46,7 +46,7 @@ func (db *DB) reclaimStep() (examined, removed int) {
 	for visited := 0; budget > 0 && visited < len(tables); visited++ {
 		tbl := tables[db.reclaimTable]
 		db.reclaimTable = (db.reclaimTable + 1) % len(tables)
-		scanned, collected := tbl.reclaimWithin(oldest, budget)
+		scanned, collected := tbl.reclaimWithin(&views, budget)
 		examined += scanned
 		removed += collected
 		budget -= max(1, scanned)
@@ -54,7 +54,7 @@ func (db *DB) reclaimStep() (examined, removed int) {
 	return examined, removed
 }
 
-func (tbl *table) reclaimWithin(oldest uint64, budget int) (examined, removed int) {
+func (tbl *table) reclaimWithin(views *reclaimViews, budget int) (examined, removed int) {
 	tbl.mu.Lock()
 	defer tbl.mu.Unlock()
 	if len(tbl.pages) == 0 {
@@ -69,7 +69,7 @@ func (tbl *table) reclaimWithin(oldest uint64, budget int) (examined, removed in
 		page, slot := tbl.reclaimSlot/heapPageRows, tbl.reclaimSlot%heapPageRows
 		row := tbl.pages[page][slot]
 		examined++
-		if row.obsolete(oldest) {
+		if row.obsolete(views) {
 			tbl.removeVersion(page, slot, row)
 			size--
 			removed++
@@ -82,7 +82,7 @@ func (tbl *table) reclaimWithin(oldest uint64, budget int) (examined, removed in
 
 // Active creations and removals have sequence zero. An aborted removal
 // leaves its predecessor live and can be detached even under a pinned view.
-func (row *version) obsolete(oldest uint64) bool {
+func (row *version) obsolete(views *reclaimViews) bool {
 	created := row.created.sequence.Load()
 	if created == abortedSequence {
 		return true
@@ -95,7 +95,7 @@ func (row *version) obsolete(oldest uint64) bool {
 		row.ended = nil
 		return false
 	}
-	return ended != 0 && ended <= oldest
+	return views.excludes(created, ended)
 }
 
 func (tbl *table) removeVersion(page, slot int, row *version) {

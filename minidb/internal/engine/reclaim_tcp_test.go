@@ -360,6 +360,7 @@ func totalVersions(t *testing.T, view engine.ReclaimObservation) engine.VersionO
 			t.Fatalf("heap and index candidates differ on %s: %+v", table, one)
 		}
 		sum.Heap += one.Heap
+		sum.VersionBytes += one.VersionBytes
 		sum.Primary += one.Primary
 		sum.Secondary += one.Secondary
 		sum.Current += one.Current

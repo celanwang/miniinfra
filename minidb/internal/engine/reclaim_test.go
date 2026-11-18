@@ -5,30 +5,41 @@ import (
 	"testing"
 )
 
-func TestPinnedStatementSurvivesCommitsAndReclamation(t *testing.T) {
+func TestPinnedStatementsKeepOnlyVisibleHistory(t *testing.T) {
 	db := seedHistory(t, t.TempDir(), 1)
-	reader, pinned := start(t, db)
+	reader, oldest := start(t, db)
 	const updates = 40
+	var middle Snapshot
 	for i := range updates {
+		if i == updates/2 {
+			middle = snapshot(t, reader)
+		}
 		if err := cycleStock(t.Context(), db, 1, i%2 == 0); err != nil {
 			t.Fatal(err)
 		}
 	}
-	want := updates/2 + 1
-	waitForHistory(t, db, historyCounts{want, want, want})
-	wantStock(t, pinned, 0, Int(1), 0)
-	wantStock(t, pinned, 1, String("hot"), 0)
-	rows, _, err := pinned.Rows(schema.Name, nil, nil)
-	if err != nil || len(rows) != 1 || rows[0][2] != Int(0) {
-		t.Fatalf("heap scan lost the pinned row: %v %v", rows, err)
+	waitForHistory(t, db, historyCounts{3, 3, 3})
+	for _, previous := range []struct {
+		view Snapshot
+		qty  int64
+	}{{oldest, 0}, {middle, updates / 4}} {
+		wantStock(t, previous.view, 0, Int(1), previous.qty)
+		wantStock(t, previous.view, 1, String("hot"), previous.qty)
+		rows, _, err := previous.view.Rows(schema.Name, nil, nil)
+		if err != nil || len(rows) != 1 || rows[0][2] != Int(previous.qty) {
+			t.Fatalf("heap scan lost the pinned row: %v %v", rows, err)
+		}
 	}
 
-	newView := snapshot(t, reader)
-	wantStock(t, newView, 1, String("hot"), updates/2)
-	pinned.Close()
-	pinned.Close()
+	latest := snapshot(t, reader)
+	wantStock(t, latest, 1, String("hot"), updates/2)
+	oldest.Close()
+	oldest.Close()
+	waitForHistory(t, db, historyCounts{2, 2, 2})
+	wantStock(t, middle, 1, String("hot"), updates/4)
+	middle.Close()
 	waitForHistory(t, db, historyCounts{1, 1, 1})
-	wantStock(t, newView, 0, Int(1), updates/2)
+	wantStock(t, latest, 0, Int(1), updates/2)
 }
 
 func TestReclaimKeepsActiveVersionAndAbortedPredecessor(t *testing.T) {
@@ -160,4 +171,87 @@ func TestReclaimSharesSlotBudgetAcrossSparseTables(t *testing.T) {
 	if got := historyFor(db, 1, "hot"); got != (historyCounts{1, 1, 1}) {
 		t.Fatalf("busy table did not converge: %+v", got)
 	}
+}
+
+func TestReclaimKeepsVersionsForSnapshotsRegisteredAfterCapture(t *testing.T) {
+	db := seedHistory(t, t.TempDir(), 1)
+	db.stopReclaimer()
+	<-db.reclaimerDone
+
+	_, oldest := start(t, db)
+	if err := cycleStock(t.Context(), db, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	views := db.captureReclaimViews()
+	_, late := start(t, db)
+	if err := cycleStock(t.Context(), db, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := db.table(schema.Name, db.published.Load())
+	if _, removed := tbl.reclaimWithin(&views, reclaimBudget); removed != 0 {
+		t.Fatal("sweep reclaimed a version ended after capture")
+	}
+	wantStock(t, oldest, 1, String("hot"), 0)
+	wantStock(t, late, 1, String("hot"), 1)
+	late.Close()
+	if _, removed := db.reclaimStep(); removed != 1 {
+		t.Fatalf("released version remained in a later sweep: removed=%d", removed)
+	}
+}
+
+func TestReclaimFallsBackForManyPinsAndCompletedWriterViews(t *testing.T) {
+	t.Run("many pins", func(t *testing.T) {
+		db := seedHistory(t, t.TempDir(), 1)
+		db.stopReclaimer()
+		<-db.reclaimerDone
+
+		reader, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reader.Rollback()
+		var pins []Snapshot
+		for range maxExactSnapshots + 1 {
+			pins = append(pins, snapshot(t, reader))
+		}
+		for range 4 {
+			if err := cycleStock(t.Context(), db, 1, true); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, removed := db.reclaimStep(); removed != 0 {
+			t.Fatal("sweep exceeded the bound on exact snapshot searches")
+		}
+		pins[0].Close()
+		if _, removed := db.reclaimStep(); removed != 3 {
+			t.Fatalf("bounded snapshot search did not resume: removed=%d", removed)
+		}
+		wantStock(t, pins[1], 1, String("hot"), 0)
+	})
+
+	t.Run("completed writer view", func(t *testing.T) {
+		db := seedHistory(t, t.TempDir(), 1)
+		db.stopReclaimer()
+		<-db.reclaimerDone
+
+		writer, view := start(t, db)
+		changed, err := view.Mutate(t.Context(), schema.Name, []Value{Int(1)}, func(row []Value) ([]Value, bool, error) {
+			row[2] = Int(5)
+			return row, true, nil
+		})
+		if err != nil || !changed {
+			t.Fatalf("update: %v %v", changed, err)
+		}
+		commit(t, writer)
+		if err := cycleStock(t.Context(), db, 1, true); err != nil {
+			t.Fatal(err)
+		}
+
+		db.reclaimStep()
+		wantStock(t, view, 1, String("hot"), 5)
+		view.Close()
+		if _, removed := db.reclaimStep(); removed != 2 {
+			t.Fatalf("finished writer's version remained pinned: removed=%d", removed)
+		}
+	})
 }
