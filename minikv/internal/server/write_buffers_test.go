@@ -90,3 +90,26 @@ func TestLargeWritesKeepBufferOwnershipAndFrameBoundary(t *testing.T) {
 	other.send(t, "GET 1\nk")
 	other.value(t, adjacent)
 }
+
+func TestRoundedReceiveCapacityUsesAndReturnsInboundBudget(t *testing.T) {
+	const bucket = 128 << 10
+	for _, test := range []struct {
+		name     string
+		perConn  int64
+		reserved int64
+	}{
+		{"rounds", bucket + 1, bucket + 1},
+		{"falls back to exact capacity", bucket, bucket},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := testServer(t, 2, func(c *Config) { c.InboundPerConn = test.perConn })
+			client := s.pipe(t)
+			client.send(t, fmt.Sprintf("SET 1 %d NONE\nkx", bucket-1))
+			waitBudget(t, &s.inbound, test.reserved)
+			_ = client.Close()
+			waitBudget(t, &s.inbound, 0)
+			other := s.pipe(t)
+			other.exchange(t, "GET 1\nk", "MISS\n")
+		})
+	}
+}

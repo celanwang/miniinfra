@@ -5,15 +5,29 @@ import "sync"
 const (
 	minReusableWriteBytes = 64 << 10
 	maxIdleWriteBytes     = 8 << 20
+	writeBufferStep       = 4 << 10
 )
 
-// writeBuffers retains only unpublished receive buffers. Each retained
-// capacity is exact, so reuse never increases a stored value's byte charge.
+// writeBuffers retains only unpublished receive buffers, indexed by the
+// backing capacity reserved from the instance's inbound budget.
 type writeBuffers struct {
 	mu    sync.Mutex
 	idle  [][]byte
 	bytes int64
 	limit int64
+}
+
+func (p *writeBuffers) rounded(size, maxValue int) int {
+	if size < minReusableWriteBytes {
+		return size
+	}
+	if remainder := size % writeBufferStep; remainder != 0 {
+		padding := writeBufferStep - remainder
+		if padding <= maxValue-size && int64(size)+int64(padding) <= p.limit {
+			return size + padding
+		}
+	}
+	return size
 }
 
 func (p *writeBuffers) take(size int) []byte {

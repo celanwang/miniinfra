@@ -181,15 +181,18 @@ func (s *Server) serveConn(conn net.Conn) {
 }
 
 func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, replyHeader []byte, req request) bool {
-	inBytes := int64(len(key))
-	if int64(req.valueBytes) > s.config.InboundPerConn-inBytes ||
-		!s.inbound.reserve(inBytes+int64(req.valueBytes)) {
+	bufferSize := s.writes.rounded(req.valueBytes, s.config.MaxValueBytes)
+	inBytes, reserved := s.reserveInbound(len(key), bufferSize)
+	if !reserved && bufferSize != req.valueBytes {
+		bufferSize = req.valueBytes
+		inBytes, reserved = s.reserveInbound(len(key), bufferSize)
+	}
+	if !reserved {
 		_ = s.writeStatus(conn, "BUSY\n")
 		return false
 	}
-	inBytes += int64(req.valueBytes)
 
-	value, result, err := s.receive(reader, key, req)
+	value, result, err := s.receive(reader, key, req, bufferSize)
 	s.inbound.release(inBytes)
 	if err != nil {
 		return false
@@ -222,19 +225,34 @@ func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, replyHeader []
 	return s.writeStatus(conn, response) == nil
 }
 
-func (s *Server) receive(reader *bufio.Reader, key []byte, req request) ([]byte, store.Result, error) {
+func (s *Server) reserveInbound(keySize, valueSize int) (int64, bool) {
+	keyBytes, valueBytes := int64(keySize), int64(valueSize)
+	if valueBytes > s.config.InboundPerConn-keyBytes {
+		return 0, false
+	}
+	total := keyBytes + valueBytes
+	return total, s.inbound.reserve(total)
+}
+
+func (s *Server) receive(reader *bufio.Reader, key []byte, req request, bufferSize int) ([]byte, store.Result, error) {
 	if _, err := io.ReadFull(reader, key); err != nil {
 		return nil, store.Invalid, err
 	}
 	if req.write {
-		value := s.writes.take(req.valueBytes)
+		buffer := s.writes.take(bufferSize)
+		value := buffer[:req.valueBytes]
 		if _, err := io.ReadFull(reader, value); err != nil {
-			s.writes.put(value)
+			s.writes.put(buffer)
 			return nil, store.Invalid, err
+		}
+		if len(value) != cap(value) {
+			result := s.cache.SetCopy(string(key), value, req.ttl, req.onlyMiss)
+			s.writes.put(buffer)
+			return nil, result, nil
 		}
 		result := s.cache.Set(string(key), value, req.ttl, req.onlyMiss)
 		if result != store.Stored {
-			s.writes.put(value)
+			s.writes.put(buffer)
 		}
 		return nil, result, nil
 	}
