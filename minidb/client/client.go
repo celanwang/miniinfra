@@ -159,11 +159,9 @@ func (c *connection) request(ctx context.Context, sql string, args []driver.Name
 	if len(fields) != 0 {
 		verb = strings.TrimSuffix(strings.ToLower(fields[0]), ";")
 	}
-	deadline := time.Now().Add(40 * time.Second)
-	if requested, ok := ctx.Deadline(); ok && requested.Before(deadline) {
-		deadline = requested
-	}
-	if err := c.socket.SetDeadline(deadline); err != nil {
+	// The context callback owns application deadlines. This separate bound
+	// also protects requests whose context has no deadline.
+	if err := c.socket.SetDeadline(time.Now().Add(40 * time.Second)); err != nil {
 		c.Close()
 		return wire.Response{}, err
 	}
@@ -177,12 +175,15 @@ func (c *connection) request(ctx context.Context, sql string, args []driver.Name
 			<-stopped
 		}
 	}()
+	if err := ctx.Err(); err != nil {
+		return wire.Response{}, err
+	}
 	var response wire.Response
-	if _, err := c.socket.Write(data); err != nil {
-		return wire.Response{}, c.transportError(verb, err)
+	if sent, err := c.socket.Write(data); err != nil {
+		return wire.Response{}, c.transportError(ctx, verb, sent != 0, err)
 	}
 	if err := wire.Read(c.reader, &response); err != nil {
-		return wire.Response{}, c.transportError(verb, err)
+		return wire.Response{}, c.transportError(ctx, verb, true, err)
 	}
 	if response.InTransaction != nil {
 		c.inTx = *response.InTransaction
@@ -201,11 +202,20 @@ func (c *connection) request(ctx context.Context, sql string, args []driver.Name
 	return response, nil
 }
 
-func (c *connection) transportError(verb string, err error) error {
+func (c *connection) transportError(ctx context.Context, verb string, possiblySent bool, err error) error {
 	inTx := c.inTx
+	if socket, ok := c.socket.(*net.TCPConn); ok && possiblySent {
+		// An abortive close interrupts a running statement. A normal FIN
+		// still allows raw TCP clients to read their final response.
+		_ = socket.SetLinger(0)
+	}
 	c.Close()
-	if verb == "commit" || !inTx && (verb == "insert" || verb == "update" || verb == "delete" || verb == "create") {
+	mayCommit := verb == "commit" || !inTx && (verb == "insert" || verb == "update" || verb == "delete" || verb == "create")
+	if possiblySent && mayCommit {
 		return &Error{Code: CommitUnknown, Message: err.Error()}
+	}
+	if canceled := ctx.Err(); canceled != nil {
+		return canceled
 	}
 	return fmt.Errorf("MiniDB connection: %w", err)
 }

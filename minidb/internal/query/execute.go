@@ -78,6 +78,10 @@ func (s *Session) Execute(ctx context.Context, sql string, args []engine.Value) 
 		if s.tx == nil {
 			return Result{}, fmt.Errorf("%w: no active transaction", ErrTransaction)
 		}
+		if err := ctx.Err(); err != nil {
+			s.abort()
+			return Result{}, err
+		}
 		tx := s.tx
 		s.tx = nil
 		return Result{}, tx.Commit()
@@ -115,6 +119,9 @@ func (s *Session) Execute(ctx context.Context, sql string, args []engine.Value) 
 			result, err = mutateRow(ctx, view, stmt)
 		}
 		view.Close()
+	}
+	if err == nil {
+		err = ctx.Err()
 	}
 	if err != nil {
 		if implicit {

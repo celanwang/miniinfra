@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -46,21 +47,31 @@ func Serve(ctx context.Context, listener net.Listener, db *engine.DB) error {
 }
 
 func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
-	defer conn.Close()
+	ctx, disconnect := context.WithCancel(ctx)
+	var receiving sync.WaitGroup
+	defer func() {
+		disconnect()
+		conn.Close()
+		receiving.Wait()
+	}()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 	session := query.NewSession(db)
 	defer session.Close()
-	reader := wire.Reader(conn)
-	for {
-		if err := conn.SetReadDeadline(time.Now().Add(time.Minute)); err != nil {
-			return
-		}
-		var req wire.Request
-		if err := wire.Read(reader, &req); err != nil {
-			if !errors.Is(err, io.EOF) {
-				send(conn, wire.Failure(fmt.Errorf("read request: %w", err)))
-			}
+
+	if err := conn.SetReadDeadline(time.Now().Add(time.Minute)); err != nil {
+		return
+	}
+	// The receiver keeps reading while execution waits for a lock. Only the
+	// executor touches the session, including rollback on disconnect.
+	requests := make(chan wire.Request)
+	var readErr error
+	receiving.Go(func() {
+		defer close(requests)
+		readErr = readRequests(ctx, conn, requests, disconnect)
+	})
+	for req := range requests {
+		if ctx.Err() != nil {
 			return
 		}
 		statement, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -74,6 +85,36 @@ func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
 		response.InTransaction = &inTx
 		if !send(conn, response) {
 			return
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(time.Minute)); err != nil {
+			return
+		}
+	}
+	if readErr != nil && ctx.Err() == nil {
+		send(conn, wire.Failure(fmt.Errorf("read request: %w", readErr)))
+	}
+}
+
+func readRequests(ctx context.Context, conn net.Conn, requests chan<- wire.Request, disconnect context.CancelFunc) error {
+	reader := wire.Reader(conn)
+	for {
+		var req wire.Request
+		if err := wire.Read(reader, &req); err != nil {
+			// FIN may be a half-close. Finish processing accepted requests
+			// and send their replies. A transport error cancels execution.
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if reader.Err() != nil && !errors.Is(err, bufio.ErrTooLong) {
+				disconnect()
+				return nil
+			}
+			return err
+		}
+		select {
+		case requests <- req:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
