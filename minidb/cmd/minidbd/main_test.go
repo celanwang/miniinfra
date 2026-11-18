@@ -34,6 +34,11 @@ func launch(t *testing.T, dir string) (string, func()) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestServeProcess$")
 	cmd.Env = append(os.Environ(), "MINIDB_TEST_DAEMON_DIR="+dir)
+	return launchCommand(t, cmd)
+}
+
+func launchCommand(t *testing.T, cmd *exec.Cmd) (string, func()) {
+	t.Helper()
 	output, err := cmd.StderrPipe()
 	if err != nil {
 		t.Fatal(err)
