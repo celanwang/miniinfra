@@ -127,3 +127,39 @@ The setup installs 2,048 sealed messages and a short tail of 128 messages of 64 
 The initial checkpoint and reopen run outside the measured workload. Default mode uses the broker's 30-second schedule for three periods with only ACK updates. Quiet mode does the same work across six forced checkpoints. Sparse mode adds one 64 KiB publication before each of six forced checkpoints. The ordinary worker reads across the archive boundary and each checkpoint releases a separate cohort of pregranted ACKs. The test reopens the partition and checks history, durable ACKs and an outstanding lease. `MINIMQ_SHORT_TAIL_ROWS` changes the starting tail size.
 
 The output separates the first image encode from later encodes of overlapping immutable offsets. Repeated bytes count the raw bodies represented again in checkpoint images. Image bytes include JSON and base64 expansion. CPU is process user plus system time over the measured workload. Heap deltas are live Go heap after two garbage collections relative to the empty process before reopen. The raw tail count excludes payloads retained for independent delivery such as scheduled items and dead letters.
+
+The integrated baseline was `6b3c0db`, the measured baseline was `877e362`, and the candidate was `3b67f6c`. The candidate seals an already checkpointed prefix once it holds at least one read batch of body bytes (8 MiB today). A small or newly appended suffix stays inline. It uses the existing segment format and checkpoint protocol. The compatibility check used the older binary to write an inline tail, the candidate to seal its prefix, and the older binary again to read the new segment and suffix and retry the recorded ACKs.
+
+Trials ran serially on macOS 15.5 arm64 with Go 1.27.3 and local APFS. Host one-minute load averages around the two default runs ranged from 2.7 to 5.7. Background work on the shared host may affect timing. The data was warm after reopen. Both native default runs had 24 ordinary ACKs, 24 ACKs that overlapped checkpoints and 24 history reads.
+
+| Default ACK-only workload | Baseline | Candidate |
+| --- | ---: | ---: |
+| Initial image encoding, before the timed workload | 22.0 ms | 21.6 ms |
+| Original bodies encoded again during three checkpoints | 3 times, 24 MiB | 1 time, 8 MiB |
+| Written checkpoint image size | 11.31 MiB each | 0.63 MiB each |
+| First checkpoint lock hold | 55.2 ms | 53.9 ms |
+| Later checkpoints, median lock hold | 42.7 ms | 26.8 ms |
+| Later checkpoints, median JSON time | 9.0 ms | 2.4 ms |
+| Ordinary ACK P99 | 23.2 ms | 21.5 ms |
+| Overlapping probe ACK P99 | 153.1 ms | 166.4 ms |
+| Process CPU | 181.9 ms | 198.9 ms |
+| Live heap delta after workload and GC | 8.70 MiB | 0.69 MiB |
+
+The candidate encodes the existing 8 MiB once into the new segment and pays one additional file sync in that first checkpoint. The table counts this conversion. The test's `repeated_bytes` counter focuses on image encodes. Final accounted disk use differed by 458 bytes in this default comparison.
+
+The forced controls ran three times per variant in alternating order. Each large-tail run had six checkpoints, 48 ordinary ACKs, 48 overlapping probe ACKs, and 48 history reads.
+
+| Forced control | Baseline | Candidate |
+| --- | ---: | ---: |
+| Quiet 8 MiB tail, repeated body bytes including conversion | 48 MiB | 8 MiB |
+| Quiet 8 MiB tail, later checkpoint lock median | 37.8 ms | 24.5 ms |
+| Quiet 8 MiB tail, process CPU median | 175.1 ms | 117.0 ms |
+| Sparse 8 MiB tail, repeated body bytes including conversion | 48.94 MiB | 8.94 MiB |
+| Sparse 8 MiB tail, later checkpoint lock median | 41.2 ms | 28.0 ms |
+| Sparse 8 MiB tail, process CPU median | 200.0 ms | 165.5 ms |
+| Sparse publication P99, median of three runs with six publishes each | 14.2 ms | 15.0 ms |
+| Quiet 1 MiB tail, repeated body bytes | 6 MiB | 6 MiB |
+
+Final accounted disk use in the large-tail controls rose roughly 1–1.5 KiB. The 1 MiB control created no new segments in either variant. The capacity regression exercises a budget that fits the inline layout and rejects early-segment staging. The checkpoint falls back to the inline layout before any files from the failed attempt are written.
+
+Keep the large-prefix policy for the reduction in repeated encoding, later lock holds, and live heap under the default cadence. Overlapping ACK P99 and CPU did not improve in that default trial. Sealed records load and decode on subsequent reads, which can add work for applications that repeatedly read recent history. The next experiment should isolate that additional cost for history readers and active task pulls before widening the policy to smaller prefixes.
