@@ -8,9 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
+	"weak"
 )
 
 func TestCheckpointKeepsRecentTailInlineWithPendingAndSettledTasks(t *testing.T) {
@@ -218,6 +220,60 @@ func TestCheckpointPreservesProtectedHistoryAndReclaimsSealedPrefix(t *testing.T
 	}
 }
 
+func TestCheckpointReleasesSealedPrefixIndexes(t *testing.T) {
+	const expiredSegments, segmentMessages = 4, 16
+	const first = expiredSegments * segmentMessages
+	for _, trial := range []struct {
+		name     string
+		retained int
+	}{{"all-expired", 0}, {"retained-suffix", 1}} {
+		t.Run(trial.name, func(t *testing.T) {
+			now := walFixtureTime
+			p := openTest(t, t.TempDir(), Config{
+				Clock: testClock(&now), SegmentMessages: segmentMessages, HistoryRetention: time.Minute,
+			})
+			for i := range first {
+				publishTest(t, p, fmt.Sprintf("message-%d", i))
+			}
+			if err := p.Compact(); err != nil {
+				t.Fatal(err)
+			}
+			var retired [expiredSegments]weak.Pointer[segmentRecord]
+			for i := range retired {
+				// Each weak pointer refers to a separate, non-tiny index allocation.
+				retired[i] = weak.Make(&p.segments[i].records[0])
+			}
+			now = now.Add(time.Minute)
+			for i := range trial.retained * segmentMessages {
+				publishTest(t, p, fmt.Sprintf("message-%d", first+i))
+			}
+			if err := p.Compact(); err != nil {
+				t.Fatal(err)
+			}
+			// Include an idle checkpoint before checking index liveness.
+			if err := p.Compact(); err != nil {
+				t.Fatal(err)
+			}
+			if p.firstOffset != first || len(p.segments) != trial.retained {
+				t.Fatalf("reclaimed range starts at %d with %d segments", p.firstOffset, len(p.segments))
+			}
+			runtime.GC()
+			runtime.GC()
+			live := 0
+			for _, index := range retired {
+				if index.Value() != nil {
+					live++
+				}
+			}
+			runtime.KeepAlive(p)
+			if live != 0 {
+				t.Fatalf("%d/%d retired index arrays are still live", live, len(retired))
+			}
+			t.Logf("%d/%d retired index arrays are still live", live, len(retired))
+		})
+	}
+}
+
 func TestCapacityRejectionLeavesSpaceForTaskCompletion(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	cfg := Config{Clock: testClock(&now), CapacityBytes: 220 << 10, SegmentMessages: 1, HistoryRetention: time.Minute}
@@ -312,7 +368,8 @@ func TestCheckpointReclaimsTailPrefixAndRetainsSuffixAfterFailures(t *testing.T)
 	checkUnchanged := func() {
 		t.Helper()
 		if !bytes.Equal(head, checkpointHEAD(t, dir)) || p.firstOffset != 0 || p.tailOffset != 2 ||
-			p.nextOffset() != 7 || len(p.segments) != 1 || string(p.tail[0].Body) != "message-2" {
+			p.nextOffset() != 7 || len(p.segments) != 1 || len(p.segments[0].records) != 2 ||
+			string(p.tail[0].Body) != "message-2" {
 			t.Fatal("failed checkpoint changed HEAD or retired uncommitted history")
 		}
 	}
