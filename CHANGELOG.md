@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniMQ copies checkpoint metadata maps only when entries expire, reducing allocations and partition lock time during idle maintenance.
 - MiniKV verifies eviction order and write outcomes under full-cache TCP load and retains the existing bounded sort.
 - MiniDB creates lock wait timers only on contention, reducing allocations in transactions that acquire row and unique-key locks.
 - MiniMQ limits dead-letter page selection to the requested number of IDs, reducing allocations and time under the partition lock.
