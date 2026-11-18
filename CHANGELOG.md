@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB reuses a 64 KiB WAL write buffer across commit batches and writes oversized payloads directly.
 - MiniMQ verifies that retrying a delayed publish after a lost reply preserves its receipt and produces one history entry across restarts.
 - MiniKV returns BAD_REQUEST for an overflowing SET deadline before checking NX or shard capacity.
 - MiniMQ reuses immutable dead-letter bodies during redrive while keeping each durable record self-contained.
