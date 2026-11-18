@@ -3,7 +3,6 @@ package minimq
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -206,10 +205,13 @@ func shortTailLoad(p *Partition, mode string, body []byte, ordinary, probes []De
 				}
 			}
 			limit := Limits{Messages: MaxBatchMessages, Bytes: MaxBatchBytes}
-			maintenance.Run(ctx, func() {
+			maintenance.Run(ctx, func() bool {
 				_, scheduled := p.AdvanceScheduled(limit)
+				fail(scheduled)
+				return false // This workload has no delayed publications.
+			}, func() {
 				_, retries := p.AdvanceRetries(limit)
-				fail(errors.Join(scheduled, retries))
+				fail(retries)
 			}, func() { fail(p.Compact()) })
 		})
 	}

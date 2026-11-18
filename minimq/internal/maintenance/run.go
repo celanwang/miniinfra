@@ -7,18 +7,30 @@ import (
 )
 
 const CheckpointInterval = 30 * time.Second
+const scheduleFollowUpDelay = 100 * time.Millisecond
 
-func Run(ctx context.Context, advance, checkpoint func()) {
+// Run performs one extra scheduled-release batch after a regular round that may
+// have reached its batch limit. Retries run on every regular round.
+func Run(ctx context.Context, schedule func() bool, retry, checkpoint func()) {
 	due := time.NewTicker(250 * time.Millisecond)
 	compaction := time.NewTicker(CheckpointInterval)
 	defer due.Stop()
 	defer compaction.Stop()
+	var followUp <-chan time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-due.C:
-			advance()
+			followUp = nil
+			mayHaveMore := schedule()
+			retry()
+			if mayHaveMore {
+				followUp = time.After(scheduleFollowUpDelay)
+			}
+		case <-followUp:
+			followUp = nil
+			schedule()
 		case <-compaction.C:
 			checkpoint()
 		}
