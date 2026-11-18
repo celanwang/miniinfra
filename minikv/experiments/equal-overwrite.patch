@@ -1,0 +1,152 @@
+diff --git a/minikv/internal/server/server.go b/minikv/internal/server/server.go
+index 031937d..08e1bb7 100644
+--- a/minikv/internal/server/server.go
++++ b/minikv/internal/server/server.go
+@@ -195 +195,25 @@ func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, replyHeader []
+-	value, result, err := s.receive(reader, key, req, bufferSize)
++	if _, err := io.ReadFull(reader, key); err != nil {
++		s.inbound.release(inBytes)
++		return false
++	}
++
++	var value []byte
++	var result store.Result
++	var err error
++	if req.write {
++		name := string(key)
++		if bufferSize != req.valueBytes && !req.onlyMiss &&
++			s.cache.HasLiveValueCapacity(name, req.valueBytes) {
++			// Read a likely equal-capacity replacement into its final
++			// backing array. The regular SET still rechecks under lock.
++			padding := int64(bufferSize - req.valueBytes)
++			s.inbound.release(padding)
++			inBytes -= padding
++			bufferSize = req.valueBytes
++		}
++		result, err = s.receiveWrite(reader, name, req, bufferSize)
++	} else {
++		value, result = s.cache.Get(string(key), func(n int64) bool {
++			return n <= s.config.OutboundPerConn && s.outbound.reserve(n)
++		})
++	}
+@@ -237,3 +261,6 @@ func (s *Server) reserveInbound(keySize, valueSize int) (int64, bool) {
+-func (s *Server) receive(reader *bufio.Reader, key []byte, req request, bufferSize int) ([]byte, store.Result, error) {
+-	if _, err := io.ReadFull(reader, key); err != nil {
+-		return nil, store.Invalid, err
++func (s *Server) receiveWrite(reader *bufio.Reader, key string, req request, bufferSize int) (store.Result, error) {
++	buffer := s.writes.take(bufferSize)
++	value := buffer[:req.valueBytes]
++	if _, err := io.ReadFull(reader, value); err != nil {
++		s.writes.put(buffer)
++		return store.Invalid, err
+@@ -241,17 +268,8 @@ func (s *Server) receive(reader *bufio.Reader, key []byte, req request, bufferSi
+-	if req.write {
+-		buffer := s.writes.take(bufferSize)
+-		value := buffer[:req.valueBytes]
+-		if _, err := io.ReadFull(reader, value); err != nil {
+-			s.writes.put(buffer)
+-			return nil, store.Invalid, err
+-		}
+-		if len(value) != cap(value) {
+-			result := s.cache.SetCopy(string(key), value, req.ttl, req.onlyMiss)
+-			s.writes.put(buffer)
+-			return nil, result, nil
+-		}
+-		result := s.cache.Set(string(key), value, req.ttl, req.onlyMiss)
+-		if result != store.Stored {
+-			s.writes.put(buffer)
+-		}
+-		return nil, result, nil
++	if len(value) != cap(value) {
++		result := s.cache.SetCopy(key, value, req.ttl, req.onlyMiss)
++		s.writes.put(buffer)
++		return result, nil
++	}
++	result := s.cache.Set(key, value, req.ttl, req.onlyMiss)
++	if result != store.Stored {
++		s.writes.put(buffer)
+@@ -259,4 +277 @@ func (s *Server) receive(reader *bufio.Reader, key []byte, req request, bufferSi
+-	value, result := s.cache.Get(string(key), func(n int64) bool {
+-		return n <= s.config.OutboundPerConn && s.outbound.reserve(n)
+-	})
+-	return value, result, nil
++	return result, nil
+diff --git a/minikv/internal/server/write_buffers_test.go b/minikv/internal/server/write_buffers_test.go
+index cfad3a3..e3de996 100644
+--- a/minikv/internal/server/write_buffers_test.go
++++ b/minikv/internal/server/write_buffers_test.go
+@@ -115,0 +116,58 @@ func TestRoundedReceiveCapacityUsesAndReturnsInboundBudget(t *testing.T) {
++
++func TestEqualCapacityOverwriteKeepsBorrowedResponseImmutable(t *testing.T) {
++	const size = (128 << 10) - 1
++	s := largeOverwriteServer(t)
++	old := strings.Repeat("a", size)
++	updated := strings.Repeat("b", size)
++	write, slow := s.pipe(t), s.pipe(t)
++	write.exchange(t, fmt.Sprintf("SET 1 %d NONE NX\nk%s", size, old), "STORED\n")
++	slow.exchange(t, "GET 1\nk", fmt.Sprintf("VALUE %d\n", size))
++
++	write.send(t, fmt.Sprintf("SET 1 %d NONE\nk%s", size, updated[:1]))
++	waitBudget(t, &s.inbound, size+1)
++	write.send(t, updated[1:])
++	write.line(t, "STORED\n")
++	waitBudget(t, &s.inbound, 0)
++	write.send(t, "GET 1\nk")
++	write.value(t, updated)
++
++	pending := make([]byte, size)
++	if _, err := io.ReadFull(slow.reader, pending); err != nil || string(pending) != old {
++		t.Fatalf("previous response changed: %v", err)
++	}
++}
++
++func TestOverwriteHintRechecksCapacityAfterConcurrentChanges(t *testing.T) {
++	const size = (128 << 10) - 1
++	s := largeOverwriteServer(t)
++	write, other := s.pipe(t), s.pipe(t)
++	write.exchange(t, fmt.Sprintf("SET 1 %d NONE\nk%s", size, strings.Repeat("a", size)), "STORED\n")
++	write.send(t, fmt.Sprintf("SET 1 %d NONE\nkx", size))
++	waitBudget(t, &s.inbound, size+1)
++
++	other.exchange(t, "SET 1 1 NONE\nks", "STORED\n")
++	for _, key := range []string{"a", "b", "c", "d"} {
++		size := 60 << 10
++		other.exchange(t, fmt.Sprintf("SET 1 %d NONE\n%s%s", size, key, strings.Repeat("q", size)), "STORED\n")
++	}
++	write.send(t, strings.Repeat("x", size-1))
++	write.line(t, "NO_SPACE\n")
++	waitBudget(t, &s.inbound, 0)
++	write.send(t, "GET 1\nk")
++	write.value(t, "s")
++}
++
++func largeOverwriteServer(t *testing.T) *Server {
++	t.Helper()
++	cache, err := store.New(store.Config{
++		Shards: 1, BytesPerShard: 256 << 10, EntriesPerShard: 8, Samples: 1,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	s, err := New(cache, DefaultConfig())
++	if err != nil {
++		t.Fatal(err)
++	}
++	return s
++}
+diff --git a/minikv/internal/store/store.go b/minikv/internal/store/store.go
+index 2e792d3..e7ea548 100644
+--- a/minikv/internal/store/store.go
++++ b/minikv/internal/store/store.go
+@@ -140,0 +141,11 @@ func (s *Store) Get(key string, reserve func(int64) bool) ([]byte, Result) {
++// HasLiveValueCapacity is a receive-buffer hint. Set still validates the
++// current key and capacity before publishing.
++func (s *Store) HasLiveValueCapacity(key string, size int) bool {
++	sh := s.shardFor(key)
++	sh.mu.RLock()
++	defer sh.mu.RUnlock()
++
++	i, exists := sh.index[key]
++	return exists && cap(sh.entries[i].value) == size && !sh.entries[i].expired(s.now())
++}
++

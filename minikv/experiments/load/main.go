@@ -461,15 +461,18 @@ func main() {
 	rate := flag.Int("rate", 10000, "ordinary offered requests per second")
 	window := flag.Duration("duration", 6*time.Second, "offered workload duration")
 	tick := flag.Duration("tick", time.Millisecond, "fixed arrival batch interval")
-	lengths := flag.String("pressure-lengths", "fixed", "fixed, repeated, adjacent, or publish pressure writes")
+	lengths := flag.String("pressure-lengths", "fixed", "pressure write size and locality pattern")
+	blockProfile := flag.Bool("block-profile", false, "fetch a Go block profile from the fixture")
 	flag.Parse()
 	t := target{address: "127.0.0.1:7321", redis: *redis}
 	encoder := json.NewEncoder(os.Stdout)
 	if *profile == "pressure" && !*redis {
-		if *lengths != "fixed" && *lengths != "repeated" && *lengths != "adjacent" && *lengths != "publish" {
+		switch *lengths {
+		case "fixed", "repeated", "adjacent", "publish", "publish-locality", "publish-aligned":
+		default:
 			log.Fatal("invalid pressure length pattern")
 		}
-		if err := encoder.Encode(runPressure(t, *lengths)); err != nil {
+		if err := encoder.Encode(runPressure(t, *lengths, *blockProfile)); err != nil {
 			log.Fatal(err)
 		}
 		return

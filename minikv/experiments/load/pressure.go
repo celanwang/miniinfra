@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -13,17 +15,21 @@ import (
 type pressureRead struct {
 	at      time.Time
 	elapsed time.Duration
+	rtt     time.Duration
 	result  outcome
 }
 
 type pressurePhase struct {
-	Reads           map[outcome]int
-	P99Microseconds float64
+	Reads              map[outcome]int
+	P99Microseconds    float64
+	RTTP99Microseconds float64
 }
 
-func runPressure(target target, lengths string) map[string]any {
+func runPressure(target target, lengths string, blockProfile bool) map[string]any {
 	result := make(map[string]any)
-	if lengths != "publish" {
+	publish := strings.HasPrefix(lengths, "publish")
+	locality := lengths == "publish-locality" || lengths == "publish-aligned"
+	if !publish {
 		prefill := fill(target, "fill", 32, 100000, 1024)
 		result["Prefill"] = prefill
 		if prefill[ok] != 100000 {
@@ -37,17 +43,33 @@ func runPressure(target target, lengths string) map[string]any {
 	warm := client{target: target}
 	defer warm.close()
 	small := bytes.Repeat([]byte("r"), smallSize)
+	var keys []string
+	if locality {
+		var err error
+		keys, err = pressureReadKeys(pressureWriteKey(lengths, 0), readers)
+		if err != nil {
+			result["RoutingError"] = err.Error()
+			return result
+		}
+	}
 	for i := range hot {
 		key := fmt.Sprintf("read%06d", i)
+		if locality {
+			key = keys[i]
+		}
 		if _, status := warm.execute(target.makeCommand(key, small, smallSize), 0, 0); status != ok {
 			result["WarmReadKeyError"] = status
 			return result
 		}
 		hot[i] = target.makeCommand(key, nil, smallSize)
 	}
-	if lengths == "publish" {
-		payload := bytes.Repeat([]byte("p"), largeSize-1)
-		for i := range 2 {
+	if publish {
+		payload := bytes.Repeat([]byte("p"), pressureWriteSize(lengths, 0))
+		keyCount := 2
+		if locality {
+			keyCount = 1
+		}
+		for i := range keyCount {
 			cmd := target.makeCommand(pressureWriteKey(lengths, i), payload, len(payload))
 			if _, status := warm.execute(cmd, 0, 0); status != ok {
 				result["WarmWriteKeyError"] = status
@@ -62,13 +84,33 @@ func runPressure(target target, lengths string) map[string]any {
 	var workers sync.WaitGroup
 	reads := make([][]pressureRead, readers)
 	queue := make(chan arrival, 256)
+	readQueues := [2]<-chan arrival{queue, queue}
+	var routingDrops int
+	if locality {
+		same, cross := make(chan arrival, 128), make(chan arrival, 128)
+		readQueues = [2]<-chan arrival{same, cross}
+		go func() {
+			destinations := [2]chan arrival{same, cross}
+			for job := range queue {
+				select {
+				case destinations[job.sequence%2] <- job:
+				default:
+					routingDrops++
+				}
+			}
+			close(same)
+			close(cross)
+		}()
+	}
 	for i := range readers {
 		workers.Go(func() {
 			client := client{target: target}
 			defer client.close()
-			for job := range queue {
+			for job := range readQueues[i/(readers/2)] {
+				started := time.Now()
 				_, status := client.execute(hot[i], smallSize, 0)
-				reads[i] = append(reads[i], pressureRead{job.at, time.Since(job.at), status})
+				end := time.Now()
+				reads[i] = append(reads[i], pressureRead{job.at, end.Sub(job.at), end.Sub(started), status})
 			}
 		})
 	}
@@ -149,33 +191,17 @@ func runPressure(target target, lengths string) map[string]any {
 			recoveredCount++
 		}
 	}
-	phases := map[string]*pressurePhase{
-		"Before": {Reads: make(map[outcome]int)},
-		"During": {Reads: make(map[outcome]int)},
-		"After":  {Reads: make(map[outcome]int)},
+	phases := pressureReadPhases(reads, writeStart, writeEnd)
+	if locality {
+		result["SameShard"] = pressureReadPhases(reads[:readers/2], writeStart, writeEnd)
+		result["CrossShard"] = pressureReadPhases(reads[readers/2:], writeStart, writeEnd)
 	}
-	timings := make(map[string][]time.Duration)
-	for _, lane := range reads {
-		for _, read := range lane {
-			phase := "During"
-			if read.at.Before(writeStart) {
-				phase = "Before"
-			} else if !read.at.Before(writeEnd) {
-				phase = "After"
-			}
-			phases[phase].Reads[read.result]++
-			if read.result == ok {
-				timings[phase] = append(timings[phase], read.elapsed)
-			}
-		}
-	}
-	for phase, samples := range timings {
-		slices.Sort(samples)
-		phases[phase].P99Microseconds = percentile(samples, 990)
+	if blockProfile {
+		result["BlockProfile"] = readBlockProfile()
 	}
 	after, _ := diagnostics(target)
 	result["Stats"] = after
-	result["ReadSchedule"] = map[string]int{"Offered": scheduled.Offered, "Waiting": scheduled.Waiting, "Late": scheduled.Late}
+	result["ReadSchedule"] = map[string]int{"Offered": scheduled.Offered, "Waiting": scheduled.Waiting + routingDrops, "Late": scheduled.Late}
 	result["ReadPhases"] = phases
 	slices.Sort(writeSamples)
 	result["Writes"] = writeCounts
@@ -187,6 +213,85 @@ func runPressure(target target, lengths string) map[string]any {
 	result["RuntimeAfter"] = writeAfter
 	result["RuntimeMax"] = peak
 	return result
+}
+
+func pressureReadPhases(reads [][]pressureRead, writeStart, writeEnd time.Time) map[string]*pressurePhase {
+	phases := map[string]*pressurePhase{
+		"Before": {Reads: make(map[outcome]int)},
+		"During": {Reads: make(map[outcome]int)},
+		"After":  {Reads: make(map[outcome]int)},
+	}
+	timings := make(map[string][]time.Duration)
+	rtts := make(map[string][]time.Duration)
+	for _, lane := range reads {
+		for _, read := range lane {
+			phase := "During"
+			if read.at.Before(writeStart) {
+				phase = "Before"
+			} else if !read.at.Before(writeEnd) {
+				phase = "After"
+			}
+			phases[phase].Reads[read.result]++
+			if read.result == ok {
+				timings[phase] = append(timings[phase], read.elapsed)
+				rtts[phase] = append(rtts[phase], read.rtt)
+			}
+		}
+	}
+	for phase, samples := range timings {
+		slices.Sort(samples)
+		phases[phase].P99Microseconds = percentile(samples, 990)
+		slices.Sort(rtts[phase])
+		phases[phase].RTTP99Microseconds = percentile(rtts[phase], 990)
+	}
+	return phases
+}
+
+func pressureReadKeys(writeKey string, readers int) ([]string, error) {
+	keys := make([]string, 1025)
+	keys[0] = writeKey
+	for i := 1; i < len(keys); i++ {
+		keys[i] = fmt.Sprintf("read%06d", i)
+	}
+	body, err := json.Marshal(keys)
+	if err != nil {
+		return nil, err
+	}
+	c := &http.Client{Timeout: time.Second}
+	resp, err := c.Post("http://127.0.0.1:9122/shards", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var routes []int
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&routes) != nil || len(routes) != len(keys) {
+		return nil, fmt.Errorf("invalid routes from fixture")
+	}
+	var same, cross []string
+	crossShard := (routes[0] + 1) % 16
+	for i, route := range routes[1:] {
+		if route == routes[0] && len(same) < readers/2 {
+			same = append(same, keys[i+1])
+		}
+		if route == crossShard && len(cross) < readers/2 {
+			cross = append(cross, keys[i+1])
+		}
+	}
+	if len(same)+len(cross) != readers {
+		return nil, fmt.Errorf("could not choose read keys for shards %d and %d", routes[0], crossShard)
+	}
+	return append(same, cross...), nil
+}
+
+func readBlockProfile() string {
+	c := &http.Client{Timeout: time.Second}
+	resp, err := c.Get("http://127.0.0.1:9122/debug/pprof/block?debug=1")
+	if err != nil {
+		return err.Error()
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return string(body)
 }
 
 func readRuntime(client *http.Client) map[string]float64 {
@@ -209,7 +314,7 @@ func pressureWriteSize(lengths string, index int) int {
 		return sizes[(index/8+index)%len(sizes)]
 	case "adjacent":
 		return largeSize - index
-	case "publish":
+	case "publish", "publish-locality":
 		return largeSize - 1
 	default:
 		return largeSize
@@ -217,8 +322,11 @@ func pressureWriteSize(lengths string, index int) int {
 }
 
 func pressureWriteKey(lengths string, index int) string {
-	if lengths == "publish" {
+	switch lengths {
+	case "publish":
 		index %= 2
+	case "publish-locality", "publish-aligned":
+		index = 0
 	}
 	return fmt.Sprintf("large%06d", index)
 }

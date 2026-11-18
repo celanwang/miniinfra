@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
+	"runtime"
 	"runtime/metrics"
 	"strconv"
 	"strings"
@@ -50,6 +52,23 @@ func TestCapacityPeer(t *testing.T) {
 	mux.HandleFunc("GET /runtime", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(pressureRuntime(s))
 	})
+	mux.HandleFunc("POST /shards", func(w http.ResponseWriter, r *http.Request) {
+		var keys []string
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&keys) != nil {
+			http.Error(w, "invalid keys", http.StatusBadRequest)
+			return
+		}
+		indices := make([]int, len(keys))
+		for i, key := range keys {
+			indices[i] = cache.ShardIndex(key)
+		}
+		_ = json.NewEncoder(w).Encode(indices)
+	})
+	if os.Getenv("MINIKV_LOCK_PROFILE") == "1" {
+		runtime.SetBlockProfileRate(1)
+		defer runtime.SetBlockProfileRate(0)
+		mux.Handle("GET /debug/pprof/block", pprof.Handler("block"))
+	}
 	admin := &http.Server{Addr: "127.0.0.1:9122", Handler: mux, ReadHeaderTimeout: time.Second}
 	defer admin.Close()
 	go func() {
