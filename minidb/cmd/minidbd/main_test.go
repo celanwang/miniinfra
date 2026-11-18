@@ -274,6 +274,68 @@ func TestTCPHalfCloseDeliversFinalReply(t *testing.T) {
 	}
 }
 
+func TestTCPPipelineAcrossLargeFrames(t *testing.T) {
+	address, _ := launch(t, t.TempDir())
+	db := client.Open(address)
+	defer db.Close()
+	large := strings.Repeat("x", 80<<10)
+	execute(t, db, "create table pipeline (id int primary key, note text)")
+	execute(t, db, "insert into pipeline values (1,'small'),(2,?)", large)
+
+	conn, err := net.DialTimeout("tcp", address, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{
+		"select id from pipeline where id = 1 and note != '" + large + "'",
+		"select note from pipeline where id = 2",
+		"select id from pipeline where id = 2",
+		"select id from pipeline where id = 1",
+		"select id from pipeline where id = 2",
+	}
+	var pipeline []byte
+	for i, statement := range statements {
+		frame, err := wire.Encode(wire.Request{SQL: statement})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == len(statements)-1 {
+			frame = frame[:len(frame)-1]
+		}
+		pipeline = append(pipeline, frame...)
+	}
+	if _, err := conn.Write(pipeline); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	expected := []struct {
+		id   int64
+		text string
+	}{{id: 1}, {text: large}, {id: 2}, {id: 1}, {id: 2}}
+	reader := wire.Reader(conn)
+	for i, want := range expected {
+		var response wire.Response
+		if err := wire.Read(reader, &response); err != nil || response.Code != "" ||
+			len(response.Result.Rows) != 1 || len(response.Result.Rows[0]) != 1 {
+			t.Fatalf("reply %d: code %q, rows %d, error %v", i, response.Code, len(response.Result.Rows), err)
+		}
+		value := response.Result.Rows[0][0]
+		if value.Int != want.id || value.Text != want.text {
+			t.Fatalf("unexpected value in reply %d", i)
+		}
+	}
+	var response wire.Response
+	if err := wire.Read(reader, &response); !errors.Is(err, io.EOF) {
+		t.Fatalf("end of half-closed pipeline: %v", err)
+	}
+}
+
 func TestOrderSurvivesLostReplyAndAbruptRestart(t *testing.T) {
 	dir := t.TempDir()
 	addr, kill := launch(t, dir)
