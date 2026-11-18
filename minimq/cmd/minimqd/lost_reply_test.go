@@ -15,6 +15,114 @@ import (
 	"github.com/celanwang/miniinfra/minimq"
 )
 
+func TestScheduledPublishReplyLostAcrossReleaseAndRestart(t *testing.T) {
+	root := t.TempDir()
+	dir, clock := filepath.Join(root, "data"), filepath.Join(root, "clock")
+	setDueClockFile(t, clock, dueExperimentEpoch)
+	broker := startDueBrokerWithClock(t, dir, time.Time{}, clock)
+	client := &http.Client{Timeout: 5 * time.Second}
+	t.Cleanup(client.CloseIdleConnections)
+	restart := func() {
+		t.Helper()
+		broker.stop(t)
+		client.CloseIdleConnections()
+		broker = startDueBrokerWithClock(t, dir, time.Time{}, clock)
+	}
+
+	const publishPath = "/v1/publish"
+	anchor := minimq.PublishRequest{ID: "anchor", Body: []byte("first offset")}
+	if got := requireDuePost[minimq.PublishResult](t, client, broker.url, publishPath, anchor); got.Offset != 0 || got.Scheduled {
+		t.Fatalf("anchor receipt = %+v", got)
+	}
+	requireDuePost[struct{}](t, client, broker.url, "/v1/subscriptions/register", registerRequest{Subscription: "notify"})
+	req := minimq.PublishRequest{ID: "delayed", Body: []byte("delayed body"), DeliverAt: dueExperimentEpoch.Add(time.Minute)}
+
+	// The test observer receives the committed reply. The producer sees EOF.
+	original := dropSuccessfulReply[minimq.PublishResult](t, client, broker.url, publishPath, req)
+	if want := (minimq.PublishResult{ID: req.ID, Scheduled: true}); original != want {
+		t.Fatalf("first scheduled receipt = %+v, want %+v", original, want)
+	}
+	status := func() minimq.PublishResult {
+		t.Helper()
+		return requireDuePost[minimq.PublishResult](t, client, broker.url, publishPath+"/status", idRequest{ID: req.ID})
+	}
+	retry := func() {
+		t.Helper()
+		if got := requireDuePost[minimq.PublishResult](t, client, broker.url, publishPath, req); got != original {
+			t.Fatalf("repeated scheduled publish = %+v, want %+v", got, original)
+		}
+	}
+	conflicts := func() {
+		t.Helper()
+		changedBody, changedTime := req, req
+		changedBody.Body = []byte("other body")
+		changedTime.DeliverAt = req.DeliverAt.Add(time.Second)
+		for _, conflict := range []minimq.PublishRequest{changedBody, changedTime} {
+			res, err := postLostReplyRequest(t, client, broker.url+publishPath, conflict)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var failure errorResponse
+			err = json.NewDecoder(res.Body).Decode(&failure)
+			res.Body.Close()
+			if err != nil || res.StatusCode != http.StatusConflict || failure.Code != "conflict" {
+				t.Fatalf("changed publish = HTTP %d, code %q, %v", res.StatusCode, failure.Code, err)
+			}
+		}
+	}
+	restart()
+	if got := status(); got != original {
+		t.Fatalf("status before retrying the recovered pending publish = %+v", got)
+	}
+	retry()
+	conflicts()
+
+	setDueClockFile(t, clock, req.DeliverAt)
+	deadline := time.Now().Add(5 * time.Second)
+	visible := status()
+	for visible.Scheduled && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		visible = status()
+	}
+	if want := (minimq.PublishResult{ID: req.ID, Offset: 1}); visible != want {
+		t.Fatalf("visible status = %+v, want %+v", visible, want)
+	}
+	retry()
+	restart()
+	if got := status(); got != visible {
+		t.Fatalf("visible status before retrying after reopen = %+v, want %+v", got, visible)
+	}
+	retry()
+	conflicts()
+
+	limit := minimq.Limits{Messages: 4, Bytes: 128}
+	page := requireDuePost[minimq.HistoryPage](t, client, broker.url, "/v1/history/read", historyRequest{Limit: limit})
+	if len(page.Messages) != 2 || page.Next != visible.Offset+1 || page.Messages[0].ID != anchor.ID {
+		t.Fatalf("recovered history has unexpected records: %+v", page)
+	}
+	checkMessage := func(message minimq.Message) {
+		t.Helper()
+		if message.ID != req.ID || message.Offset != visible.Offset || !bytes.Equal(message.Body, req.Body) {
+			t.Fatalf("delayed message = %+v, want offset %d and original body", message, visible.Offset)
+		}
+	}
+	checkMessage(page.Messages[1])
+	pull := pullRequest{Subscription: "notify", Worker: "worker", Limit: limit}
+	const pullPath = "/v1/deliveries/pull"
+	ds := requireDuePost[[]minimq.Delivery](t, client, broker.url, pullPath, pull)
+	if len(ds) != 1 || ds[0].Attempt != 1 {
+		t.Fatalf("ordinary Pull = %+v, want a single first attempt", ds)
+	}
+	checkMessage(ds[0].Message)
+	ack := deliveryRequest{Subscription: pull.Subscription, Worker: pull.Worker, Instance: ds[0].Instance, Token: ds[0].Token}
+	if got := requireDuePost[minimq.AckResult](t, client, broker.url, "/v1/deliveries/ack", ack); got != minimq.AckAccepted {
+		t.Fatalf("ordinary ACK = %q", got)
+	}
+	if again := requireDuePost[[]minimq.Delivery](t, client, broker.url, pullPath, pull); len(again) != 0 {
+		t.Fatalf("ordinary Pull repeated the delayed message: %+v", again)
+	}
+}
+
 func TestCommittedDeliveryRepliesLostOverTCP(t *testing.T) {
 	root := t.TempDir()
 	dir, clock := filepath.Join(root, "data"), filepath.Join(root, "clock")
