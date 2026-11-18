@@ -119,31 +119,22 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 	go schedule(start, 2*time.Second, 250*time.Microsecond, 10000, queue, make(chan arrival, 8), &scheduled, &auxiliary)
 
 	httpClient := http.Client{Timeout: 40 * time.Millisecond}
-	first := readRuntime(&httpClient)
-	peak := make(map[string]float64)
-	for k, v := range first {
-		peak[k] = v
-	}
-	stopSampling := make(chan struct{})
-	sampled := make(chan struct{})
-	go func() {
-		defer close(sampled)
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopSampling:
-				return
-			case <-ticker.C:
-				for key, value := range readRuntime(&httpClient) {
-					peak[key] = max(peak[key], value)
-				}
-			}
-		}
-	}()
-
 	time.Sleep(time.Until(start.Add(250 * time.Millisecond)))
+	var primeStart, primeEnd time.Time
+	if size := switchPrimeSize(lengths); size != 0 {
+		primingBefore := readRuntime(&httpClient)
+		finishPrime := samplePressureRuntime(&httpClient, primingBefore)
+		primeStart = time.Now()
+		prime := primeWritePool(target, hot, size)
+		primeEnd = time.Now()
+		prime["Before"] = primingBefore
+		primeAfter := readRuntime(&httpClient)
+		prime["After"] = primeAfter
+		prime["Peak"] = finishPrime(primeAfter)
+		result["Prime"] = prime
+	}
 	writeBefore := readRuntime(&httpClient)
+	finishSampling := samplePressureRuntime(&httpClient, writeBefore)
 	writeStart := time.Now()
 	writeResults := make([]map[outcome]int, writers)
 	writeLatency := make([][]time.Duration, writers)
@@ -156,7 +147,7 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 			defer client.close()
 			statuses := make(map[outcome]int)
 			writeResults[i] = statuses
-			for k := i; k < 256; k += writers {
+			for k := i; k < pressureWriteCount(lengths); k += writers {
 				size := pressureWriteSize(lengths, k)
 				cmd := target.makeCommand(pressureWriteKey(lengths, k), value[:size], size)
 				started := time.Now()
@@ -175,9 +166,11 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 	writes.Wait()
 	writeEnd := time.Now()
 	writeAfter := readRuntime(&httpClient)
-	close(stopSampling)
-	<-sampled
+	peak := finishSampling(writeAfter)
 	workers.Wait()
+	if !primeStart.IsZero() {
+		result["PrimeReads"] = pressureReadPhases(reads, primeStart, primeEnd)["During"]
+	}
 
 	writeCounts := make(map[outcome]int)
 	recoveredCount := 0
@@ -314,6 +307,13 @@ func pressureWriteSize(lengths string, index int) int {
 		return sizes[(index/8+index)%len(sizes)]
 	case "adjacent":
 		return largeSize - index
+	case "large-to-half", "cold-half":
+		return largeSize / 2
+	case "alternating":
+		if index/8%2 != 0 {
+			return largeSize / 2
+		}
+		return largeSize
 	case "publish", "publish-locality":
 		return largeSize - 1
 	default:
