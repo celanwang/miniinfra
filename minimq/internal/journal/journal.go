@@ -9,14 +9,16 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 )
 
 const (
-	maxFrame = 1 << 28
-	headSize = 24
+	maxFrame         = 1 << 28
+	headSize         = 24
+	FrameHeaderBytes = 8
 )
 
 var ErrCorrupt = errors.New("corrupt partition storage")
@@ -166,14 +168,18 @@ func (j *Journal) Available() (int64, error) {
 }
 
 func EncodeFrame(payload []byte) ([]byte, error) {
+	return AppendFrame(nil, payload)
+}
+
+// AppendFrame appends a length/CRC frame without a temporary frame buffer.
+func AppendFrame(dst, payload []byte) ([]byte, error) {
 	if len(payload) == 0 || len(payload) > maxFrame {
 		return nil, fmt.Errorf("invalid frame size: %d", len(payload))
 	}
-	frame := make([]byte, 8+len(payload))
-	binary.LittleEndian.PutUint32(frame, uint32(len(payload)))
-	binary.LittleEndian.PutUint32(frame[4:], crc32.ChecksumIEEE(payload))
-	copy(frame[8:], payload)
-	return frame, nil
+	dst = slices.Grow(dst, FrameHeaderBytes+len(payload))
+	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(payload)))
+	dst = binary.LittleEndian.AppendUint32(dst, crc32.ChecksumIEEE(payload))
+	return append(dst, payload...), nil
 }
 
 func ReadFrame(reader io.Reader, remaining int64) ([]byte, int64, error) {
@@ -182,12 +188,12 @@ func ReadFrame(reader io.Reader, remaining int64) ([]byte, int64, error) {
 
 // ReadFrameInto validates a frame and reuses scratch when it has enough capacity.
 func ReadFrameInto(reader io.Reader, remaining int64, scratch []byte) ([]byte, int64, error) {
-	var header [8]byte
+	var header [FrameHeaderBytes]byte
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		return nil, 0, fmt.Errorf("%w: frame header: %v", ErrCorrupt, err)
 	}
 	size := int64(binary.LittleEndian.Uint32(header[:]))
-	if size == 0 || size > maxFrame || size+8 > remaining {
+	if size == 0 || size > maxFrame || size+FrameHeaderBytes > remaining {
 		return nil, 0, fmt.Errorf("%w: invalid frame length", ErrCorrupt)
 	}
 	data := scratch
@@ -201,7 +207,7 @@ func ReadFrameInto(reader io.Reader, remaining int64, scratch []byte) ([]byte, i
 	if crc32.ChecksumIEEE(data) != binary.LittleEndian.Uint32(header[4:]) {
 		return nil, 0, fmt.Errorf("%w: frame checksum", ErrCorrupt)
 	}
-	return data, size + 8, nil
+	return data, size + FrameHeaderBytes, nil
 }
 
 func (j *Journal) Append(frame []byte) error {

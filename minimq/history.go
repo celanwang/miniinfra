@@ -49,13 +49,15 @@ func encodeSegment(s *segment, messages []storedMessage, stats *checkpointTiming
 		if err != nil {
 			return nil, err
 		}
-		frame, err := journal.EncodeFrame(payload)
+		data.Grow(journal.FrameHeaderBytes + len(payload))
+		frame, err := journal.AppendFrame(data.AvailableBuffer(), payload)
 		if err != nil {
 			return nil, err
 		}
 		s.records = append(s.records, segmentRecord{
 			position: int64(data.Len()), accepted: msg.AcceptedSequence, bodyBytes: len(msg.Body),
 		})
+		// The frame uses data's spare capacity. Write advances its length.
 		data.Write(frame)
 		if stats != nil {
 			stats.frame += time.Since(start)
