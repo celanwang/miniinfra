@@ -26,3 +26,5 @@ go test -race ./...
 ```
 
 See the [design](docs/plan/design.md) for failure guarantees and the [recovery notes](docs/plan/recovery.md) for the clock contract and replication plan.
+
+The [checkpoint experiment](docs/checkpoint-experiment.md) covers repeatable backlog and history workloads under the broker's default maintenance cycle.
