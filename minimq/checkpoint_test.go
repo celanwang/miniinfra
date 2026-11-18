@@ -258,6 +258,9 @@ func TestCompactReclaimsExpiredPartialSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 	p = openTest(t, dir, cfg)
+	if p.journal.End() != 0 {
+		t.Fatal("expected an empty WAL before age only reclamation")
+	}
 	if history, err := p.Read(0, pageLimit); err != nil || len(history.Messages) != 1 {
 		t.Fatalf("unexpired partial segment: %+v, %v", history, err)
 	}
@@ -270,5 +273,117 @@ func TestCompactReclaimsExpiredPartialSegment(t *testing.T) {
 	}
 	if got := publishTest(t, p, "later"); got.Offset != 1 {
 		t.Fatalf("new publication reused offset: %+v", got)
+	}
+}
+
+func TestCheckpointExpiresMetadataWithAnEmptyWAL(t *testing.T) {
+	now := walFixtureTime
+	expiry := now.Add(time.Minute)
+	dir := t.TempDir()
+	cfg := Config{Clock: testClock(&now), DedupRetention: time.Minute, DeadRetention: time.Minute}
+	p := openTest(t, dir, cfg)
+	registerTest(t, p, "notify", SubscriptionConfig{MaxAttempts: 1})
+	publishTest(t, p, "ordinary")
+	publishTest(t, p, "failure")
+	ds := pullTest(t, p, "notify", "worker", 2)
+	ackTest(t, p, "notify", "worker", ds[0], AckAccepted)
+	failed, err := p.Fail("notify", "worker", ds[1].Instance, ds[1].Token, "failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	redrive, err := p.Redrive("notify", failed.DeadLetterID, "retain-task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduled := PublishRequest{ID: "delayed", Body: []byte("later"), DeliverAt: expiry}
+	original, err := p.Publish(scheduled)
+	if err != nil || !original.Scheduled {
+		t.Fatalf("schedule = %+v, %v", original, err)
+	}
+	before := checkpointHEAD(t, dir)
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	head := checkpointHEAD(t, dir)
+	if bytes.Equal(before, head) || p.journal.End() != 0 {
+		t.Fatal("the initial checkpoint did not publish the new WAL state")
+	}
+	now = expiry.Add(-time.Nanosecond)
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(head, checkpointHEAD(t, dir)) {
+		t.Fatal("checkpoint before the expiry boundary changed HEAD")
+	}
+	now = expiry
+	capacity := p.config.CapacityBytes
+	p.config.CapacityBytes = 4096
+	err = p.Compact()
+	p.config.CapacityBytes = capacity
+	if !errors.Is(err, ErrCapacity) || !bytes.Equal(head, checkpointHEAD(t, dir)) ||
+		len(p.publishes) != 3 || len(p.dead) != 1 || len(p.acknowledgments) != 1 || len(p.redriveReceipts) != 1 {
+		t.Fatalf("failed checkpoint changed live metadata or HEAD: %v", err)
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(head, checkpointHEAD(t, dir)) || p.journal.End() != 0 {
+		t.Fatal("expiry at the boundary did not publish a new generation")
+	}
+	check := func() {
+		t.Helper()
+		if len(p.publishes) != 1 || len(p.dead) != 0 || len(p.acknowledgments) != 0 || len(p.redriveReceipts) != 0 ||
+			len(p.redrives) != 1 || len(p.scheduled) != 1 {
+			t.Fatal("checkpoint pruned the wrong metadata")
+		}
+		if got, err := p.Publish(scheduled); err != nil || got != original {
+			t.Fatalf("pending scheduled receipt = %+v, %v", got, err)
+		}
+		if got, err := p.PublishStatus("delayed"); err != nil || !got.Scheduled {
+			t.Fatalf("pending status = %+v, %v", got, err)
+		}
+	}
+	check()
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, cfg)
+	check()
+	recovered := pullTest(t, p, "notify", "worker", 1)[0]
+	if recovered.Instance != redrive.Instance || string(recovered.Message.Body) != "failure" {
+		t.Fatalf("redrive after receipt and dead-letter expiry: %+v", recovered)
+	}
+	if n, err := p.AdvanceScheduled(pageLimit); err != nil || n != 1 {
+		t.Fatalf("publish due item after reopening = %d, %v", n, err)
+	}
+}
+
+func TestCheckpointSealsFullTailWithAnEmptyWAL(t *testing.T) {
+	now := walFixtureTime
+	dir := t.TempDir()
+	cfg := Config{Clock: testClock(&now), SegmentMessages: 16}
+	p := openTest(t, dir, cfg)
+	for _, id := range []string{"one", "two", "three"} {
+		publishTest(t, p, id)
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.SegmentMessages = 2
+	p = openTest(t, dir, cfg)
+	if p.journal.End() != 0 || len(p.tail) != 3 || len(p.segments) != 0 {
+		t.Fatal("recovered fixture must have an inline tail and an empty WAL")
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.segments) != 1 || p.segments[0].Count != 2 || len(p.tail) != 1 {
+		t.Fatal("checkpoint with an empty WAL did not seal the newly full segment")
+	}
+	if page, err := p.Read(0, pageLimit); err != nil || len(page.Messages) != 3 || page.Messages[2].ID != "three" {
+		t.Fatalf("history across sealed and inline records = %+v, %v", page, err)
 	}
 }
