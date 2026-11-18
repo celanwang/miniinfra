@@ -89,7 +89,7 @@ func runWALChild(binary, dir, mode string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
-func copyWALFixture(t *testing.T, source, target string) {
+func copyWALFixture(t testing.TB, source, target string) {
 	t.Helper()
 	files, err := os.ReadDir(source)
 	if err != nil {

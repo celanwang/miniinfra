@@ -264,7 +264,12 @@ func TestCompactReclaimsExpiredPartialSegment(t *testing.T) {
 	if history, err := p.Read(0, pageLimit); err != nil || len(history.Messages) != 1 {
 		t.Fatalf("unexpired partial segment: %+v, %v", history, err)
 	}
-	now = now.Add(time.Minute)
+	head := checkpointHEAD(t, dir)
+	now = now.Add(time.Minute - time.Nanosecond)
+	if err := p.Compact(); err != nil || !bytes.Equal(head, checkpointHEAD(t, dir)) {
+		t.Fatalf("checkpoint before age boundary changed HEAD: %v", err)
+	}
+	now = now.Add(time.Nanosecond)
 	if err := p.Compact(); err != nil {
 		t.Fatal(err)
 	}
@@ -273,6 +278,139 @@ func TestCompactReclaimsExpiredPartialSegment(t *testing.T) {
 	}
 	if got := publishTest(t, p, "later"); got.Offset != 1 {
 		t.Fatalf("new publication reused offset: %+v", got)
+	}
+}
+
+func TestCheckpointReclaimsTailPrefixAndRetainsSuffixAfterFailures(t *testing.T) {
+	now := walFixtureTime
+	dir := t.TempDir()
+	cfg := Config{Clock: testClock(&now), SegmentMessages: 2, HistoryRetention: time.Minute}
+	p := openTest(t, dir, cfg)
+	registerTest(t, p, "notify", SubscriptionConfig{})
+	publish := func(i int) {
+		t.Helper()
+		if got := publishTest(t, p, fmt.Sprintf("message-%d", i)); got.Offset != uint64(i) {
+			t.Fatalf("publish %d took offset %d", i, got.Offset)
+		}
+	}
+	publish(0)
+	publish(1)
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	publish(2)
+	publish(3)
+	for _, d := range pullTest(t, p, "notify", "worker", 4) {
+		ackTest(t, p, "notify", "worker", d, AckAccepted)
+	}
+	now = now.Add(time.Minute)
+	publish(4)
+	publish(5)
+	publish(6)
+	head := checkpointHEAD(t, dir)
+
+	checkUnchanged := func() {
+		t.Helper()
+		if !bytes.Equal(head, checkpointHEAD(t, dir)) || p.firstOffset != 0 || p.tailOffset != 2 ||
+			p.nextOffset() != 7 || len(p.segments) != 1 || string(p.tail[0].Body) != "message-2" {
+			t.Fatal("failed checkpoint changed HEAD or retired uncommitted history")
+		}
+	}
+	capacity := p.config.CapacityBytes
+	p.config.CapacityBytes = 4096
+	if err := p.Compact(); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("bounded checkpoint = %v", err)
+	}
+	checkUnchanged()
+	p.config.CapacityBytes = capacity
+	// A directory at the suffix's new segment path makes staging fail.
+	blocked := filepath.Join(dir, (&segment{Base: 4}).name())
+	if err := os.Mkdir(blocked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Compact(); err == nil || p.failed == nil {
+		t.Fatal("staging failure did not stop the partition")
+	}
+	checkUnchanged()
+	if err := os.Remove(blocked); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, cfg)
+	checkUnchanged()
+	checkPage := func(first, count int) {
+		t.Helper()
+		page, err := p.Read(uint64(first), pageLimit)
+		if err != nil || len(page.Messages) != count || page.Next != 7 {
+			t.Fatalf("history from %d = %+v, %v", first, page, err)
+		}
+		for i, msg := range page.Messages {
+			offset := i + first
+			if msg.Offset != uint64(offset) || string(msg.Body) != fmt.Sprintf("message-%d", offset) {
+				t.Fatalf("body at offset %d after checkpoint = %q", offset, msg.Body)
+			}
+		}
+	}
+	checkPage(0, 7)
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	checkSuffix := func() {
+		t.Helper()
+		status, err := p.Status()
+		if err != nil || status.FirstOffset != 4 || status.NextOffset != 7 ||
+			len(p.segments) != 1 || p.segments[0].Base != 4 || len(p.tail) != 1 {
+			t.Fatalf("retained suffix = %+v, %v", status, err)
+		}
+		var gap *OffsetGap
+		if _, err := p.Read(0, pageLimit); !errors.As(err, &gap) || gap.First != 4 {
+			t.Fatalf("read before the suffix = %v", err)
+		}
+		checkPage(4, 3)
+	}
+	checkSuffix()
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, cfg)
+	checkSuffix()
+	publish(7)
+}
+
+func TestCheckpointKeepsExpiredTailBehindUnexpiredSegment(t *testing.T) {
+	lower, upper := walFixtureTime, walFixtureTime.Add(10*time.Minute)
+	cfg := Config{SegmentMessages: 2, HistoryRetention: time.Minute, Clock: func() (TimeBounds, error) {
+		return TimeBounds{Lower: lower, Upper: upper}, nil
+	}}
+	dir := t.TempDir()
+	p := openTest(t, dir, cfg)
+	publishTest(t, p, "older-one")
+	publishTest(t, p, "older-two")
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	// A tighter clock bound can give later slots earlier publication times.
+	lower = lower.Add(time.Second)
+	upper = lower
+	publishTest(t, p, "later-one")
+	publishTest(t, p, "later-two")
+	lower = lower.Add(time.Minute)
+	upper = lower
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if p.firstOffset != 0 || len(p.segments) != 2 || p.segments[1].Base != 2 {
+		t.Fatal("later expired segment jumped over the older retained segment")
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, cfg)
+	page, err := p.Read(0, pageLimit)
+	if err != nil || len(page.Messages) != 4 || page.Next != 4 || string(page.Messages[3].Body) != "later-two" {
+		t.Fatalf("history behind a retained older segment = %+v, %v", page, err)
 	}
 }
 
