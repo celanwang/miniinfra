@@ -124,7 +124,7 @@ func (view Snapshot) Rows(name string, columns []int, values []Value) (rows [][]
 	if err != nil {
 		return nil, false, err
 	}
-	view.tx.lockTable(tbl.mu.RLock)
+	view.tx.lockTable(tbl, tbl.mu.RLock)
 	defer tbl.mu.RUnlock()
 	if len(columns) != 0 {
 		for i := range tbl.indexes {
@@ -173,7 +173,7 @@ func (view Snapshot) Mutate(ctx context.Context, name string, primary []Value, e
 		return false, fmt.Errorf("%w: wrong number of primary key values", ErrSchema)
 	}
 	var id uint64
-	view.tx.lockTable(tbl.mu.RLock)
+	view.tx.lockTable(tbl, tbl.mu.RLock)
 	for row := range tbl.indexes[tbl.primary].lookup(lookupKey(primary)) {
 		if view.visible(row) {
 			id = row.id
@@ -190,7 +190,7 @@ func (view Snapshot) Mutate(ctx context.Context, name string, primary []Value, e
 		return false, err
 	}
 	current := Snapshot{tx: tx, sequence: tx.db.published.Load()}
-	tx.lockTable(tbl.mu.RLock)
+	tx.lockTable(tbl, tbl.mu.RLock)
 	var old *version
 	for row := tbl.heads[id]; row != nil; row = row.previous {
 		if current.visible(row) {
@@ -252,7 +252,7 @@ func (tx *Txn) write(ctx context.Context, tbl *table, old *version, ch change) e
 		}
 	}
 
-	tx.lockTable(tbl.mu.Lock)
+	tx.lockTable(tbl, tbl.mu.Lock)
 	defer tbl.mu.Unlock()
 	if ch.Kind != "delete" {
 		current := Snapshot{tx: tx, sequence: tx.db.published.Load()}
@@ -277,14 +277,24 @@ func (tx *Txn) write(ctx context.Context, tbl *table, old *version, ch change) e
 type transactionTiming struct {
 	rowWait, uniqueWait, lockManagerWait, tableWait time.Duration
 	wal                                             wal.CommitTiming
+	acquisitions                                    []tableAcquisition
 }
 
-func (tx *Txn) lockTable(lock func()) {
+type tableAcquisition struct {
+	table             *table
+	requested, locked time.Time
+}
+
+func (tx *Txn) lockTable(tbl *table, lock func()) {
 	if tx.timing == nil {
 		lock()
 		return
 	}
 	start := time.Now()
 	lock()
-	tx.timing.tableWait += time.Since(start)
+	locked := time.Now()
+	tx.timing.tableWait += locked.Sub(start)
+	if tx.timing.acquisitions != nil {
+		tx.timing.acquisitions = append(tx.timing.acquisitions, tableAcquisition{tbl, start, locked})
+	}
 }
