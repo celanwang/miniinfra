@@ -80,7 +80,7 @@ def rss(container):
     return memory
 
 
-def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit, server_cpus, driver_cpus, pressure_lengths="fixed", block_profile=False, ttl_pattern="clustered", page_window=1):
+def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit, server_cpus, driver_cpus, pressure_lengths="fixed", block_profile=False, ttl_pattern="clustered", page_window=1, page_key_bytes=12):
     with engine(binaries, image, name, go_memory_limit, server_cpus, block_profile) as container:
         flags = [
             "run", "--rm", "--pull=never", "--network", f"container:{container}",
@@ -96,7 +96,7 @@ def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit
         elif profile == "ttl":
             flags += ["-ttl-pattern", ttl_pattern]
         elif profile == "page":
-            flags += ["-page-window", page_window]
+            flags += ["-page-window", page_window, "-page-key-bytes", page_key_bytes]
         else:
             flags[2:2] = ["--pid", f"container:{container}"]
         if driver_cpus:
@@ -112,6 +112,7 @@ def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit
             metadata["TTLPattern"] = ttl_pattern
         if profile == "page":
             metadata["PageWindow"] = page_window
+            metadata["PageKeyBytes"] = page_key_bytes
         driver = subprocess.run(["docker", *map(str, flags)], capture_output=True, text=True)
         oom = docker("inspect", "--format", "{{.State.OOMKilled}}", container) == "true"
         if driver.returncode and not oom:
@@ -151,6 +152,7 @@ def main():
     parser.add_argument("--block-profile", action="store_true", help="collect an instrumented Go block profile")
     parser.add_argument("--ttl-pattern", default="clustered", choices=("clustered", "spread", "byte-fit", "byte-limit"))
     parser.add_argument("--page-window", type=int, default=1, choices=(1, 4))
+    parser.add_argument("--page-key-bytes", type=int, default=12, help="key length for the page profile (12–1024)")
     args = parser.parse_args()
     profiles = args.profiles.split(",")
     if any(p not in ("small", "mixed", "slow", "capacity", "pressure", "ttl", "page") for p in profiles):
@@ -171,7 +173,8 @@ def main():
                 engines = ("minikv",)
             for name in engines:
                 replay(binaries, args.image, name, profile, rate, args.duration, args.tick,
-                       args.go_memory_limit, args.server_cpus, args.driver_cpus, args.pressure_lengths, args.block_profile, args.ttl_pattern, args.page_window)
+                       args.go_memory_limit, args.server_cpus, args.driver_cpus, args.pressure_lengths, args.block_profile,
+                       args.ttl_pattern, args.page_window, args.page_key_bytes)
 
 
 if __name__ == "__main__":
