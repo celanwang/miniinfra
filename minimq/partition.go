@@ -185,6 +185,7 @@ type operationTiming struct {
 	worker                    string
 	checkpoint                checkpointTiming
 	retry                     retryTiming
+	commit                    commitTiming
 }
 
 type checkpointTiming struct {
@@ -194,9 +195,14 @@ type checkpointTiming struct {
 }
 
 type retryTiming struct {
-	scan, order, read, prepare, commit time.Duration
-	visited, candidates, settled, dead int
-	deadBytes                          int
+	scan, order, read, decode, prepare, commit time.Duration
+	visited, candidates, settled, dead         int
+	deadBytes                                  int
+}
+
+type commitTiming struct {
+	encode, frame, write time.Duration
+	bytes                int
 }
 
 // An optional observer, installed before opening the workload to concurrent
@@ -204,9 +210,11 @@ type retryTiming struct {
 type partitionTimings struct {
 	record           func(string, operationTiming)
 	time             time.Duration
+	writeTime        time.Duration
 	calls            int
 	checkpoint       checkpointTiming
 	retry            retryTiming
+	commit           commitTiming
 	checkpointLocked func()
 }
 
@@ -218,6 +226,7 @@ func (p *Partition) observe(record func(string, operationTiming)) {
 		timings.calls++
 	}
 	p.journal.ObserveWrite = func(elapsed time.Duration) {
+		timings.writeTime += elapsed
 		timings.checkpoint.write += elapsed
 	}
 }
@@ -230,6 +239,7 @@ func (p *Partition) beginOperation() operationTiming {
 	arrived := time.Now()
 	p.mu.Lock()
 	p.timings.retry = retryTiming{}
+	p.timings.commit = commitTiming{}
 	return operationTiming{
 		arrived: arrived, locked: time.Now(), syncTime: p.timings.time, syncCalls: p.timings.calls,
 	}
@@ -244,6 +254,7 @@ func (p *Partition) endOperation(operation string, sample operationTiming) {
 			sample.checkpoint = timing.checkpoint
 		}
 		sample.retry = timing.retry
+		sample.commit = timing.commit
 		timing.record(operation, sample)
 	}
 	p.mu.Unlock()
@@ -351,26 +362,48 @@ func (p *Partition) applyPublication(pub publication, acceptedSequence uint64) e
 
 func (p *Partition) commit(tx transaction) error {
 	tx.Sequence = p.sequence + 1
+	timing := p.timings
+	var started time.Time
+	if timing != nil {
+		started = time.Now()
+	}
 	data, err := json.Marshal(tx)
+	if timing != nil {
+		timing.commit.encode += time.Since(started)
+		started = time.Now()
+	}
 	if err != nil {
 		return err
 	}
-	frame, err := journal.EncodeFrame(data)
+	frame, err := journal.PrepareFrame(data)
+	if timing != nil {
+		timing.commit.frame += time.Since(started)
+		timing.commit.bytes += frame.Size()
+	}
 	if err != nil {
 		return err
 	}
+	frameBytes := int64(frame.Size())
 	budget := p.config.CapacityBytes/2 - 4096
-	if int64(len(frame))+p.reserved+tx.ReserveDelta > budget-p.storageBytes() {
+	if frameBytes+p.reserved+tx.ReserveDelta > budget-p.storageBytes() {
 		return ErrCapacity
 	}
 	available, err := p.journal.Available()
 	if err != nil {
 		return err
 	}
-	if int64(len(frame))+p.reserved+tx.ReserveDelta+8192 > available {
+	if frameBytes+p.reserved+tx.ReserveDelta+8192 > available {
 		return ErrCapacity
 	}
-	if err := p.journal.Append(frame); err != nil {
+	var writeBefore time.Duration
+	if timing != nil {
+		writeBefore = timing.writeTime
+	}
+	err = p.journal.Append(frame)
+	if timing != nil {
+		timing.commit.write += timing.writeTime - writeBefore
+	}
+	if err != nil {
 		p.failed = err
 		return err
 	}

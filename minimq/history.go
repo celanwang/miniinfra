@@ -170,10 +170,11 @@ func (p *Partition) locateHistory(offset uint64) historyLocation {
 
 // A batch keeps at most one segment descriptor and one encoded frame buffer.
 type historyReader struct {
-	dir     string
-	file    *os.File
-	segment *segment
-	frame   []byte
+	dir        string
+	file       *os.File
+	segment    *segment
+	frame      []byte
+	decodeTime *time.Duration
 }
 
 func (r *historyReader) close() {
@@ -206,7 +207,15 @@ func (r *historyReader) read(offset uint64, loc historyLocation) (Message, error
 	}
 	r.frame = data
 	var msg storedMessage
-	if err := json.Unmarshal(data, &msg); err != nil || msg.Offset != offset ||
+	var began time.Time
+	if r.decodeTime != nil {
+		began = time.Now()
+	}
+	err = json.Unmarshal(data, &msg)
+	if r.decodeTime != nil {
+		*r.decodeTime += time.Since(began)
+	}
+	if err != nil || msg.Offset != offset ||
 		msg.AcceptedSequence != loc.record.accepted || len(msg.Body) != loc.record.bodyBytes {
 		return Message{}, fmt.Errorf("%w: invalid history record at offset %d", ErrCorrupt, offset)
 	}

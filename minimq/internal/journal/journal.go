@@ -17,6 +17,7 @@ import (
 
 const (
 	maxFrame         = 1 << 28
+	splitFrameAt     = 1 << 20
 	headSize         = 24
 	FrameHeaderBytes = 8
 )
@@ -167,19 +168,45 @@ func (j *Journal) Available() (int64, error) {
 	return int64(stats.Bavail) * int64(stats.Bsize), nil
 }
 
-func EncodeFrame(payload []byte) ([]byte, error) {
-	return AppendFrame(nil, payload)
-}
-
 // AppendFrame appends a length/CRC frame without a temporary frame buffer.
 func AppendFrame(dst, payload []byte) ([]byte, error) {
-	if len(payload) == 0 || len(payload) > maxFrame {
-		return nil, fmt.Errorf("invalid frame size: %d", len(payload))
+	if err := validateFrameSize(len(payload)); err != nil {
+		return nil, err
 	}
 	dst = slices.Grow(dst, FrameHeaderBytes+len(payload))
+	return append(appendFrameHeader(dst, payload), payload...), nil
+}
+
+func validateFrameSize(size int) error {
+	if size == 0 || size > maxFrame {
+		return fmt.Errorf("invalid frame size: %d", size)
+	}
+	return nil
+}
+
+func appendFrameHeader(dst, payload []byte) []byte {
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(payload)))
-	dst = binary.LittleEndian.AppendUint32(dst, crc32.ChecksumIEEE(payload))
-	return append(dst, payload...), nil
+	return binary.LittleEndian.AppendUint32(dst, crc32.ChecksumIEEE(payload))
+}
+
+// Frame holds the bytes of one WAL record. A large frame borrows its payload
+// until Append returns. Small frames are contiguous for a single write.
+type Frame struct {
+	prefix, payload []byte
+}
+
+func (f Frame) Size() int { return len(f.prefix) + len(f.payload) }
+
+func PrepareFrame(payload []byte) (Frame, error) {
+	if len(payload) < splitFrameAt {
+		frame, err := AppendFrame(nil, payload)
+		return Frame{prefix: frame}, err
+	}
+	if err := validateFrameSize(len(payload)); err != nil {
+		return Frame{}, err
+	}
+	header := appendFrameHeader(make([]byte, 0, FrameHeaderBytes), payload)
+	return Frame{prefix: header, payload: payload}, nil
 }
 
 func ReadFrame(reader io.Reader, remaining int64) ([]byte, int64, error) {
@@ -210,7 +237,7 @@ func ReadFrameInto(reader io.Reader, remaining int64, scratch []byte) ([]byte, i
 	return data, size + FrameHeaderBytes, nil
 }
 
-func (j *Journal) Append(frame []byte) error {
+func (j *Journal) Append(frame Frame) error {
 	if j.failed != nil {
 		return j.failed
 	}
@@ -221,19 +248,35 @@ func (j *Journal) Append(frame []byte) error {
 	return nil
 }
 
-func (j *Journal) append(frame []byte) error {
-	if _, err := j.file.WriteAt(frame, j.end); err != nil {
+func (j *Journal) append(frame Frame) error {
+	if err := j.writeAt(frame.prefix, j.end); err != nil {
 		return err
+	}
+	if len(frame.payload) != 0 {
+		if err := j.writeAt(frame.payload, j.end+int64(len(frame.prefix))); err != nil {
+			return err
+		}
 	}
 	if err := j.sync(j.file); err != nil {
 		return err
 	}
-	end := j.end + int64(len(frame))
+	end := j.end + int64(frame.Size())
 	if err := j.installHead(j.generation, end); err != nil {
 		return err
 	}
 	j.end = end
 	return nil
+}
+
+func (j *Journal) writeAt(data []byte, offset int64) error {
+	if j.ObserveWrite == nil {
+		_, err := j.file.WriteAt(data, offset)
+		return err
+	}
+	start := time.Now()
+	_, err := j.file.WriteAt(data, offset)
+	j.ObserveWrite(time.Since(start))
+	return err
 }
 
 func (j *Journal) installHead(generation uint64, end int64) error {

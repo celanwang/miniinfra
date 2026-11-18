@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -225,19 +226,26 @@ func reportRetryExperiment(t *testing.T, samples map[string][]operationTiming) {
 	}
 	for i, s := range samples["retry"] {
 		r := s.retry
-		t.Logf("round=%d visited=%d eligible=%d settled=%d dead=%d dead_bytes=%d lock=%s scan=%s order=%s read=%s prepare=%s commit=%s sync=%s",
+		t.Logf("round=%d visited=%d eligible=%d settled=%d dead=%d dead_bytes=%d lock=%s scan=%s order=%s read=%s read_frame=%s decode=%s prepare=%s commit=%s encode=%s frame=%s write=%s sync=%s sync_calls=%d frame_bytes=%d",
 			i+1, r.visited, r.candidates, r.settled, r.dead, r.deadBytes, s.finished.Sub(s.locked), r.scan,
-			r.order, r.read, r.prepare-r.read, r.commit, s.syncTime)
+			r.order, r.read, r.read-r.decode, r.decode, r.prepare-r.read, r.commit, s.commit.encode, s.commit.frame, s.commit.write, s.syncTime, s.syncCalls, s.commit.bytes)
 	}
 }
 
 func reportRetryOperations(t *testing.T, op string, samples, retries []operationTiming) {
 	t.Helper()
 	var elapsed, waits, held, overlaps []time.Duration
+	var encode, frame, write, sync []time.Duration
+	var frameBytes int
 	for _, s := range samples {
 		elapsed = append(elapsed, s.finished.Sub(s.arrived))
 		waits = append(waits, s.locked.Sub(s.arrived))
 		held = append(held, s.finished.Sub(s.locked))
+		encode = append(encode, s.commit.encode)
+		frame = append(frame, s.commit.frame)
+		write = append(write, s.commit.write)
+		sync = append(sync, s.syncTime)
+		frameBytes += s.commit.bytes
 		for _, r := range retries {
 			from := s.arrived
 			if !from.Before(r.locked) && from.Before(r.finished) {
@@ -252,6 +260,12 @@ func reportRetryOperations(t *testing.T, op string, samples, retries []operation
 	}
 	t.Logf("op=%s count=%d p99=%s wait_p99=%s lock_p99=%s overlap_retry=%d overlap_p99=%s",
 		op, len(samples), historyP99(elapsed), historyP99(waits), historyP99(held), len(overlaps), overlapP99)
+	median := func(values []time.Duration) time.Duration {
+		slices.Sort(values)
+		return values[(len(values)-1)/2]
+	}
+	t.Logf("commit_op=%s mean_frame_bytes=%d encode_p50=%s frame_p50=%s write_p50=%s sync_p50=%s",
+		op, frameBytes/len(samples), median(encode), median(frame), median(write), median(sync))
 }
 
 func verifyRetryExperimentDead(t *testing.T, p *Partition, want int, body []byte) {
