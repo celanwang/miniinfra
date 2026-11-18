@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB skips redundant secondary index key encoding during uniqueness checks on inserts and updates.
 - MiniKV verifies that concurrent conditional refills publish one complete value and start its TTL at publication.
 - MiniMQ copies checkpoint metadata maps only when entries expire, reducing allocations and partition lock time during idle maintenance.
 - MiniKV verifies eviction order and write outcomes under full-cache TCP load and retains the existing bounded sort.
