@@ -109,6 +109,8 @@ func countCandidates(idx *index, page *indexPage) int {
 type SweepMeasurement struct {
 	Steps, Scanned, Removed int
 	Time, Max, MaxTableHold time.Duration
+	MaxTableRemove          time.Duration
+	MaxTableName            string
 	Slowest                 SweepPhases
 }
 
@@ -138,7 +140,11 @@ func (db *DB) MeasureReclaimSweeps(ctx context.Context) <-chan SweepMeasurement 
 				stats.Removed += sweep.removed
 				stats.Time += sweep.wall
 				for _, visit := range sweep.timing.tables {
-					stats.MaxTableHold = max(stats.MaxTableHold, visit.releasing.Sub(visit.locked))
+					if duration := visit.releasing.Sub(visit.locked); duration > stats.MaxTableHold {
+						stats.MaxTableHold = duration
+						stats.MaxTableName = visit.table.schema.Name
+						stats.MaxTableRemove = visit.remove
+					}
 				}
 				if sweep.wall > stats.Max {
 					stats.Max = sweep.wall
