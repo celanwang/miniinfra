@@ -25,12 +25,44 @@ type pressurePhase struct {
 	RTTP99Microseconds float64
 }
 
+const (
+	pressureWriters        = 8
+	evictionWritesPerShard = 192
+	evictionEntryBytes     = (4<<20)/ttlShardSlots - 112
+)
+
+func evictionWriteClass(step int) int {
+	if step < 120 {
+		return 0
+	}
+	if step%3 == 0 {
+		return 2 // Seventeen entries exceed the sample budget of sixteen.
+	}
+	return 1
+}
+
 func runPressure(target target, lengths string, blockProfile bool) map[string]any {
 	result := make(map[string]any)
 	publish := strings.HasPrefix(lengths, "publish")
 	locality := lengths == "publish-locality" || lengths == "publish-aligned"
 	var business *businessPressure
-	if lengths == "business" {
+	var eviction [][]ttlEntry
+	hotSize := smallSize
+	if lengths == "eviction" {
+		var err error
+		eviction, err = ttlLayout(ttlShardSlots, evictionWritesPerShard)
+		if err != nil {
+			result["SetupError"] = err.Error()
+			return result
+		}
+		hotSize = evictionEntryBytes - len(eviction[0][0].key)
+		value := bytes.Repeat([]byte("r"), hotSize)
+		prefill := populateTTL(target, eviction, ttlShardSlots, func(int) ([]byte, time.Time) { return value, time.Time{} })
+		result["Prefill"] = prefill
+		if prefill[ok] != ttlShards*ttlShardSlots {
+			return result
+		}
+	} else if lengths == "business" {
 		var err error
 		business, err = prepareBusinessPressure(target)
 		if err != nil {
@@ -47,7 +79,7 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 	}
 
 	const readers = 16
-	const writers = 8
+	const writers = pressureWriters
 	hot := make([]command, readers)
 	warm := client{target: target}
 	defer warm.close()
@@ -62,6 +94,10 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 		}
 	}
 	for i := range hot {
+		if eviction != nil {
+			hot[i] = target.makeCommand(eviction[i][3500].key, nil, hotSize)
+			continue
+		}
 		key := fmt.Sprintf("read%06d", i)
 		if locality {
 			key = keys[i]
@@ -123,7 +159,7 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 			defer client.close()
 			for job := range readQueues[i/(readers/2)] {
 				started := time.Now()
-				_, status := client.execute(hot[i], smallSize, 0)
+				_, status := client.execute(hot[i], hotSize, 0)
 				end := time.Now()
 				reads[i] = append(reads[i], pressureRead{job.at, end.Sub(job.at), end.Sub(started), status})
 			}
@@ -153,6 +189,7 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 	writeStart := time.Now()
 	writeResults := make([]map[outcome]int, writers)
 	writeLatency := make([][]time.Duration, writers)
+	var evictionLatency [writers][3][]time.Duration
 	recovered := make([]bool, writers)
 	verified := make([]bool, writers)
 	unexpected := make([]int, writers)
@@ -173,30 +210,44 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 				size := pressureWriteSize(lengths, k)
 				key := pressureWriteKey(lengths, k)
 				var expected outcome
+				var writeClass int
 				if business != nil {
 					key, size, expected = business.write(k)
 					if expected == ok {
 						data[0] = byte(k / writers)
 					}
 				}
+				if eviction != nil {
+					step := k / writers
+					at := writeStart.Add(time.Duration(step*writers+i) * 250 * time.Microsecond)
+					time.Sleep(time.Until(at))
+					key = eviction[i][ttlShardSlots+step].key
+					writeClass = evictionWriteClass(step)
+					size = [...]int{1, 2, 17}[writeClass]*evictionEntryBytes - len(key)
+					expected = [...]outcome{ok, ok, noSpace}[writeClass]
+				}
 				cmd := target.makeCommand(key, data[:size], size)
 				started := time.Now()
 				_, status := client.execute(cmd, 0, 0)
+				elapsed := time.Since(started)
 				statuses[status]++
+				if expected != "" && expected != status {
+					unexpected[i]++
+				}
 				if business != nil {
-					if expected != status {
-						unexpected[i]++
-					}
 					if expected == ok && status == ok {
 						lastPublished = data[:size]
 					}
 				}
+				if eviction != nil && status == expected {
+					evictionLatency[i][writeClass] = append(evictionLatency[i][writeClass], elapsed)
+				}
 				if status == ok || status == noSpace {
-					writeLatency[i] = append(writeLatency[i], time.Since(started))
+					writeLatency[i] = append(writeLatency[i], elapsed)
 				}
 			}
 			if previous := client.conn; previous != nil {
-				_, status := client.execute(hot[i], smallSize, 0)
+				_, status := client.execute(hot[i], hotSize, 0)
 				recovered[i] = status == ok && client.conn == previous
 				if business != nil && recovered[i] && len(lastPublished) > 0 {
 					verified[i] = business.verify(&client, i, lastPublished) && client.conn == previous
@@ -226,7 +277,7 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 		}
 	}
 	phases := pressureReadPhases(reads, writeStart, writeEnd)
-	if locality {
+	if locality || eviction != nil {
 		result["SameShard"] = pressureReadPhases(reads[:readers/2], writeStart, writeEnd)
 		result["CrossShard"] = pressureReadPhases(reads[readers/2:], writeStart, writeEnd)
 	}
@@ -242,7 +293,18 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 	result["WriteSamples"] = len(writeSamples)
 	result["WriteP99Microseconds"] = percentile(writeSamples, 990)
 	result["WriterConnectionsRecovered"] = recoveredCount
-	if business != nil {
+	if eviction != nil {
+		classResults := make(map[string]any)
+		for class, name := range [...]string{"Single", "Multiple", "Reject"} {
+			var times []time.Duration
+			for _, lane := range evictionLatency {
+				times = append(times, lane[class]...)
+			}
+			classResults[name] = map[string]any{"Count": len(times), "Latency": describePageLatency(times)}
+		}
+		result["EvictionWrites"] = classResults
+	}
+	if business != nil || eviction != nil {
 		var failures, verifiedCount int
 		for i, n := range unexpected {
 			failures += n
@@ -251,7 +313,9 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 			}
 		}
 		result["UnexpectedWrites"] = failures
-		result["VerifiedValues"] = verifiedCount
+		if business != nil {
+			result["VerifiedValues"] = verifiedCount
+		}
 	}
 	result["WriteSeconds"] = writeEnd.Sub(writeStart).Seconds()
 	result["RuntimeBefore"] = writeBefore

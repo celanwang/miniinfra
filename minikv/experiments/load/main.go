@@ -542,7 +542,7 @@ func main() {
 	if *profile == "pressure" && !*redis {
 		switch *lengths {
 		case "fixed", "repeated", "adjacent", "publish", "publish-locality", "publish-aligned",
-			"large-to-half", "half-to-large", "cold-half", "alternating", "business":
+			"large-to-half", "half-to-large", "cold-half", "alternating", "business", "eviction":
 		default:
 			log.Fatal("invalid pressure length pattern")
 		}
