@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniMQ skips unrelated redrive scans when a subscription has no pending redrives.
 - MiniMQ rebuilds pending delivery order in one heap pass when restoring a checkpoint.
 - MiniKV verifies that retrying a conditional write after a lost reply preserves its original value and expiry.
 - MiniDB skips index key encoding when reclaiming an old row version that can be unlinked directly.
