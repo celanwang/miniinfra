@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB prefers fully bound non-null unique indexes for equality lookups, reducing waits on tenant-scoped queries.
 - MiniKV verifies ordered pipelined responses and documents the latency tradeoff for small page reads.
 - MiniDB copies only matching rows during single-table queries, reducing allocations and writer waits on selective scans.
 - MiniKV verifies large GET replies under TCP backpressure and records the latency cost of vector writes.
