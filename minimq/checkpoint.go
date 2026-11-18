@@ -194,6 +194,9 @@ func (p *Partition) compact(now TimeBounds) error {
 		removed++
 		image.First = end
 	}
+	// Clear retired slots in the private copy to release their record indexes.
+	// In-flight readers can still hold descriptors from p.segments.
+	clear(image.Segments[:removed])
 	image.Segments = image.Segments[removed:]
 	image.Tail = p.tail[sealed:]
 	if p.journal.End() == 0 && sealed == 0 && removed == 0 &&
