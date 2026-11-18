@@ -553,6 +553,59 @@ func TestCheckpointExpiresMetadataWithAnEmptyWAL(t *testing.T) {
 	}
 }
 
+func TestCheckpointPrunesPublishReceiptsAndAllowsIDReuse(t *testing.T) {
+	now := walFixtureTime
+	dir := t.TempDir()
+	cfg := Config{Clock: testClock(&now), DedupRetention: time.Minute}
+	p := openTest(t, dir, cfg)
+	publishTest(t, p, "older")
+	now = now.Add(30 * time.Second)
+	recent := publishTest(t, p, "recent")
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(30 * time.Second)
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := p.PublishStatus(recent.ID); err != nil || got != recent || len(p.publishes) != 1 {
+		t.Fatalf("partial expiry: recent status = %+v, receipts = %d, %v", got, len(p.publishes), err)
+	}
+	head := checkpointHEAD(t, dir)
+	now = now.Add(30 * time.Second)
+	capacity := p.config.CapacityBytes
+	p.config.CapacityBytes = 4096
+	err := p.Compact()
+	p.config.CapacityBytes = capacity
+	if !errors.Is(err, ErrCapacity) || len(p.publishes) != 1 || !bytes.Equal(head, checkpointHEAD(t, dir)) {
+		t.Fatalf("rejected expiry changed receipts or HEAD: %v", err)
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.publishes) != 0 || bytes.Equal(head, checkpointHEAD(t, dir)) {
+		t.Fatal("expiry did not checkpoint an empty receipt map")
+	}
+	checkReuse := func(id string, offset uint64) {
+		t.Helper()
+		req := PublishRequest{ID: id, Body: []byte("new body")}
+		got, err := p.Publish(req)
+		if want := (PublishResult{ID: id, Offset: offset}); err != nil || got != want {
+			t.Fatalf("reuse %q = %+v, want %+v, %v", id, got, want, err)
+		}
+	}
+	checkReuse("older", 2)
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, cfg)
+	if got, err := p.PublishStatus("older"); err != nil || got.Offset != 2 || len(p.publishes) != 1 {
+		t.Fatalf("status after replay into an empty map = %+v, receipts = %d, %v", got, len(p.publishes), err)
+	}
+	checkReuse("recent", 3)
+}
+
 func TestCheckpointSealsFullTailWithAnEmptyWAL(t *testing.T) {
 	now := walFixtureTime
 	dir := t.TempDir()

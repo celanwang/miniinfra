@@ -134,6 +134,10 @@ func pruneCheckpointEntries[V any](entries map[string]V, expired func(string, V)
 	if pruned == nil {
 		return entries
 	}
+	if len(pruned) == 0 {
+		// The emptied clone still holds the original map's capacity.
+		return make(map[string]V)
+	}
 	return pruned
 }
 
