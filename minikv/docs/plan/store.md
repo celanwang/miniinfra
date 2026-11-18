@@ -2,7 +2,7 @@
 
 同一个键始终路由到同一个分片。分片拥有键索引、紧凑条目数组、条目额度和写入顺序。每个条目记录不可变值及截止时间。一次请求的状态在分片锁内裁决，网络传输在锁外完成。
 
-`GET` 在同步查找期间借用连接的帧内键缓冲。路由用 `maphash.Bytes`，与写入对同样字节使用相同种子和分片计算。字符串转换直接放在索引查找表达式里，让 Go 复用现有键字节。写入仍生成独立的字符串键，连接可以在下一帧覆盖接收缓冲。[长键分配与 TCP 对照](capacity.md#热-get-的键查找) · [Go `maphash`](https://pkg.go.dev/hash/maphash) · [Go 字符串查找转换](https://github.com/golang/go/blob/go1.27.3/src/runtime/string.go#L183)
+`GET` 和 `SET` 在同步查找期间借用连接的帧内键缓冲，共用 `maphash.Bytes` 路由和相同的种子。字符串转换直接放在索引查找表达式里，让 Go 复用现有键字节。覆盖已有槽位沿用驻留键，只有成功发布新键时才生成独立字符串。连接可以在下一帧覆盖接收缓冲。[长键读取对照](capacity.md#热-get-的键查找) · [写入键分配对照](capacity.md#set-的键复制) · [Go `maphash`](https://pkg.go.dev/hash/maphash) · [Go 字符串查找转换](https://github.com/golang/go/blob/go1.27.3/src/runtime/string.go#L183)
 
 | 操作 | 锁内步骤 | 可观察结果 |
 | --- | --- | --- |

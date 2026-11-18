@@ -60,7 +60,7 @@ func TestCapacityPeer(t *testing.T) {
 		}
 		indices := make([]int, len(keys))
 		for i, key := range keys {
-			indices[i] = cache.ShardIndex(key)
+			indices[i] = cache.ShardIndex([]byte(key))
 		}
 		_ = json.NewEncoder(w).Encode(indices)
 	})

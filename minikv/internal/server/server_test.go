@@ -217,7 +217,7 @@ func TestLargeTCPReplyReturnsOutboundBudget(t *testing.T) {
 			key := "tenant:product:detail:" + strings.Repeat("a", 40) + "\x00\n"
 			get := fmt.Sprintf("GET %d\n%s", len(key), key)
 			old := bytes.Repeat([]byte("o"), cfg.MaxValueBytes)
-			if cache.Set(key, old, 0, false) != store.Stored {
+			if cache.Set([]byte(key), old, 0, false) != store.Stored {
 				t.Fatal("could not store old value")
 			}
 			slow.exchange(t, get+"SET 1 1 NONE\nzZ", fmt.Sprintf("VALUE %d\n", len(old)))
@@ -296,11 +296,13 @@ func TestTCPCommandsAndShutdown(t *testing.T) {
 	})
 	address, cancel := s.listenTestTCP(t)
 	c := dialTestTCP(t, address)
-	c.exchange(t, "GET 2\nk\n", "MISS\n")
-	c.exchange(t, "SET 2 3 700 NX\nk\na\x00b", "STORED\n")
-	c.exchange(t, "SET 2 3 NONE NX\nk\nnew", "EXISTS\n")
-	c.exchange(t, "SET 2 1000 NONE\nk\n"+strings.Repeat("x", 1000), "NO_SPACE\n")
-	c.send(t, "GET 2\nk\n")
+	key := strings.Repeat("tenant:", 9) + "\n"
+	get := fmt.Sprintf("GET %d\n%s", len(key), key)
+	c.exchange(t, get, "MISS\n")
+	c.exchange(t, fmt.Sprintf("SET %d 3 700 NX\n%sa\x00b", len(key), key), "STORED\n")
+	c.exchange(t, fmt.Sprintf("SET %d 3 NONE NX\n%snew", len(key), key), "EXISTS\n")
+	c.exchange(t, fmt.Sprintf("SET %d 1000 NONE\n%s%s", len(key), key, strings.Repeat("x", 1000)), "NO_SPACE\n")
+	c.send(t, get)
 	c.value(t, "a\x00b")
 	end := time.Now().Add(3 * time.Second)
 	for s.cache.Stats(0).Entries > 0 {
@@ -309,9 +311,9 @@ func TestTCPCommandsAndShutdown(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	c.exchange(t, "GET 2\nk\n", "MISS\n")
-	c.exchange(t, "SET 2 0 NONE NX\nk\n", "STORED\n")
-	c.send(t, "GET 2\nk\n")
+	c.exchange(t, get, "MISS\n")
+	c.exchange(t, fmt.Sprintf("SET %d 0 NONE NX\n%s", len(key), key), "STORED\n")
+	c.send(t, get)
 	c.value(t, "")
 	cancel()
 	c.end(t)
@@ -331,8 +333,8 @@ func TestTCPPipelinePreservesOrderAndContinuesAfterRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	large := strings.Repeat("l\n\x00b", 64<<10)
-	if cache.Set("l", []byte(large), 0, false) != store.Stored ||
-		cache.Set("x", make([]byte, len(large)+1), 0, false) != store.Stored {
+	if cache.Set([]byte("l"), []byte(large), 0, false) != store.Stored ||
+		cache.Set([]byte("x"), make([]byte, len(large)+1), 0, false) != store.Stored {
 		t.Fatal("could not prefill large values")
 	}
 	address, _ := s.listenTestTCP(t)

@@ -101,18 +101,18 @@ func New(config Config) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) ShardIndex(key string) int {
-	return int(maphash.String(s.seed, key) % uint64(len(s.shards)))
+func (s *Store) ShardIndex(key []byte) int {
+	return int(maphash.Bytes(s.seed, key) % uint64(len(s.shards)))
 }
 
-func (s *Store) shardFor(key string) *shard {
+func (s *Store) shardFor(key []byte) *shard {
 	return &s.shards[s.ShardIndex(key)]
 }
 
 // Get borrows key for the lookup and returns an immutable value if reserved.
 // reserve runs under the read lock and must return without waiting on I/O.
 func (s *Store) Get(key []byte, reserve func(int64) bool) ([]byte, Result) {
-	sh := &s.shards[maphash.Bytes(s.seed, key)%uint64(len(s.shards))]
+	sh := s.shardFor(key)
 	sh.mu.RLock()
 	i, ok := sh.index[string(key)]
 	if !ok || sh.entries[i].expired(s.now()) {
@@ -128,19 +128,19 @@ func (s *Store) Get(key []byte, reserve func(int64) bool) ([]byte, Result) {
 	return value, Hit
 }
 
-// Set takes ownership of value on success. Its backing array must be
+// Set borrows key and takes ownership of value on success. Its backing array must be
 // immutable after publication. A zero TTL explicitly disables expiration.
-func (s *Store) Set(key string, value []byte, ttl time.Duration, onlyMissing bool) Result {
+func (s *Store) Set(key, value []byte, ttl time.Duration, onlyMissing bool) Result {
 	return s.set(key, value, ttl, onlyMissing, false)
 }
 
-// SetCopy borrows value during the call and allocates an exact-capacity copy
+// SetCopy borrows key and value and allocates an exact-capacity value copy
 // only if the write passes the shard's conditional and capacity checks.
-func (s *Store) SetCopy(key string, value []byte, ttl time.Duration, onlyMissing bool) Result {
+func (s *Store) SetCopy(key, value []byte, ttl time.Duration, onlyMissing bool) Result {
 	return s.set(key, value, ttl, onlyMissing, true)
 }
 
-func (s *Store) set(key string, value []byte, ttl time.Duration, onlyMissing, copyValue bool) Result {
+func (s *Store) set(key, value []byte, ttl time.Duration, onlyMissing, copyValue bool) Result {
 	if len(key) == 0 || ttl < 0 {
 		return Invalid
 	}
@@ -150,16 +150,17 @@ func (s *Store) set(key string, value []byte, ttl time.Duration, onlyMissing, co
 	defer sh.mu.Unlock()
 
 	now := s.now()
-	i, exists := sh.index[key]
+	i, exists := sh.index[string(key)]
 	if onlyMissing && exists && !sh.entries[i].expired(now) {
 		return Exists
 	}
 
-	next := entry{key: key, value: value}
-	delta := next.bytes()
+	next := entry{value: value}
+	valueBytes := cap(value)
 	if copyValue {
-		delta -= int64(cap(value) - len(value))
+		valueBytes = len(value)
 	}
+	delta := int64(len(key)) + int64(valueBytes)
 	if exists {
 		delta -= sh.entries[i].bytes()
 	}
@@ -196,10 +197,11 @@ func (s *Store) set(key string, value []byte, ttl time.Duration, onlyMissing, co
 		sh.remove(victim, now)
 	}
 	if exists {
-		i = sh.index[key]
+		i = sh.index[string(key)]
 		next.key = sh.entries[i].key
 		sh.entries[i] = next
 	} else {
+		next.key = string(key)
 		sh.index[next.key] = uint32(len(sh.entries))
 		sh.entries = append(sh.entries, next)
 	}
