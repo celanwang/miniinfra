@@ -182,14 +182,22 @@ type operationTiming struct {
 	arrived, locked, finished time.Time
 	syncTime                  time.Duration
 	syncCalls                 int
+	worker                    string
+	checkpoint                checkpointTiming
+}
+
+type checkpointTiming struct {
+	prepare, encode, frame, write, cleanup, cleanupSync time.Duration
 }
 
 // An optional observer, installed before opening the workload to concurrent
 // calls. Its counters are updated under the partition lock.
 type partitionTimings struct {
-	record func(string, operationTiming)
-	time   time.Duration
-	calls  int
+	record           func(string, operationTiming)
+	time             time.Duration
+	calls            int
+	checkpoint       checkpointTiming
+	checkpointLocked func()
 }
 
 func (p *Partition) observe(record func(string, operationTiming)) {
@@ -198,6 +206,9 @@ func (p *Partition) observe(record func(string, operationTiming)) {
 	p.journal.ObserveSync = func(elapsed time.Duration) {
 		timings.time += elapsed
 		timings.calls++
+	}
+	p.journal.ObserveWrite = func(elapsed time.Duration) {
+		timings.checkpoint.write += elapsed
 	}
 }
 
@@ -218,6 +229,9 @@ func (p *Partition) endOperation(operation string, sample operationTiming) {
 		sample.finished = time.Now()
 		sample.syncTime = timing.time - sample.syncTime
 		sample.syncCalls = timing.calls - sample.syncCalls
+		if operation == "checkpoint" {
+			sample.checkpoint = timing.checkpoint
+		}
 		timing.record(operation, sample)
 	}
 	p.mu.Unlock()

@@ -21,6 +21,7 @@ import (
 const checkpointBodyBytes = 64 << 10
 const queuedFastHistory = 32
 const checkpointPulseSize = 4
+const checkpointProbeWorker = "checkpoint-probe"
 
 func TestCheckpointExperiment(t *testing.T) {
 	mode := os.Getenv("MINIMQ_CHECKPOINT_EXPERIMENT")
@@ -40,14 +41,18 @@ func TestCheckpointExperiment(t *testing.T) {
 	backlog := experimentInt(t, "MINIMQ_CHECKPOINT_BACKLOG", 2048, 64, 16384)
 	rate := experimentInt(t, "MINIMQ_CHECKPOINT_RATE", 16, 4, 128)
 	pulses := 40
+	cycles := 10
 	pulseInterval := time.Duration(checkpointPulseSize) * time.Second / time.Duration(rate)
 	if mode == "default" {
 		pulses = int((3*maintenance.CheckpointInterval + 3*time.Second) / pulseInterval)
+		cycles = 3
 	}
+	probesPerCycle := min(8, (backlog-queuedFastHistory-checkpointPulseSize-1)/cycles)
+	probeCount := probesPerCycle * cycles
 	body := bytes.Repeat([]byte("minimq\r!"), checkpointBodyBytes/8)
 	cfg := Config{CapacityBytes: 16 << 30}
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := seedCheckpointBacklog(dir, cfg, body, backlog); err != nil {
+	if err := seedCheckpointBacklog(dir, cfg, body, backlog, queuedFastHistory+probeCount); err != nil {
 		t.Fatal(err)
 	}
 	heapBefore := liveHeap()
@@ -57,6 +62,10 @@ func TestCheckpointExperiment(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.Close() })
 	heapDelta := liveHeap() - heapBefore
+	probes, err := p.Pull("fast", checkpointProbeWorker, Limits{Messages: probeCount, Bytes: probeCount * len(body)})
+	if err != nil || len(probes) != probeCount {
+		t.Fatalf("prepare %d checkpoint leases: got %d, %v", probeCount, len(probes), err)
+	}
 	resident, pages, err := checkCheckpointCache(dir, cache == "cold")
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +76,8 @@ func TestCheckpointExperiment(t *testing.T) {
 	t.Logf("mode=%s os=%s cache=%s resident_pages=%d/%d backlog=%d body_bytes=%d reopen_heap_delta=%d target_messages_per_second=%d",
 		mode, runtime.GOOS, cache, resident, pages, backlog, len(body), heapDelta, rate)
 
-	var acks, checkpoints []operationTiming
+	acks := make([]operationTiming, 0, checkpointPulseSize*pulses+queuedFastHistory+probeCount)
+	var checkpoints []operationTiming
 	p.observe(func(op string, timing operationTiming) {
 		if op == "ack" {
 			acks = append(acks, timing)
@@ -75,17 +85,28 @@ func TestCheckpointExperiment(t *testing.T) {
 			checkpoints = append(checkpoints, timing)
 		}
 	})
-	heap, last, err := runCheckpointLoad(p, mode, pulseInterval, pulses, backlog, body)
+	gates := make([]chan struct{}, cycles)
+	for i := range gates {
+		gates[i] = make(chan struct{})
+	}
+	cycle := 0
+	p.timings.checkpointLocked = func() {
+		if cycle < len(gates) {
+			close(gates[cycle])
+			cycle++
+		}
+	}
+	heap, last, err := runCheckpointLoad(p, mode, pulseInterval, pulses, backlog, body, probes, gates)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if mode == "default" && len(checkpoints) < 3 {
 		t.Fatalf("observed %d default checkpoints, expected at least 3", len(checkpoints))
 	}
-	if len(acks) != checkpointPulseSize*pulses+queuedFastHistory {
+	if len(acks) != checkpointPulseSize*pulses+queuedFastHistory+probeCount {
 		t.Fatalf("recorded %d ACKs", len(acks))
 	}
-	t.Logf("ack_count=%d replay_pages=%d", len(acks), pulses)
+	t.Logf("ack_count=%d probe_acks=%d replay_pages=%d", len(acks), probeCount, pulses)
 	reportCheckpointTimings(t, acks, checkpoints, heap)
 	verifyExperimentReopen(t, p, dir, cfg, last, uint64(backlog+checkpointPulseSize*pulses))
 }
@@ -103,20 +124,20 @@ func experimentInt(t *testing.T, name string, fallback, lower, upper int) int {
 	return n
 }
 
-func seedCheckpointBacklog(dir string, cfg Config, body []byte, count int) error {
+func seedCheckpointBacklog(dir string, cfg Config, body []byte, count, fastPending int) error {
 	p, err := Open(dir, cfg)
 	if err != nil {
 		return err
 	}
 	defer p.Close()
 	for _, name := range []string{"slow", "fast"} {
-		if err := p.Register(name, SubscriptionConfig{LeaseDuration: time.Minute, Window: 65536}); err != nil {
+		if err := p.Register(name, SubscriptionConfig{LeaseDuration: 5 * time.Minute, Window: 65536}); err != nil {
 			return err
 		}
 	}
 	// Materialize a durable starting image before the timed workload. The
 	// first part of the backlog has already settled for the fast subscription.
-	p.subscriptions["fast"].Floor = uint64(count - queuedFastHistory)
+	p.subscriptions["fast"].Floor = uint64(count - fastPending)
 	digest := sha256.Sum256(body)
 	sealed := count / 256 * 256
 	for i := range sealed {
@@ -158,7 +179,7 @@ type heapTiming struct {
 	bytes uint64
 }
 
-func runCheckpointLoad(p *Partition, mode string, pace time.Duration, pulses, backlog int, body []byte) ([]heapTiming, Delivery, error) {
+func runCheckpointLoad(p *Partition, mode string, pace time.Duration, pulses, backlog int, body []byte, probes []Delivery, gates []chan struct{}) ([]heapTiming, Delivery, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(pulses)*pace+2*time.Minute)
 	defer cancel()
 	var tasks, maintenanceTasks sync.WaitGroup
@@ -214,6 +235,22 @@ func runCheckpointLoad(p *Partition, mode string, pace time.Duration, pulses, ba
 	leases := make(chan Delivery, 8)
 	total := checkpointPulseSize*pulses + queuedFastHistory
 	limit := Limits{Messages: checkpointPulseSize, Bytes: checkpointPulseSize * len(body)}
+	perCycle := len(probes) / len(gates)
+	for i, delivery := range probes {
+		gate := gates[i/perCycle]
+		run(func() error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-gate:
+			}
+			got, err := p.Ack("fast", checkpointProbeWorker, delivery.Instance, delivery.Token)
+			if err != nil || got != AckAccepted {
+				return fmt.Errorf("probe ACK offset %d: %q, %v", delivery.Message.Offset, got, err)
+			}
+			return nil
+		})
+	}
 	run(func() error {
 		defer close(replay)
 		start := time.Now()
@@ -236,7 +273,7 @@ func runCheckpointLoad(p *Partition, mode string, pace time.Duration, pulses, ba
 					return err
 				}
 			}
-			replay <- uint64((step * 97) % (backlog - queuedFastHistory - limit.Messages))
+			replay <- uint64((step * 97) % (backlog - queuedFastHistory - len(probes) - limit.Messages))
 			if mode == "forced" && (step+1)%4 == 0 {
 				if err := p.Compact(); err != nil {
 					return err
@@ -324,9 +361,14 @@ func checkpointPhase(arrived, locked time.Time, checkpoints []operationTiming) s
 
 func reportCheckpointTimings(t *testing.T, acks, checkpoints []operationTiming, heap []heapTiming) {
 	t.Helper()
-	byPhase := map[string][]operationTiming{"all": acks}
+	byPhase := make(map[string][]operationTiming)
 	for _, ack := range acks {
 		phase := checkpointPhase(ack.arrived, ack.locked, checkpoints)
+		if ack.worker == checkpointProbeWorker {
+			byPhase["probe_"+phase] = append(byPhase["probe_"+phase], ack)
+			continue
+		}
+		byPhase["all"] = append(byPhase["all"], ack)
 		byPhase[phase] = append(byPhase[phase], ack)
 	}
 	peaks, heapSamples := make(map[string]uint64), make(map[string]int)
@@ -337,7 +379,7 @@ func reportCheckpointTimings(t *testing.T, acks, checkpoints []operationTiming, 
 		heapSamples["all"]++
 		heapSamples[phase]++
 	}
-	for _, phase := range []string{"all", "before", "during", "after", "far"} {
+	for _, phase := range []string{"all", "before", "during", "after", "far", "probe_during", "probe_after", "probe_far"} {
 		samples := byPhase[phase]
 		if len(samples) == 0 {
 			t.Logf("phase=%s n=0 heap_peak_bytes=%d heap_samples=%d", phase, peaks[phase], heapSamples[phase])
@@ -350,13 +392,19 @@ func reportCheckpointTimings(t *testing.T, acks, checkpoints []operationTiming, 
 			held = append(held, s.finished.Sub(s.locked))
 			flush = append(flush, s.syncTime)
 		}
-		t.Logf("phase=%s n=%d ack_p99=%s wait_p99=%s held_p99=%s sync_p99=%s heap_peak_bytes=%d heap_samples=%d",
-			phase, len(samples), historyP99(total), historyP99(wait), historyP99(held), historyP99(flush),
+		p99 := historyP99(total)
+		t.Logf("phase=%s n=%d ack_p50=%s ack_p99=%s wait_p99=%s held_p99=%s sync_p99=%s heap_peak_bytes=%d heap_samples=%d",
+			phase, len(samples), total[(len(total)-1)/2], p99, historyP99(wait), historyP99(held), historyP99(flush),
 			peaks[phase], heapSamples[phase])
 	}
 	for i, cp := range checkpoints {
-		t.Logf("checkpoint=%d wait=%s held=%s sync_time=%s sync_calls=%d",
-			i+1, cp.locked.Sub(cp.arrived), cp.finished.Sub(cp.locked), cp.syncTime, cp.syncCalls)
+		stage := cp.checkpoint
+		held := cp.finished.Sub(cp.locked)
+		cleanup := stage.cleanup - stage.cleanupSync
+		rest := held - stage.prepare - stage.encode - stage.frame - stage.write - cleanup - cp.syncTime
+		t.Logf("checkpoint=%d wait=%s held=%s prepare=%s encode=%s frame=%s write=%s sync_time=%s cleanup=%s rest=%s sync_calls=%d",
+			i+1, cp.locked.Sub(cp.arrived), held, stage.prepare, stage.encode, stage.frame,
+			stage.write, cp.syncTime, cleanup, rest, cp.syncCalls)
 	}
 }
 
@@ -376,6 +424,26 @@ func verifyExperimentReopen(t *testing.T, p *Partition, dir string, cfg Config, 
 		page, err := reopened.Read(offset, Limits{Messages: 1, Bytes: checkpointBodyBytes})
 		if err != nil || len(page.Messages) != 1 || page.Messages[0].Offset != offset {
 			t.Fatalf("replayed offset %d: %v", offset, err)
+		}
+	}
+}
+
+func BenchmarkEncodeCheckpointSegment(b *testing.B) {
+	body := bytes.Repeat([]byte("minimq\r!"), checkpointBodyBytes/8)
+	messages := make([]storedMessage, 256)
+	at := time.Now().UTC()
+	for i := range messages {
+		messages[i] = storedMessage{
+			Message:          Message{ID: fmt.Sprintf("event-%d", i), Offset: uint64(i), PublishedAt: at, Body: body},
+			AcceptedSequence: uint64(i + 1),
+		}
+	}
+	b.SetBytes(int64(len(body) * len(messages)))
+	b.ReportAllocs()
+	for b.Loop() {
+		var s segment
+		if _, err := encodeSegment(&s, messages, nil); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

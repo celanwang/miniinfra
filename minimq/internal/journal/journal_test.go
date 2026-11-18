@@ -1,11 +1,28 @@
 package journal
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestAppendFramePreservesLegacyBytes(t *testing.T) {
+	start := []byte("prefix")
+	frame, err := AppendFrame(start, []byte("abc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := []byte{3, 0, 0, 0, 0xc2, 0x41, 0x24, 0x35, 'a', 'b', 'c'}
+	if !bytes.Equal(frame, append(bytes.Clone(start), legacy...)) {
+		t.Fatalf("frame = %x", frame)
+	}
+	payload, n, err := ReadFrame(bytes.NewReader(frame[len(start):]), int64(len(legacy)))
+	if err != nil || string(payload) != "abc" || n != int64(len(legacy)) {
+		t.Fatalf("read frame = %q, %d, %v", payload, n, err)
+	}
+}
 
 func TestRecoveryRequiresDurableHeadBeforeCollection(t *testing.T) {
 	root := t.TempDir()

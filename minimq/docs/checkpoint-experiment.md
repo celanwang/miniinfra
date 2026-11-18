@@ -8,13 +8,17 @@ MINIMQ_CHECKPOINT_EXPERIMENT=forced go test -run '^TestCheckpointExperiment$' -c
 MINIMQ_CHECKPOINT_EXPERIMENT=default MINIMQ_CHECKPOINT_CACHE=cold go test -run '^TestCheckpointExperiment$' -count=1 -v
 ```
 
-The test makes its own data directory. The default mode uses the same 30-second timer and retry maintenance loop as the broker. At the default settings it publishes 1,488 messages at a target of 16 per second, performs 372 four-message history reads, and confirms 1,520 deliveries. One subscription pins the backlog while a second grants and acknowledges tasks concurrently. The forced mode publishes 160 messages, performs 40 reads, and checkpoints after every 16 publications. Both modes reopen the partition at the end to verify history and confirm that acknowledged work stays settled.
+The test makes its own data directory. The default mode uses the same 30-second timer and retry maintenance loop as the broker. At the default settings it publishes 1,488 messages at a target of 16 per second, performs 372 four-message history reads, and confirms 1,520 ordinary deliveries. One subscription pins the backlog while a second grants and acknowledges tasks concurrently. The forced mode publishes 160 messages, performs 40 reads, and checkpoints after every 16 publications. Both modes reopen the partition at the end to verify history and confirm that acknowledged work stays settled.
 
 `MINIMQ_CHECKPOINT_BACKLOG` defaults to 2,048 messages of 64 KiB each. Set it to `8192` to start with 512 MiB of sealed history. `MINIMQ_CHECKPOINT_RATE` sets the target publication rate in default mode. Compare runs at the same rate and backlog. The initial backlog is materialized as a checkpoint outside the timed workload.
 
 On Linux amd64 and arm64, the cold mode evicts only the test's sealed files after the broker has reopened and validated them. It requires at least 99% of those pages to be absent as measured by `mincore`. Later reads can refill the cache. In a VM, host-side and device caches can still serve those reads. Warm runs use the cache left by the recovery scan. Platforms without the Linux page check print zero tracked pages.
 
-ACK phases use the checkpoint's actual lock interval. A `during` ACK waits on that interval. The `before` and `after` buckets cover arrivals within one second of the nearest checkpoint boundary. Each bucket reports sample count, nearest-rank P99, and sampled Go heap peak. Small buckets can report the maximum as P99. Sync time is the time spent inside file and directory `Sync` calls. Heap sampling runs every 50 ms and may miss short spikes.
+ACK phases use the checkpoint's actual lock interval. A `during` ACK waits on that interval. The `before` and `after` buckets cover arrivals within one second of the nearest checkpoint boundary. Each bucket reports sample count, P50, nearest-rank P99, and sampled Go heap peak. Small buckets can report the maximum as P99. Sync time is the time spent inside file and directory `Sync` calls. Heap sampling runs every 50 ms and may miss short spikes.
+
+Up to eight additional deliveries per checkpoint are leased before the timed workload. Their workers submit ACKs when the checkpoint acquires the lock. The test reports these ACKs in separate `probe_*` buckets. These requests compete with ordinary work for the same lock and durable journal. Compare runs made with the same probe workload.
+
+Checkpoint timings distinguish state preparation, JSON encoding, length/CRC frame assembly and its explicit copies, file `Write` calls, file and directory `Sync`, and collection outside `Sync`. The remaining time includes hashing, file management and scheduling. Copying inside the JSON encoder is part of the JSON timing.
 
 ## First comparison
 
@@ -69,3 +73,43 @@ Both Linux default runs completed 372 history pages and reopened successfully wi
 The candidate retains the sync for each new file, the directory barrier before publishing `HEAD`, and the separate barrier that makes the new `HEAD` durable. The process interruption test exits at four points spanning staging and publication, then verifies the retained history, acknowledged receipts, and an outstanding lease. A separate compatibility check opened a partition created by `af9cb7d`, installed a new checkpoint, and reopened it with the older binary.
 
 The next question is how much of the remaining checkpoint hold comes from encoding, file writes, and collection. That split can justify whether to prepare sealed segments outside the state lock.
+
+## Checkpoint stage comparison
+
+The integrated baseline was `c87d9a4`. The measured baseline `747c3f6` adds stage timing and the overlapping ACK probes. Candidate `7b2f6d7` assembles the frame directly in the segment buffer. The comparison used Go 1.27.3, macOS 15.5 arm64 and a local APFS directory. Runs were serial on a shared host and the one-minute load averages around the default runs were about 2–3. The cache was warm after reopen. The cold-cache comparison above predates the new probes.
+
+```sh
+GOWORK=off MINIMQ_CHECKPOINT_EXPERIMENT=default MINIMQ_CHECKPOINT_BACKLOG=8192 go test -run '^TestCheckpointExperiment$' -count=1 -v
+GOWORK=off MINIMQ_CHECKPOINT_EXPERIMENT=forced MINIMQ_CHECKPOINT_BACKLOG=8192 go test -run '^TestCheckpointExperiment$' -count=1 -v
+GOWORK=off go test -run '^$' -bench '^BenchmarkEncodeCheckpointSegment$' -benchtime=8x -count=5
+```
+
+Both default runs completed three 30-second periods with 512 MiB of sealed message bodies, 372 history pages, 1,520 ordinary ACKs, and 24 probe ACKs. The stage values are medians across the three checkpoints. The ACK values are per-run percentiles.
+
+| Checkpoint stage | Baseline | Candidate |
+| --- | ---: | ---: |
+| Wait for state lock | 36.87 ms | 35.95 ms |
+| Hold state lock | 121.19 ms | 107.57 ms |
+| Copy and prune state | 1.13 ms | 0.77 ms |
+| JSON encoding | 42.10 ms | 40.85 ms |
+| Frame assembly, including CRC and explicit copies | 19.60 ms | 10.61 ms |
+| File writes | 5.45 ms | 5.23 ms |
+| File and directory syncs | 42.74 ms | 44.98 ms |
+| Collection outside sync | 1.51 ms | 1.48 ms |
+| Remaining lock hold | 8.20 ms | 8.05 ms |
+
+| ACK cohort | Baseline P50 / P99 (samples) | Candidate P50 / P99 (samples) |
+| --- | ---: | ---: |
+| All ordinary | 27.93 / 68.88 ms (1,520) | 26.95 / 55.02 ms (1,520) |
+| Before | 26.99 / 48.03 ms (46) | 25.11 / 44.94 ms (46) |
+| During | 159.01 / 183.46 ms (2) | 138.01 / 153.45 ms (2) |
+| After | 30.01 / 158.82 ms (54) | 35.90 / 139.01 ms (56) |
+| Probe during | 195.07 / 279.04 ms (24) | 187.36 / 248.58 ms (24) |
+
+Both runs sampled a heap peak of about 265 MiB and reopened with about 2.56 MiB of additional live heap before the workload. Probe tail time includes queueing behind other durable ACKs. Small during buckets report near-maximum observations. The end-to-end P99 changes above describe one default run per branch.
+
+For the segment microbenchmark, the executable order alternated across five pairs. Each sample sealed a segment of 256 messages of 64 KiB each. Median time went from 10.71 to 9.55 ms per operation, with ranges of 10.60–11.33 and 9.40–9.79 ms. Allocated bytes fell from 92.42 to 69.27 MB per operation. The on-disk length and CRC bytes match the original format. The process interruption suite and a round trip between the `c87d9a4` and candidate binaries verified history, leases and receipts.
+
+The forced runs published 160 messages in each of three runs per binary. With segments of 256 messages, every checkpoint in this control retained its new messages in the short tail and frame assembly measured zero. Each run completed 192 ordinary ACKs, 80 probe ACKs and 40 history pages. All probes overlapped the checkpoints. Ordinary P99 ranges were 133.0–153.7 ms on the baseline and 120.8–142.0 ms on the candidate. Probe P99 ranges were 200.9–214.8 and 190.9–201.9 ms. Differences in this control show the run-to-run variation even without segment assembly.
+
+Keep the in-buffer frame path for its repeatable allocation and encoding benefit. JSON is the largest remaining measured non-sync phase. In the forced baseline, writing repeated short-tail checkpoints took 8.4–27.8 ms in JSON encoding alone. Measuring that repeated work separately from sealed-record encoding is the next constraint to investigate before changing lock boundaries.
