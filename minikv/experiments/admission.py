@@ -1,4 +1,4 @@
-"""Replay paired fixed-rate TCP workloads against MiniKV under a Docker memory cap."""
+"""Replay the historical MiniKV admission comparison under a Docker memory cap."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +20,8 @@ WORKERS = 16
 TICK = 0.020
 WINDOW_TICKS = 500
 VALUE = b"x" * 1024
+# This revision contains the experiment peer and the published comparison.
+PEER_REVISION = "ff182ad95d5e664bc38a83cb3ecd8472947cb1d5"
 
 
 @dataclass
@@ -231,10 +233,14 @@ def main():
     arch = subprocess.check_output(["docker", "info", "--format", "{{.Architecture}}"], text=True).strip()
     goarch = {"aarch64": "arm64", "x86_64": "amd64", "arm64": "arm64", "amd64": "amd64"}[arch]
     with tempfile.TemporaryDirectory(dir="/tmp") as scratch:
-        binary = Path(scratch).resolve() / "peer"
+        source = Path(scratch).resolve()
+        archive = subprocess.check_output(["git", "archive", PEER_REVISION, "minikv"], cwd=module.parent)
+        subprocess.run(["tar", "-x", "-C", source], input=archive, check=True)
+        binary = source / "bin" / "peer"
+        binary.parent.mkdir()
         subprocess.run(
-            ["go", "test", "-c", "-o", binary, "./internal/server"], cwd=module, check=True,
-            env={**os.environ, "GOOS": "linux", "GOARCH": goarch, "CGO_ENABLED": "0"},
+            ["go", "test", "-c", "-o", binary, "./internal/server"], cwd=source / "minikv", check=True,
+            env={**os.environ, "GOOS": "linux", "GOARCH": goarch, "CGO_ENABLED": "0", "GOWORK": "off"},
         )
         for pair in range(1, args.pairs + 1):
             arms = ("direct", "two-fill") if pair % 2 else ("two-fill", "direct")
