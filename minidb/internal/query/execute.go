@@ -79,6 +79,12 @@ func (s *Session) Execute(ctx context.Context, sql string, args []engine.Value) 
 		tx := s.tx
 		s.tx = nil
 		return Result{}, tx.Commit()
+	case "checkpoint":
+		if s.tx != nil {
+			s.abort()
+			return Result{}, fmt.Errorf("%w: CHECKPOINT requires autocommit", ErrTransaction)
+		}
+		return Result{}, s.db.Checkpoint()
 	case "create":
 		if s.tx != nil {
 			s.abort()

@@ -8,9 +8,9 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
-	"path/filepath"
 	"sync"
-	"syscall"
+
+	"github.com/celanwang/miniinfra/minidb/internal/disk"
 )
 
 const (
@@ -29,6 +29,8 @@ var (
 // transaction's commit boundary. Publish runs in log order, after sync.
 type Log struct {
 	file     *os.File
+	lock     *os.File
+	path     string
 	queue    chan request
 	done     chan struct{}
 	mu       sync.RWMutex
@@ -37,70 +39,93 @@ type Log struct {
 }
 
 type request struct {
-	payload []byte
-	publish func(end int64)
-	result  chan error
+	checkpoint func(int64) error
+	payload    []byte
+	publish    func(end int64)
+	result     chan error
 }
 
 func Open(path string, replay func([]byte) error) (*Log, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
+	return OpenWithCheckpoint(path, func() (int64, error) { return 0, nil }, replay)
+}
+
+// OpenWithCheckpoint loads the published checkpoint while holding a lock that
+// stays on the same inode across WAL replacements. A zero position means
+// recovery starts with a legacy WAL and no checkpoint.
+func OpenWithCheckpoint(path string, load func() (int64, error), replay func([]byte) error) (*Log, error) {
+	lock, err := os.OpenFile(path+".lock", os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return nil, err
 	}
 	opened := false
 	defer func() {
 		if !opened {
+			lock.Close()
+		}
+	}()
+	if err := lockFile(lock); err != nil {
+		return nil, err
+	}
+	checkpoint, err := load()
+	if err != nil {
+		return nil, err
+	}
+	mode := os.O_RDWR
+	if checkpoint == 0 {
+		mode |= os.O_CREATE
+	}
+	file, err := os.OpenFile(path, mode, 0600)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if !opened {
 			file.Close()
 		}
 	}()
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil, fmt.Errorf("lock WAL: %w", err)
+	// Retain the inode lock for older binaries that used the data file alone.
+	if err := lockFile(file); err != nil {
+		return nil, err
 	}
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err
 	}
-	if info.Size() == 0 {
+	if info.Size() == 0 && checkpoint == 0 {
 		if _, err := file.WriteString(magic); err != nil {
 			return nil, err
 		}
-		if err := file.Sync(); err != nil {
-			return nil, err
-		}
-	}
-	directory, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return nil, err
-	}
-	err = directory.Sync()
-	directory.Close()
-	if err != nil {
-		return nil, err
 	}
 
-	end, err := scan(file, replay)
+	offset, base, err := replayStart(file, checkpoint)
 	if err != nil {
 		return nil, err
 	}
-	// Make any valid records retained by the OS durable before serving reads.
+	tail, err := scan(file, offset, replay)
+	if err != nil {
+		return nil, err
+	}
+	// Adopt valid records retained by the OS and any visible rename before
+	// serving reads.
 	if err := file.Sync(); err != nil {
 		return nil, err
 	}
-	if _, err := file.Seek(end, io.SeekStart); err != nil {
+	if err := disk.SyncDirectory(path); err != nil {
 		return nil, err
 	}
-	log := &Log{file: file, queue: make(chan request, maxBatch), done: make(chan struct{})}
-	go log.run(end)
+	if _, err := file.Seek(tail, io.SeekStart); err != nil {
+		return nil, err
+	}
+	log := &Log{
+		file: file, lock: lock, path: path,
+		queue: make(chan request, maxBatch), done: make(chan struct{}),
+	}
+	go log.run(base + (tail - offset))
 	opened = true
 	return log, nil
 }
 
-func scan(file *os.File, replay func([]byte) error) (int64, error) {
-	version := make([]byte, len(magic))
-	if _, err := file.ReadAt(version, 0); err != nil || string(version) != magic {
-		return 0, errors.New("invalid or unsupported WAL header")
-	}
-	end := int64(len(magic))
+func scan(file *os.File, end int64, replay func([]byte) error) (int64, error) {
 	var header [headerSize]byte
 	for {
 		n, err := file.ReadAt(header[:], end)
@@ -137,34 +162,47 @@ func scan(file *os.File, replay func([]byte) error) (int64, error) {
 	if err := file.Truncate(end); err != nil {
 		return 0, err
 	}
-	return end, file.Sync()
+	return end, nil
 }
 
 func (log *Log) Commit(payload []byte, publish func(end int64)) error {
 	if len(payload) == 0 || len(payload) > MaxPayload {
 		return ErrTooLarge
 	}
-	result := make(chan error, 1)
+	return log.submit(request{payload: payload, publish: publish})
+}
+
+func (log *Log) submit(item request) error {
+	item.result = make(chan error, 1)
 	log.mu.RLock()
 	if log.closed {
 		log.mu.RUnlock()
 		return ErrClosed
 	}
-	log.queue <- request{payload: payload, publish: publish, result: result}
+	log.queue <- item
 	log.mu.RUnlock()
-	return <-result
+	return <-item.result
 }
 
 func (log *Log) run(end int64) {
 	defer close(log.done)
 	var failure error
 	for first := range log.queue {
+		if first.checkpoint != nil {
+			failure = log.checkpoint(first, end, failure)
+			continue
+		}
 		batch := []request{first}
+		var barrier request
 	collect:
 		for len(batch) < maxBatch {
 			select {
 			case next, ok := <-log.queue:
 				if !ok {
+					break collect
+				}
+				if next.checkpoint != nil {
+					barrier = next
 					break collect
 				}
 				batch = append(batch, next)
@@ -182,8 +220,14 @@ func (log *Log) run(end int64) {
 			}
 			item.result <- failure
 		}
+		if barrier.checkpoint != nil {
+			failure = log.checkpoint(barrier, end, failure)
+		}
 	}
 	log.closeErr = errors.Join(failure, log.file.Close())
+	if log.lock != nil {
+		log.closeErr = errors.Join(log.closeErr, log.lock.Close())
+	}
 }
 
 func (log *Log) sync(batch []request) error {

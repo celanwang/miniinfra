@@ -97,7 +97,7 @@ func (view Snapshot) sees(state *transactionState) bool {
 	if state == nil {
 		return false
 	}
-	if state == view.tx.state {
+	if view.tx != nil && state == view.tx.state {
 		return true
 	}
 	seq := state.sequence.Load()

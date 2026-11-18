@@ -14,16 +14,17 @@ import (
 )
 
 type DB struct {
-	log         *wal.Log
-	catalog     sync.RWMutex
-	ddl         sync.Mutex
-	tables      map[string]*table
-	locks       lockManager
-	lockTimeout time.Duration
-	rowID       atomic.Uint64
-	published   atomic.Uint64
-	closed      atomic.Bool
-	failed      atomic.Bool
+	checkpointPath string
+	log            *wal.Log
+	catalog        sync.RWMutex
+	ddl            sync.Mutex
+	tables         map[string]*table
+	locks          lockManager
+	lockTimeout    time.Duration
+	rowID          atomic.Uint64
+	published      atomic.Uint64
+	closed         atomic.Bool
+	failed         atomic.Bool
 }
 
 type transactionState struct {
@@ -62,11 +63,12 @@ type record struct {
 
 func Open(dir string) (*DB, error) {
 	db := &DB{
-		tables:      make(map[string]*table),
-		locks:       lockManager{holders: make(map[resource]*Txn), waiting: make(map[*Txn]*Txn)},
-		lockTimeout: defaultLockTimeout,
+		checkpointPath: filepath.Join(dir, checkpointFile),
+		tables:         make(map[string]*table),
+		locks:          lockManager{holders: make(map[resource]*Txn), waiting: make(map[*Txn]*Txn)},
+		lockTimeout:    defaultLockTimeout,
 	}
-	log, err := wal.Open(filepath.Join(dir, "minidb.wal"), db.replay)
+	log, err := wal.OpenWithCheckpoint(filepath.Join(dir, "minidb.wal"), db.loadCheckpoint, db.replay)
 	if err != nil {
 		return nil, err
 	}

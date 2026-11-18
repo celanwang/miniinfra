@@ -75,7 +75,7 @@ func parse(sql string, args []engine.Value) (statement, error) {
 
 	s := statement{verb: p.next()}
 	switch s.verb {
-	case "begin", "commit", "rollback":
+	case "begin", "commit", "rollback", "checkpoint":
 	case "create":
 		p.require("table")
 		s.schema = p.schema()
