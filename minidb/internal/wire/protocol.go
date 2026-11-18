@@ -8,40 +8,20 @@ import (
 	"io"
 	"unicode/utf8"
 
-	"github.com/celanwang/miniinfra/minidb/internal/engine"
-	"github.com/celanwang/miniinfra/minidb/internal/query"
+	"github.com/celanwang/miniinfra/minidb/internal/sqltypes"
 )
 
 const MaxFrame = 4 << 20
 
 type Request struct {
 	SQL  string
-	Args []engine.Value
+	Args []sqltypes.Value
 }
 type Response struct {
-	Result        query.Result
+	Result        sqltypes.Result
 	Code          string
 	Message       string
 	InTransaction *bool `json:",omitempty"`
-}
-
-func Failure(err error) Response {
-	code := "execution"
-	switch {
-	case errors.Is(err, engine.ErrUnique):
-		code = "unique"
-	case errors.Is(err, engine.ErrDeadlock):
-		code = "deadlock"
-	case errors.Is(err, engine.ErrLockWait):
-		code = "lock_wait"
-	case errors.Is(err, engine.ErrCommitUnknown):
-		code = "commit_unknown"
-	case errors.Is(err, engine.ErrConstraint):
-		code = "constraint"
-	case errors.Is(err, engine.ErrUnavailable):
-		code = "unavailable"
-	}
-	return Response{Code: code, Message: err.Error()}
 }
 
 func Reader(in io.Reader) *bufio.Scanner {

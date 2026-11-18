@@ -7,7 +7,30 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+
+	"github.com/celanwang/miniinfra/minidb/internal/sqltypes"
 )
+
+func TestEncodeTypedFrames(t *testing.T) {
+	values := []sqltypes.Value{{}, sqltypes.Int(-7), sqltypes.String("库存\x00"), sqltypes.Bool(true), sqltypes.Bool(false)}
+	inTransaction := true
+	const encodedValues = `[{"Kind":0,"Int":0,"Text":""},{"Kind":1,"Int":-7,"Text":""},{"Kind":2,"Int":0,"Text":"库存\u0000"},{"Kind":3,"Int":1,"Text":""},{"Kind":3,"Int":0,"Text":""}]`
+	for _, tc := range []struct {
+		message any
+		want    string
+	}{
+		{Request{SQL: "insert into items values (?,?,?,?,?)", Args: values}, `{"SQL":"insert into items values (?,?,?,?,?)","Args":` + encodedValues + `}`},
+		{Response{Result: sqltypes.Result{Columns: []string{"a", "b", "c", "d", "e"}, Rows: [][]sqltypes.Value{values}}, InTransaction: &inTransaction},
+			`{"Result":{"Columns":["a","b","c","d","e"],"Rows":[` + encodedValues + `],"Affected":0},"Code":"","Message":"","InTransaction":true}`},
+		{Response{Code: "unique", Message: "conflict"},
+			`{"Result":{"Columns":null,"Rows":null,"Affected":0},"Code":"unique","Message":"conflict"}`},
+	} {
+		got, err := Encode(tc.message)
+		if err != nil || string(got) != tc.want+"\n" {
+			t.Fatalf("frame for %T = %q, %v, want %s", tc.message, got, err, tc.want)
+		}
+	}
+}
 
 func TestReadPipelinedFramesAcrossBlock(t *testing.T) {
 	first := strings.Repeat("a", 4093)
