@@ -81,11 +81,17 @@ func run(ctx context.Context, dir, address string, cfg minimq.Config) (err error
 
 func maintain(ctx context.Context, p *minimq.Partition) {
 	limit := minimq.Limits{Messages: minimq.MaxBatchMessages, Bytes: minimq.MaxBatchBytes}
-	maintenance.Run(ctx, func() {
-		_, scheduleErr := p.AdvanceScheduled(limit)
-		_, retryErr := p.AdvanceRetries(limit)
-		if err := errors.Join(scheduleErr, retryErr); err != nil {
-			log.Printf("delivery maintenance: %v", err)
+	// Below this count the byte budget can still fit any valid message.
+	minFullBatch := min(limit.Messages, limit.Bytes/minimq.MaxMessageBytes)
+	maintenance.Run(ctx, func() bool {
+		count, err := p.AdvanceScheduled(limit)
+		if err != nil {
+			log.Printf("scheduled delivery maintenance: %v", err)
+		}
+		return count >= minFullBatch
+	}, func() {
+		if _, err := p.AdvanceRetries(limit); err != nil {
+			log.Printf("retry maintenance: %v", err)
 		}
 	}, func() {
 		if err := p.Compact(); err != nil {

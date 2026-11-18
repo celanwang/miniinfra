@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -200,10 +199,13 @@ func runCheckpointLoad(p *Partition, mode string, pace time.Duration, pulses, ba
 	}
 	runMaintenance := func() {
 		limit := Limits{Messages: MaxBatchMessages, Bytes: MaxBatchBytes}
-		maintenance.Run(ctx, func() {
-			_, scheduleErr := p.AdvanceScheduled(limit)
-			_, retryErr := p.AdvanceRetries(limit)
-			if err := errors.Join(scheduleErr, retryErr); err != nil {
+		maintenance.Run(ctx, func() bool {
+			if _, err := p.AdvanceScheduled(limit); err != nil {
+				fail(err)
+			}
+			return false // This workload has no delayed publications.
+		}, func() {
+			if _, err := p.AdvanceRetries(limit); err != nil {
 				fail(err)
 			}
 		}, func() {
