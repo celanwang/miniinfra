@@ -125,6 +125,7 @@ type transaction struct {
 	Schedule     *scheduledPublication
 	Due          []publication
 	Dead         []DeadLetter
+	Redrive      *redriveAdmission
 	Register     *registration
 	Tasks        []taskUpdate
 	Ack          *ackReceipt
@@ -160,6 +161,8 @@ type Partition struct {
 	scheduled       map[string]scheduledPublication
 	due             scheduleQueue
 	dead            map[string]DeadLetter
+	redrives        map[string]redriveTask
+	redriveReceipts map[string]redriveReceipt
 	segments        []segment
 	checkpointBytes int64
 }
@@ -178,6 +181,8 @@ func Open(dir string, config Config) (*Partition, error) {
 		acknowledgments: make(map[string]ackReceipt),
 		scheduled:       make(map[string]scheduledPublication),
 		dead:            make(map[string]DeadLetter),
+		redrives:        make(map[string]redriveTask),
+		redriveReceipts: make(map[string]redriveReceipt),
 	}
 	j, err := journal.Open(dir, p.restore, func(data []byte) error {
 		var tx transaction
@@ -230,6 +235,11 @@ func (p *Partition) apply(tx transaction) error {
 	}
 	if err := p.applySchedule(tx); err != nil {
 		return err
+	}
+	if tx.Redrive != nil {
+		if err := p.applyRedrive(*tx.Redrive); err != nil {
+			return err
+		}
 	}
 	if err := p.applySubscriptions(tx); err != nil {
 		return err

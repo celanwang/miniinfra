@@ -23,17 +23,19 @@ type segment struct {
 func (s segment) name() string { return fmt.Sprintf("history-%016x", s.Base) }
 
 type checkpoint struct {
-	Sequence      uint64
-	TimeLower     time.Time
-	First         uint64
-	Tail          []storedMessage
-	Segments      []segment
-	Publishes     map[string]publishReceipt
-	Subscriptions map[string]*subscription
-	Acks          map[string]ackReceipt
-	Scheduled     map[string]scheduledPublication
-	Dead          map[string]DeadLetter
-	Reserved      int64
+	Sequence        uint64
+	TimeLower       time.Time
+	First           uint64
+	Tail            []storedMessage
+	Segments        []segment
+	Publishes       map[string]publishReceipt
+	Subscriptions   map[string]*subscription
+	Acks            map[string]ackReceipt
+	Scheduled       map[string]scheduledPublication
+	Dead            map[string]DeadLetter
+	Redrives        map[string]redriveTask
+	RedriveReceipts map[string]redriveReceipt
+	Reserved        int64
 }
 
 func (p *Partition) storageBytes() int64 {
@@ -133,6 +135,12 @@ func (p *Partition) restore(path string) error {
 	p.segments, p.checkpointBytes = image.Segments, int64(len(data))
 	p.publishes, p.subscriptions = image.Publishes, image.Subscriptions
 	p.acknowledgments, p.dead = image.Acks, image.Dead
+	if image.Redrives != nil {
+		p.redrives = image.Redrives
+	}
+	if image.RedriveReceipts != nil {
+		p.redriveReceipts = image.RedriveReceipts
+	}
 	for _, item := range image.Scheduled {
 		if err := p.applySchedule(transaction{Schedule: &item}); err != nil {
 			return err
@@ -161,6 +169,7 @@ func (p *Partition) compact(now TimeBounds) error {
 		Segments:  append([]segment(nil), p.segments...),
 		Publishes: maps.Clone(p.publishes), Acks: maps.Clone(p.acknowledgments),
 		Subscriptions: p.subscriptions, Scheduled: p.scheduled, Dead: maps.Clone(p.dead),
+		Redrives: p.redrives, RedriveReceipts: maps.Clone(p.redriveReceipts),
 	}
 	maps.DeleteFunc(image.Publishes, func(id string, r publishReceipt) bool {
 		_, pending := p.scheduled[id]
@@ -168,6 +177,7 @@ func (p *Partition) compact(now TimeBounds) error {
 	})
 	maps.DeleteFunc(image.Acks, func(_ string, r ackReceipt) bool { return !now.Lower.Before(r.Expires) })
 	maps.DeleteFunc(image.Dead, func(_ string, d DeadLetter) bool { return !now.Lower.Before(d.Expires) })
+	maps.DeleteFunc(image.RedriveReceipts, func(_ string, r redriveReceipt) bool { return !now.Lower.Before(r.Expires) })
 
 	var files = make(map[string][]byte)
 	sealed := 0
@@ -208,7 +218,7 @@ func (p *Partition) compact(now TimeBounds) error {
 	image.Tail = p.history[sealed:]
 	if p.journal.End() == 0 && len(files) == 0 && removed == 0 &&
 		len(image.Acks) == len(p.acknowledgments) && len(image.Publishes) == len(p.publishes) &&
-		len(image.Dead) == len(p.dead) {
+		len(image.Dead) == len(p.dead) && len(image.RedriveReceipts) == len(p.redriveReceipts) {
 		return nil
 	}
 	payload, err := json.Marshal(image)
@@ -244,6 +254,7 @@ func (p *Partition) compact(now TimeBounds) error {
 	p.firstOffset, p.segments = image.First, image.Segments
 	p.timeLower, p.checkpointBytes = image.TimeLower, int64(len(payload))
 	p.publishes, p.acknowledgments, p.dead = image.Publishes, image.Acks, image.Dead
+	p.redriveReceipts = image.RedriveReceipts
 	if err := p.collectFiles(); err != nil {
 		p.failed = fmt.Errorf("partition requires recovery after file collection: %w", err)
 		return p.failed

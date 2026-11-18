@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -72,10 +73,11 @@ type registration struct {
 }
 
 type subscription struct {
-	Config     SubscriptionConfig
-	Registered uint64
-	Floor      uint64
-	Tasks      map[uint64]taskState
+	Config        SubscriptionConfig
+	Registered    uint64
+	Floor         uint64
+	Tasks         map[uint64]taskState
+	NextRedriveAt time.Time
 }
 
 type leaseState struct {
@@ -92,9 +94,11 @@ type taskState struct {
 }
 
 type taskUpdate struct {
-	Subscription string
-	Offset       uint64
-	State        taskState
+	Subscription  string
+	Offset        uint64
+	Redrive       string
+	NextRedriveAt time.Time
+	State         taskState
 }
 
 type ackReceipt struct {
@@ -122,6 +126,22 @@ func (p *Partition) applySubscriptions(tx transaction) error {
 	}
 	for _, u := range tx.Tasks {
 		sub := p.subscriptions[u.Subscription]
+		if u.Redrive != "" {
+			task, exists := p.redrives[u.Redrive]
+			if sub == nil || !exists || task.Subscription != u.Subscription {
+				return fmt.Errorf("%w: invalid redrive state update", ErrCorrupt)
+			}
+			if !u.NextRedriveAt.IsZero() {
+				sub.NextRedriveAt = u.NextRedriveAt
+			}
+			if u.State.Finished {
+				delete(p.redrives, u.Redrive)
+			} else {
+				task.State = u.State
+				p.redrives[u.Redrive] = task
+			}
+			continue
+		}
 		if sub == nil || u.Offset < sub.Floor || u.Offset >= p.nextOffset() {
 			return fmt.Errorf("%w: invalid subscription update", ErrCorrupt)
 		}
@@ -201,6 +221,18 @@ func (p *Partition) Pull(name, worker string, limit Limits) ([]Delivery, error) 
 	}
 	var deliveries []Delivery
 	tx := transaction{Lower: now.Lower}
+	if !now.Lower.Before(sub.NextRedriveAt) {
+		if task, found := p.readyRedrive(name, now, limit.Bytes); found {
+			update := task.update()
+			update.NextRedriveAt = now.Upper.Add(redriveInterval)
+			delivery, err := p.grant(&tx, update, task.Message, worker, now)
+			if err != nil {
+				return nil, err
+			}
+			deliveries = append(deliveries, delivery)
+			limit.Bytes -= len(task.Message.Body)
+		}
+	}
 	end := min(p.nextOffset(), sub.Floor+sub.Config.Window)
 	for offset := sub.Floor; offset < end && len(deliveries) < limit.Messages; offset++ {
 		msg := p.history[offset-p.firstOffset]
@@ -216,20 +248,11 @@ func (p *Partition) Pull(name, worker string, limit Limits) ([]Delivery, error) 
 		if !known {
 			state.Remaining = sub.Config.taskReserve(len(msg.Body))
 		}
-		token, err := newToken()
+		delivery, err := p.grant(&tx, taskUpdate{Subscription: name, Offset: offset, State: state}, msg.Message, worker, now)
 		if err != nil {
 			return nil, err
 		}
-		state.Attempts++
-		state.Remaining -= transitionReserve
-		state.Lease = leaseState{Token: token, Worker: worker, Deadline: now.Upper.Add(sub.Config.LeaseDuration)}
-		tx.Tasks = append(tx.Tasks, taskUpdate{Subscription: name, Offset: offset, State: state})
-		tx.ReserveDelta -= transitionReserve
-		msg.Body = bytes.Clone(msg.Body)
-		deliveries = append(deliveries, Delivery{
-			Message: msg.Message, Instance: historyInstance(offset),
-			Token: token, Attempt: state.Attempts, Deadline: state.Lease.Deadline,
-		})
+		deliveries = append(deliveries, delivery)
 		limit.Bytes -= len(msg.Body)
 	}
 	if len(deliveries) != 0 {
@@ -242,10 +265,48 @@ func (p *Partition) Pull(name, worker string, limit Limits) ([]Delivery, error) 
 
 func historyInstance(offset uint64) string { return fmt.Sprintf("history:%d", offset) }
 
+func (u taskUpdate) instance() string {
+	if u.Redrive != "" {
+		return u.Redrive
+	}
+	return historyInstance(u.Offset)
+}
+
+func (p *Partition) messageForTask(u taskUpdate) Message {
+	if u.Redrive != "" {
+		return p.redrives[u.Redrive].Message
+	}
+	return p.history[u.Offset-p.firstOffset].Message
+}
+
+func (p *Partition) grant(tx *transaction, update taskUpdate, msg Message, worker string, now TimeBounds) (Delivery, error) {
+	token, err := newToken()
+	if err != nil {
+		return Delivery{}, err
+	}
+	update.State.Attempts++
+	update.State.Remaining -= transitionReserve
+	deadline := now.Upper.Add(p.subscriptions[update.Subscription].Config.LeaseDuration)
+	update.State.Lease = leaseState{Token: token, Worker: worker, Deadline: deadline}
+	tx.Tasks = append(tx.Tasks, update)
+	tx.ReserveDelta -= transitionReserve
+	msg.Body = bytes.Clone(msg.Body)
+	return Delivery{
+		Message: msg, Instance: update.instance(), Token: token, Attempt: update.State.Attempts, Deadline: deadline,
+	}, nil
+}
+
 func (p *Partition) lookupTask(name, instance string) (taskUpdate, error) {
 	sub := p.subscriptions[name]
 	if sub == nil {
 		return taskUpdate{}, ErrSubscription
+	}
+	if strings.HasPrefix(instance, "redrive:") {
+		task, exists := p.redrives[instance]
+		if !exists || task.Subscription != name {
+			return taskUpdate{}, ErrOutcomeUnknown
+		}
+		return task.update(), nil
 	}
 	var offset uint64
 	if _, err := fmt.Sscanf(instance, "history:%d", &offset); err != nil || historyInstance(offset) != instance {

@@ -11,6 +11,7 @@ type DeadLetter struct {
 	Message                    Message
 	Attempts                   int
 	Reason                     string
+	SourceDeadLetterID         string
 	DeadAt, Expires            time.Time
 }
 
@@ -63,9 +64,10 @@ func (p *Partition) recordFailure(tx *transaction, update taskUpdate, reason str
 		return FailureResult{}, err
 	}
 	tx.Dead = append(tx.Dead, DeadLetter{
-		ID: id, Subscription: update.Subscription, Instance: historyInstance(update.Offset),
-		Message: p.history[update.Offset-p.firstOffset].Message, Attempts: update.State.Attempts,
+		ID: id, Subscription: update.Subscription, Instance: update.instance(),
+		Message: p.messageForTask(update), Attempts: update.State.Attempts,
 		Reason: reason, DeadAt: settledAt, Expires: settledAt.Add(p.config.DeadRetention),
+		SourceDeadLetterID: p.redrives[update.Redrive].SourceDeadLetterID,
 	})
 	tx.ReserveDelta -= update.State.Remaining
 	update.State = taskState{Finished: true}
@@ -102,6 +104,12 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 			}
 		}
 	}
+	for _, task := range p.redrives {
+		if (name == "" || name == task.Subscription) && task.State.Lease.Token != "" &&
+			!now.Lower.Before(task.State.Lease.Deadline) {
+			expired = append(expired, task.update())
+		}
+	}
 	sort.Slice(expired, func(i, j int) bool {
 		a, b := expired[i], expired[j]
 		if !a.State.Lease.Deadline.Equal(b.State.Lease.Deadline) {
@@ -110,13 +118,13 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 		if a.Subscription != b.Subscription {
 			return a.Subscription < b.Subscription
 		}
-		return a.Offset < b.Offset
+		return a.instance() < b.instance()
 	})
 	tx := transaction{Lower: now.Lower}
 	for _, update := range expired {
 		size := 0
 		if update.State.Attempts >= p.subscriptions[update.Subscription].Config.MaxAttempts {
-			size = len(p.history[update.Offset-p.firstOffset].Body)
+			size = len(p.messageForTask(update).Body)
 		}
 		if len(tx.Tasks) == limit.Messages || size > limit.Bytes {
 			break
