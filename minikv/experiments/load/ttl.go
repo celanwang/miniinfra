@@ -119,7 +119,7 @@ func startTTLReads(t target, layout [][]ttlEntry, hotSlot int, first time.Time) 
 	jobs := make(chan arrival, 256)
 	var scheduled, unused counts
 	readStart := first.Add(-400 * time.Millisecond)
-	go schedule(readStart, 5*time.Second, 250*time.Microsecond, 10000, jobs, make(chan arrival, 8), &scheduled, &unused)
+	go schedule(readStart, 5*time.Second, 250*time.Microsecond, 10000, 0, jobs, make(chan arrival, 8), &scheduled, &unused)
 	for shard := range ttlReads {
 		wg.Go(func() {
 			c := client{target: t}

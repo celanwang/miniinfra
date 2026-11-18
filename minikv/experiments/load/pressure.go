@@ -131,7 +131,7 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 	}
 	start := time.Now().Add(100 * time.Millisecond)
 	var scheduled, auxiliary counts
-	go schedule(start, 2*time.Second, 250*time.Microsecond, 10000, queue, make(chan arrival, 8), &scheduled, &auxiliary)
+	go schedule(start, 2*time.Second, 250*time.Microsecond, 10000, 0, queue, make(chan arrival, 8), &scheduled, &auxiliary)
 
 	httpClient := http.Client{Timeout: 40 * time.Millisecond}
 	time.Sleep(time.Until(start.Add(250 * time.Millisecond)))

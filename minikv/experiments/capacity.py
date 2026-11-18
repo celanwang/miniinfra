@@ -80,7 +80,7 @@ def rss(container):
     return memory
 
 
-def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit, server_cpus, driver_cpus, pressure_lengths="fixed", block_profile=False, ttl_pattern="clustered"):
+def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit, server_cpus, driver_cpus, pressure_lengths="fixed", block_profile=False, ttl_pattern="clustered", page_window=1):
     with engine(binaries, image, name, go_memory_limit, server_cpus, block_profile) as container:
         flags = [
             "run", "--rm", "--pull=never", "--network", f"container:{container}",
@@ -95,6 +95,8 @@ def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit
                 flags += ["-block-profile"]
         elif profile == "ttl":
             flags += ["-ttl-pattern", ttl_pattern]
+        elif profile == "page":
+            flags += ["-page-window", page_window]
         else:
             flags[2:2] = ["--pid", f"container:{container}"]
         if driver_cpus:
@@ -108,6 +110,8 @@ def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit
             metadata["PressureLengths"] = pressure_lengths
         if profile == "ttl":
             metadata["TTLPattern"] = ttl_pattern
+        if profile == "page":
+            metadata["PageWindow"] = page_window
         driver = subprocess.run(["docker", *map(str, flags)], capture_output=True, text=True)
         oom = docker("inspect", "--format", "{{.State.OOMKilled}}", container) == "true"
         if driver.returncode and not oom:
@@ -146,9 +150,10 @@ def main():
     parser.add_argument("--peer-module", type=Path, help="build the MiniKV peer from another checkout")
     parser.add_argument("--block-profile", action="store_true", help="collect an instrumented Go block profile")
     parser.add_argument("--ttl-pattern", default="clustered", choices=("clustered", "spread", "byte-fit", "byte-limit"))
+    parser.add_argument("--page-window", type=int, default=1, choices=(1, 4))
     args = parser.parse_args()
     profiles = args.profiles.split(",")
-    if any(p not in ("small", "mixed", "slow", "capacity", "pressure", "ttl") for p in profiles):
+    if any(p not in ("small", "mixed", "slow", "capacity", "pressure", "ttl", "page") for p in profiles):
         parser.error("invalid profile")
     rates = [int(rate) for rate in args.rates.split(",")]
     if any(rate <= 0 for rate in rates):
@@ -162,11 +167,11 @@ def main():
             (p, r) for p in profiles for r in ([0] if p in ("capacity", "pressure", "ttl") else rates)
         ):
             engines = ("minikv", "redis") if i % 2 == 0 else ("redis", "minikv")
-            if profile in ("pressure", "ttl"):
+            if profile in ("pressure", "ttl", "page"):
                 engines = ("minikv",)
             for name in engines:
                 replay(binaries, args.image, name, profile, rate, args.duration, args.tick,
-                       args.go_memory_limit, args.server_cpus, args.driver_cpus, args.pressure_lengths, args.block_profile, args.ttl_pattern)
+                       args.go_memory_limit, args.server_cpus, args.driver_cpus, args.pressure_lengths, args.block_profile, args.ttl_pattern, args.page_window)
 
 
 if __name__ == "__main__":
