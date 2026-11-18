@@ -39,6 +39,11 @@ func openTCP(t *testing.T, dir string) (*engine.DB, *sql.DB, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return serveTCP(t, store)
+}
+
+func serveTCP(t *testing.T, store *engine.DB) (*engine.DB, *sql.DB, func()) {
+	t.Helper()
 	socket, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		store.Close()

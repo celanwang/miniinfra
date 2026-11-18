@@ -43,6 +43,7 @@ type Log struct {
 // CommitTiming describes the durable write path of one successfully synced
 // request. Requests in a batch share its write and sync durations.
 type CommitTiming struct {
+	Enqueued           time.Time
 	Queue, Write, Sync time.Duration
 	BatchSize          int
 }
@@ -54,6 +55,8 @@ type request struct {
 	payload    []byte
 	publish    func(end int64)
 	result     chan error
+
+	checkpointTiming *CheckpointTiming
 }
 
 func Open(path string, replay func([]byte) error) (*Log, error) {
@@ -313,6 +316,7 @@ func (log *Log) sync(batch []request) error {
 		for _, item := range batch {
 			if item.timing != nil {
 				*item.timing = CommitTiming{
+					Enqueued:  item.enqueued,
 					Queue:     started.Sub(item.enqueued),
 					Write:     flushing.Sub(started),
 					Sync:      elapsed,

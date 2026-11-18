@@ -32,6 +32,8 @@ type DB struct {
 	published      atomic.Uint64
 	closed         atomic.Bool
 	failed         atomic.Bool
+
+	checkpointObserver *checkpointObserver
 }
 
 type transactionState struct {
@@ -153,11 +155,18 @@ func (db *DB) persist(change record, publish func(uint64), timing *wal.CommitTim
 	if err != nil {
 		return err
 	}
+	observer := db.checkpointObserver
+	if observer != nil && timing == nil {
+		timing = new(wal.CommitTiming)
+	}
 	err = db.log.CommitWithTiming(bytes, func(int64) {
 		next := db.published.Load() + 1
 		publish(next)
 		db.published.Store(next)
 	}, timing)
+	if err == nil && observer != nil {
+		observer.commit(*timing)
+	}
 	switch {
 	case err == nil, errors.Is(err, wal.ErrTooLarge), errors.Is(err, wal.ErrClosed):
 		return err

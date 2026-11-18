@@ -7,8 +7,10 @@ import (
 	"io"
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/celanwang/miniinfra/minidb/internal/pages"
+	"github.com/celanwang/miniinfra/minidb/internal/wal"
 )
 
 const checkpointFile = "minidb.pages"
@@ -19,25 +21,59 @@ type checkpointRecord struct {
 	Values []Value
 }
 
+type checkpointTiming struct {
+	WAL         wal.CheckpointTiming
+	Pages       pages.SaveTiming
+	ReclaimWait time.Duration
+}
+
+type checkpointObserver struct {
+	commit     func(wal.CommitTiming)
+	checkpoint func(checkpointTiming)
+}
+
 // Checkpoint persists the latest published view. Active transactions may
 // keep writing private versions, but publication waits at the WAL barrier.
 func (db *DB) Checkpoint() error {
 	if err := db.available(); err != nil {
 		return err
 	}
+	if observer := db.checkpointObserver; observer != nil {
+		var timing checkpointTiming
+		err := db.log.CheckpointWithTiming(func(lsn int64) error {
+			return db.writeCheckpoint(lsn, &timing)
+		}, &timing.WAL)
+		if err == nil {
+			observer.checkpoint(timing)
+		}
+		return err
+	}
 	return db.log.Checkpoint(db.saveCheckpoint)
 }
 
 func (db *DB) saveCheckpoint(lsn int64) error {
+	return db.writeCheckpoint(lsn, nil)
+}
+
+func (db *DB) writeCheckpoint(lsn int64, timing *checkpointTiming) error {
+	var started time.Time
+	if timing != nil {
+		started = time.Now()
+	}
 	db.reclaimMu.Lock()
 	defer db.reclaimMu.Unlock()
+	var pageTiming *pages.SaveTiming
+	if timing != nil {
+		timing.ReclaimWait = time.Since(started)
+		pageTiming = &timing.Pages
+	}
 	view := db.pinSnapshot(nil)
 	defer view.Close()
 	meta := pages.Metadata{LSN: lsn, Sequence: view.sequence, LastRowID: db.rowID.Load()}
 	db.catalog.RLock()
 	tables := maps.Clone(db.tables)
 	db.catalog.RUnlock()
-	return pages.Save(db.checkpointPath, meta, func(out io.Writer) error {
+	return pages.SaveWithTiming(db.checkpointPath, meta, func(out io.Writer) error {
 		enc := json.NewEncoder(out)
 		var records []checkpointRecord
 		for _, name := range slices.Sorted(maps.Keys(tables)) {
@@ -66,7 +102,7 @@ func (db *DB) saveCheckpoint(lsn int64) error {
 			}
 		}
 		return nil
-	})
+	}, pageTiming)
 }
 
 func (db *DB) loadCheckpoint() (int64, error) {
