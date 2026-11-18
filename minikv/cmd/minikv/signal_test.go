@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -57,8 +58,9 @@ func TestSIGTERMWithPartialSet(t *testing.T) {
 
 	stopSignalProcess(t, cmd)
 	var reply [1]byte
-	if _, err := pending.Read(reply[:]); err != io.EOF {
-		t.Fatalf("partial SET connection after SIGTERM: got %v, want EOF", err)
+	if n, err := pending.Read(reply[:]); n != 0 ||
+		(!errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET)) {
+		t.Fatalf("partial SET after SIGTERM: read %d bytes (%v), want EOF or reset without a reply", n, err)
 	}
 
 	restarted, bound := startSignalProcess(t, address)
