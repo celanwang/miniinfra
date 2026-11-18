@@ -20,7 +20,7 @@ func put(t *testing.T, s *Store, key, value string, ttl time.Duration, nx bool, 
 	t.Helper()
 	payload := make([]byte, len(value))
 	copy(payload, value)
-	if got := s.Set(key, payload, ttl, nx); got != want {
+	if got := s.Set([]byte(key), payload, ttl, nx); got != want {
 		t.Fatalf("Set(%q) = %d, want %d", key, got, want)
 	}
 }
@@ -92,7 +92,7 @@ func TestSetCopyChecksPublishedCapacityAndDoesNotRetainScratch(t *testing.T) {
 	s, _ := testStore(t, 4, 1, 1)
 	scratch := make([]byte, 3, 128)
 	copy(scratch, "abc")
-	if got := s.SetCopy("k", scratch, 0, true); got != Stored {
+	if got := s.SetCopy([]byte("k"), scratch, 0, true); got != Stored {
 		t.Fatalf("SetCopy returned %v", got)
 	}
 	copy(scratch, "xxx")

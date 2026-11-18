@@ -244,11 +244,11 @@ func (s *Server) receive(reader *bufio.Reader, key []byte, req request, bufferSi
 			return nil, store.Invalid, err
 		}
 		if len(value) != cap(value) {
-			result := s.cache.SetCopy(string(key), value, req.ttl, req.onlyMiss)
+			result := s.cache.SetCopy(key, value, req.ttl, req.onlyMiss)
 			s.writes.put(buffer)
 			return nil, result, nil
 		}
-		result := s.cache.Set(string(key), value, req.ttl, req.onlyMiss)
+		result := s.cache.Set(key, value, req.ttl, req.onlyMiss)
 		if result != store.Stored {
 			s.writes.put(buffer)
 		}

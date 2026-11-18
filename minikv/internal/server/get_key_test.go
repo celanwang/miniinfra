@@ -21,7 +21,7 @@ func TestReceiveGETKeyAllocations(t *testing.T) {
 	}
 	for _, size := range []int{16, 32, 33, 64, 128, 256, 1024} {
 		hitKey := bytes.Repeat([]byte("h"), size)
-		if cache.Set(string(hitKey), []byte("value"), 0, false) != store.Stored {
+		if cache.Set(hitKey, []byte("value"), 0, false) != store.Stored {
 			t.Fatalf("could not prefill key of length %d", size)
 		}
 		for _, tc := range []struct {
@@ -55,7 +55,7 @@ func TestReceiveGETKeyAllocations(t *testing.T) {
 	}
 }
 
-func TestTCPGETBorrowsBinaryKeysAcrossShards(t *testing.T) {
+func TestTCPReusesBinaryKeyBufferAcrossShards(t *testing.T) {
 	cache, err := store.New(store.Config{Shards: 4, BytesPerShard: 4 << 10, EntriesPerShard: 4, Samples: 4})
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +68,7 @@ func TestTCPGETBorrowsBinaryKeysAcrossShards(t *testing.T) {
 	short := ""
 	for i := range 256 {
 		key := string([]byte{'\n', 0, byte(i)})
-		if cache.ShardIndex(key) != cache.ShardIndex(long) {
+		if cache.ShardIndex([]byte(key)) != cache.ShardIndex([]byte(long)) {
 			short = key
 			break
 		}
@@ -86,4 +86,14 @@ func TestTCPGETBorrowsBinaryKeysAcrossShards(t *testing.T) {
 	c.value(t, "short")
 	c.value(t, "long")
 	c.line(t, "MISS\n")
+	c.send(t, fmt.Sprintf("SET %d 4 NONE\n%sLONGSET %d 5 NONE\n%sSHORT", len(long), long, len(short), short))
+	c.line(t, "STORED\n")
+	c.line(t, "STORED\n")
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fresh := dialTestTCP(t, address)
+	fresh.send(t, fmt.Sprintf("GET %d\n%sGET %d\n%s", len(long), long, len(short), short))
+	fresh.value(t, "LONG")
+	fresh.value(t, "SHORT")
 }
