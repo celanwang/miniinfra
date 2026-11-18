@@ -634,3 +634,36 @@ for arm in baseline single; do
         --server-cpus 0-1 --driver-cpus 2-5 --peer-module "$peers/$arm/minikv"
 done
 ```
+
+## 短状态回复的分配
+
+基线 `c82438a` 以 `io.WriteString` 把固定状态字符串写进 TCP 连接。借用版将状态追加到同一连接原有的 32 B 回复缓冲，再同步写出。当前最长的状态行含换行占 12 B。每条回复仍有原来的完整写期限，普通值回复沿用原发送方式。
+
+复用容量回放。`status` 为约一半未命中 `GET`、四分之一空值覆盖和四分之一已存在键的空值 `SET NX`。空值把短回复的成本和非空入站值缓冲分开。`hit` 全是命中并返回 512 B 值。两种负载均使用 96 条连接、250 µs 节拍，计划每秒 30,000 次普通请求和 40 次背景请求，各做三对 6 秒回放。Linux arm64、Go 1.27.3，服务与驱动分别固定 CPU 0–1、2–5，服务上限 160 MiB。
+
+在预热并建立全部连接后、回放完成后两次采样 `/runtime`。堆字节增量按完整回复数归一。分配次数包括已计入普通堆对象的分配块，以及复用这些块的微小分配，按每千个完整回复归一。采样包含服务进程背景活动和诊断开销。 [Go 运行时计数](https://pkg.go.dev/runtime/metrics) · [Go 分配计数校验](https://github.com/golang/go/blob/go1.27.3/src/runtime/metrics_test.go#L191-L200)
+
+| 指标，三轮中位数 | 短状态基线 / 借用 | 带值 GET 基线 / 借用 |
+| --- | ---: | ---: |
+| 服务堆分配 B / 回复 | 8.067 / 0.032 | 0.010 / 0.015 |
+| 服务堆分配次数 / 千个回复 | 1,001.18 / 0.70 | 0.16 / 0.31 |
+| 普通连接计划发送至读完 P99 | 3.47 / 3.45 ms | 3.41 / 3.43 ms |
+| 普通连接 RTT P99 | 0.97 / 0.85 ms | 0.95 / 0.72 ms |
+
+12 轮已发送的请求全数收到预期回复，计划完成率最低 99.77%。短状态组每对少分配约 7.94–9.48 B / 回复，分配次数从各轮约每回复一次降到每千次回复少于一次。带值 GET 的分配保持在诊断底噪附近。短状态 RTT P99 配对变化为 +0.229、−0.174、−0.355 ms，服务 CPU 也有升有降。
+
+**采用回复缓冲复用。** 真实 TCP 的管线测试覆盖状态与值完整交错、`EXISTS`、`NO_SPACE` 和出站 `BUSY` 后正常读写，以及入站 `BUSY`、`BAD_REQUEST`、`TOO_LARGE` 后关闭。另用阻塞的连接验证短回复写超时会关闭连接，后续写入未执行。采用依据是短状态的可重复分配收益。
+
+从组件目录复跑，每对可交换两个 peer 的顺序。基线复用当前的测试诊断代码，以取得相同的堆分配计数。
+
+```sh
+base=$(mktemp -d)
+git -C .. archive c82438a minikv | tar -x -C "$base"
+cp internal/server/capacity_experiment_test.go "$base/minikv/internal/server/"
+for mode in status hit; do
+    for peer in "$base/minikv" "$PWD"; do
+        GOWORK=off python3 experiments/capacity.py --profiles "$mode" --rates 30000 \
+            --tick 250us --server-cpus 0-1 --driver-cpus 2-5 --peer-module "$peer"
+    done
+done
+```
