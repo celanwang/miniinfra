@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniMQ verifies that retrying a delayed publish after a lost reply preserves its receipt and produces one history entry across restarts.
 - MiniKV returns BAD_REQUEST for an overflowing SET deadline before checking NX or shard capacity.
 - MiniMQ reuses immutable dead-letter bodies during redrive while keeping each durable record self-contained.
 - MiniDB allocates transaction lock state on the first grant, saving two allocations on point reads.
