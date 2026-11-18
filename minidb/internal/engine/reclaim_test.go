@@ -188,7 +188,7 @@ func TestReclaimKeepsVersionsForSnapshotsRegisteredAfterCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 	tbl, _ := db.table(schema.Name, db.published.Load())
-	if _, removed := tbl.reclaimWithin(&views, reclaimBudget); removed != 0 {
+	if _, removed := tbl.reclaimWithin(&views, reclaimBudget, nil); removed != 0 {
 		t.Fatal("sweep reclaimed a version ended after capture")
 	}
 	wantStock(t, oldest, 1, String("hot"), 0)

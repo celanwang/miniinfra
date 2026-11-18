@@ -143,6 +143,7 @@ func TestTCPStaggeredSnapshots(t *testing.T) {
 		p99(normal[0]), len(normal[0]), p99(normal[1]), len(normal[1]), drain)
 	t.Logf("sweeps=%d scanned=%d removed=%d mean=%s max=%s",
 		work.Steps, work.Scanned, work.Removed, work.Time/time.Duration(max(1, work.Steps)), work.Max)
+	t.Logf("slowest_sweep_phases=%+v longest_table_hold=%s", work.Slowest, work.MaxTableHold)
 
 	testLockedReplacement(t, store, pool)
 	closeStore()
