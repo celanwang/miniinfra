@@ -20,13 +20,15 @@ def mount(binaries):
 
 
 @contextmanager
-def engine(binaries, image, name, go_memory_limit):
+def engine(binaries, image, name, go_memory_limit, cpuset):
     container = f"minikv-capacity-{uuid.uuid4().hex[:12]}"
     flags = [
         "run", "-d", "--name", container, "--pull=never", "--network", "none",
         "--cpus=2", "--memory=160m", "--memory-swap=160m",
         "--sysctl", "net.ipv4.tcp_wmem=4096 32768 131072",
     ]
+    if cpuset:
+        flags += ["--cpuset-cpus", cpuset]
     if name == "minikv":
         flags += [
             "-e", "MINIKV_CAPACITY_PEER=1", "-e", "GOMAXPROCS=2",
@@ -76,27 +78,33 @@ def rss(container):
     return memory
 
 
-def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit):
-    with engine(binaries, image, name, go_memory_limit) as container:
+def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit, server_cpus, driver_cpus):
+    with engine(binaries, image, name, go_memory_limit, server_cpus) as container:
         flags = [
             "run", "--rm", "--pull=never", "--network", f"container:{container}",
-            "--pid", f"container:{container}", "--cpus=4",
+            "--cpus=4",
             "--memory=256m", "--memory-swap=256m", "-e", "GOMAXPROCS=4",
             "--mount", mount(binaries), "--entrypoint", "/work/load", image,
             "-profile", profile, "-rate", rate, "-duration", duration, "-tick", tick,
         ]
+        if profile != "pressure":
+            flags[2:2] = ["--pid", f"container:{container}"]
+        if driver_cpus:
+            flags[2:2] = ["--cpuset-cpus", driver_cpus]
         if name == "redis":
             flags.append("-redis")
         metadata = {"Engine": name, "Profile": profile, "Rate": rate,
                     "Duration": duration, "Tick": tick,
                     "GoMemoryLimit": go_memory_limit if name == "minikv" else None}
         driver = subprocess.run(["docker", *map(str, flags)], capture_output=True, text=True)
-        if driver.returncode:
-            if docker("inspect", "--format", "{{.State.OOMKilled}}", container) != "true":
-                raise RuntimeError(f"load driver exited {driver.returncode}: {driver.stderr}")
-            result = {"OOMKilled": True, "DriverStderr": driver.stderr.strip()}
+        oom = docker("inspect", "--format", "{{.State.OOMKilled}}", container) == "true"
+        if driver.returncode and not oom:
+            raise RuntimeError(f"load driver exited {driver.returncode}: {driver.stderr}")
+        result = json.loads(driver.stdout) if not driver.returncode else {}
+        if oom:
+            result.update(OOMKilled=True, DriverStderr=driver.stderr.strip())
         else:
-            result = {**rss(container), **json.loads(driver.stdout)}
+            result.update(rss(container))
         print(json.dumps({**metadata, **result}), flush=True)
 
 
@@ -118,9 +126,11 @@ def main():
     parser.add_argument("--duration", default="6s")
     parser.add_argument("--tick", default="1ms", help="schedule slots in fixed-duration batches")
     parser.add_argument("--go-memory-limit", help="set GOMEMLIMIT on the MiniKV server for this run")
+    parser.add_argument("--server-cpus", help="pin the server to a Docker CPU set")
+    parser.add_argument("--driver-cpus", help="pin the driver to a Docker CPU set")
     args = parser.parse_args()
     profiles = args.profiles.split(",")
-    if any(p not in ("small", "mixed", "slow", "capacity") for p in profiles):
+    if any(p not in ("small", "mixed", "slow", "capacity", "pressure") for p in profiles):
         parser.error("invalid profile")
     rates = [int(rate) for rate in args.rates.split(",")]
     if any(rate <= 0 for rate in rates):
@@ -131,11 +141,14 @@ def main():
         binaries = Path(scratch).resolve()
         build(binaries, module)
         for i, (profile, rate) in enumerate(
-            (p, r) for p in profiles for r in ([0] if p == "capacity" else rates)
+            (p, r) for p in profiles for r in ([0] if p in ("capacity", "pressure") else rates)
         ):
             engines = ("minikv", "redis") if i % 2 == 0 else ("redis", "minikv")
+            if profile == "pressure":
+                engines = ("minikv",)
             for name in engines:
-                replay(binaries, args.image, name, profile, rate, args.duration, args.tick, args.go_memory_limit)
+                replay(binaries, args.image, name, profile, rate, args.duration, args.tick,
+                       args.go_memory_limit, args.server_cpus, args.driver_cpus)
 
 
 if __name__ == "__main__":

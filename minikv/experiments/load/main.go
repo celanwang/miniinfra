@@ -457,13 +457,19 @@ func fill(t target, prefix string, clients, n, size int) map[outcome]int {
 
 func main() {
 	redis := flag.Bool("redis", false, "use Redis RESP2")
-	profile := flag.String("profile", "small", "small, mixed, slow, or capacity")
+	profile := flag.String("profile", "small", "small, mixed, slow, capacity, or pressure")
 	rate := flag.Int("rate", 10000, "ordinary offered requests per second")
 	window := flag.Duration("duration", 6*time.Second, "offered workload duration")
 	tick := flag.Duration("tick", time.Millisecond, "fixed arrival batch interval")
 	flag.Parse()
 	t := target{address: "127.0.0.1:7321", redis: *redis}
 	encoder := json.NewEncoder(os.Stdout)
+	if *profile == "pressure" && !*redis {
+		if err := encoder.Encode(runPressure(t)); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if *profile == "capacity" {
 		prefill := fill(t, "fill", 32, 100000, 1024)
 		fmt.Fprintln(os.Stderr, "capacity prefill finished:", prefill)
