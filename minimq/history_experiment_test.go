@@ -83,32 +83,38 @@ func runHistoryLoad(p *Partition, body []byte, first, end int) ([]time.Duration,
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	failures := make(chan error, 3)
+	readOffsets := make(chan uint64, end-first)
 	var acks []time.Duration
 	var reads int
 	go func() {
-		defer cancel()
-		failures <- consumeHistoryLoad(ctx, p, body, end-first, &acks)
+		err := consumeHistoryLoad(ctx, p, body, end-first, &acks)
+		if err != nil {
+			cancel()
+		}
+		failures <- err
 	}()
 	go func() {
-		tick := time.NewTicker(time.Millisecond)
-		defer tick.Stop()
 		limit := Limits{Messages: 4, Bytes: 4 * len(body)}
-		var offset uint64
 		for {
 			select {
 			case <-ctx.Done():
-				failures <- nil
+				failures <- ctx.Err()
 				return
-			case <-tick.C:
+			case offset, ok := <-readOffsets:
+				if !ok {
+					failures <- nil
+					return
+				}
 				page, err := p.Read(offset, limit)
 				if err != nil {
 					failures <- err
 					cancel()
 					return
 				}
-				if len(page.Messages) == 0 {
-					offset = 0
-					continue
+				if len(page.Messages) != limit.Messages {
+					failures <- fmt.Errorf("short history page at %d: %d records", offset, len(page.Messages))
+					cancel()
+					return
 				}
 				for _, msg := range page.Messages {
 					if !bytes.Equal(msg.Body, body) {
@@ -118,11 +124,11 @@ func runHistoryLoad(p *Partition, body []byte, first, end int) ([]time.Duration,
 					}
 				}
 				reads++
-				offset = page.Next
 			}
 		}
 	}()
 	go func() {
+		defer close(readOffsets)
 		for i := first; i < end; i++ {
 			if ctx.Err() != nil {
 				break
@@ -139,6 +145,9 @@ func runHistoryLoad(p *Partition, body []byte, first, end int) ([]time.Duration,
 					return
 				}
 			}
+			if pages := (i + 1) / 4; pages > 0 {
+				readOffsets <- uint64(4 * (i % pages))
+			}
 		}
 		failures <- nil
 	}()
@@ -148,8 +157,9 @@ func runHistoryLoad(p *Partition, body []byte, first, end int) ([]time.Duration,
 			err = failure
 		}
 	}
-	if err == nil && reads == 0 {
-		err = fmt.Errorf("mixed workload did not complete any history reads")
+	wantReads := end - max(first, 3)
+	if err == nil && reads != wantReads {
+		err = fmt.Errorf("mixed workload completed %d history pages, want %d", reads, wantReads)
 	}
 	return acks, reads, err
 }
