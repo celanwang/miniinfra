@@ -98,7 +98,7 @@ func waitForLock(t *testing.T, db *DB, waiter *Txn) {
 
 func wantStock(t *testing.T, view Snapshot, column int, value Value, stock int64) {
 	t.Helper()
-	rows, indexed, err := view.Rows("inventory", []int{column}, []Value{value})
+	rows, indexed, err := view.Rows(t.Context(), "inventory", []int{column}, []Value{value})
 	if err != nil || !indexed || len(rows) != 1 || rows[0][2] != Int(stock) {
 		t.Fatalf("rows = %v, indexed = %v, err = %v, want stock %d", rows, indexed, err, stock)
 	}
@@ -200,7 +200,7 @@ func TestUniqueKeyWaitAndDeadlockVictim(t *testing.T) {
 	}
 	commit(t, second)
 	_, fresh := start(t, db)
-	rows, _, err := fresh.Rows("inventory", []int{1}, []Value{String("request")})
+	rows, _, err := fresh.Rows(t.Context(), "inventory", []int{1}, []Value{String("request")})
 	if err != nil || len(rows) != 1 || rows[0][0] != Int(803) {
 		t.Fatalf("aborted row still owns unique key: %v %v", rows, err)
 	}
