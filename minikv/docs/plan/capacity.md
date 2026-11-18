@@ -287,3 +287,42 @@ GOWORK=off python3 experiments/capacity.py --profiles pressure --pressure-length
 GOWORK=off python3 experiments/capacity.py --profiles pressure --pressure-lengths publish-locality \
     --server-cpus 0-1 --driver-cpus 2-5 --peer-module "$peer_source/minikv"
 ```
+
+### 空闲池跨尺寸切换
+
+空闲池的旧策略在仍有空间时才接受归还。白盒测试把 8 MiB 填满于单个尺寸，再归还另一尺寸，两个方向都会丢掉新缓冲。后续该尺寸即使反复出现，也不会获得可复用的槽位。
+
+沿用默认 16 分片、64 MiB 缓存、160 MiB cgroup 硬上限和默认 Go 内存设置。预填 100000 个 1 KiB 小值，再由 16 条连接按 10k/s 计划速率发出 20000 次小读。第一阶段使用正常 TCP SET，将每条值体保留最后一字节，等所有请求取得入站额度再发送最后一字节。1 MiB 用 8 条连接，512 KiB 用 16 条。两组保持同一进程，结束时确认空闲池确实占满 8 MiB。随后用 8 条连接发出 256 MiB 的另一尺寸写入。冷启动对照从相同的新进程预填后跳过第一阶段。
+
+两组用同一驱动，以 Go 1.27.3 在 Linux arm64 Docker 中串行交替。服务器固定 CPU 0–1，驱动固定 CPU 2–5。每轮启动前等待其他 Docker 容器退出，宿主调度仍共享。分配量取阶段前后累计分配差，OOM 时取最后可采样值。cgroup 峰值取阶段内采到的累计高水位，可能包含预填或上一阶段。小读 P99 从计划时刻计到完整命中，失败和未发另计。
+
+| 第一阶段，六轮范围 | `NO_SPACE` | 原连接继续读 | 阶段分配 | cgroup 高水位 | 阶段小读成功 / P99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 用 1 MiB 填池 | 8 / 8 | 8 / 8 | 8.02–8.16 MiB | 101.7–128.8 MiB | 225–562 / 5.51–13.72 ms |
+| 用 512 KiB 填池 | 16 / 16 | 16 / 16 | 8.05–8.18 MiB | 109.3–127.5 MiB | 315–560 / 6.33–13.31 ms |
+
+| 第二阶段，三对各方向 | OOM | `NO_SPACE` | 整轮小读成功 | 原写连接继续读 | 阶段分配 | cgroup 高水位 | 小读 P99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 MiB → 512 KiB，旧策略 | 3/3 | 85–180 / 512 | 3555–4107 | 0 / 8 | 43.58–86.28 MiB | 160.0 MiB | 13.73–40.08 ms，部分完成 |
+| 1 MiB → 512 KiB，替换最早归还 | 0/3 | 512 / 512 | 20000 | 8 / 8 | 4.51–4.64 MiB | 106.5–133.1 MiB | 11.46–12.80 ms |
+| 512 KiB → 1 MiB，旧策略 | 3/3 | 36–53 / 256 | 3275–3471 | 0 / 8 | 34.02–54.20 MiB | 157.3–160.0 MiB | 13.65–55.25 ms，部分完成 |
+| 512 KiB → 1 MiB，替换最早归还 | 0/3 | 256 / 256 | 20000 | 8 / 8 | 8.31–8.50 MiB | 117.5–129.5 MiB | 8.96–12.85 ms |
+
+替换策略在两方向的进程 RSS 峰值分别为 112.6–130.3 和 123.2–134.6 MiB，空闲缓冲上限仍为 8 MiB。旧策略六轮都在第二阶段退出，退出后小读无成功结果。两轮冷启动里，两种策略都能完整拒绝大写，512 KiB 分配为 4.49–4.65 MiB，1 MiB 为 8.24–8.33 MiB。切换后的分配回到冷启动量级。
+
+另做三对交替回放，每批 8 个写在 1 MiB 和 512 KiB 间切换，总共 384 个写。两组每轮均完整拒写且无 OOM。旧策略分配 38.03–39.91 MiB，替换策略为 22.86–35.50 MiB。小读 P99 从 10.39–11.20 ms 变为 10.96–12.07 ms。单对四尺寸轮换的分配从 23.04 增至 26.46 MiB，单对相邻互异的分配近似持平。两对成功覆盖均完成 256 个 SET，阶段分配维持在 263.48–263.61 MiB。控制组部分轮次有少量驱动晚发，所有已发小读和同连接恢复检查均成功。
+
+采用按归还顺序替换。症状来自一个尺寸的空闲缓冲长期占满预算，替换只在归还空间不足时发生。池仍按实际 backing 容量记账，容量上限不变。交替对照显示分配下降，但小读尾延迟没有一致改善，更宽的尺寸分布仍需实测。
+
+从组件目录运行以下命令。每个模式可交替运行先后顺序。历史 peer 使用与当前版本相同的发压器。
+
+```sh
+peer_source=$(mktemp -d)
+git -C .. archive 7323242 minikv | tar -xf - -C "$peer_source"
+for lengths in large-to-half half-to-large cold-half fixed alternating repeated adjacent publish; do
+    GOWORK=off python3 experiments/capacity.py --profiles pressure --pressure-lengths "$lengths" \
+        --server-cpus 0-1 --driver-cpus 2-5 --peer-module "$peer_source/minikv"
+    GOWORK=off python3 experiments/capacity.py --profiles pressure --pressure-lengths "$lengths" \
+        --server-cpus 0-1 --driver-cpus 2-5
+done
+```
