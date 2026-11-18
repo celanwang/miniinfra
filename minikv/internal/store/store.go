@@ -21,7 +21,6 @@ const (
 	NoSpace
 	Busy
 	Invalid
-	NotCached
 )
 
 const (
@@ -35,7 +34,6 @@ type Config struct {
 	BytesPerShard   int64
 	EntriesPerShard int
 	Samples         int
-	AdmissionWindow time.Duration
 }
 
 type Store struct {
@@ -72,21 +70,16 @@ type shard struct {
 	evicted   uint64
 	expired   uint64
 	rejected  uint64
-	admission *admission
 }
 
 func New(config Config) (*Store, error) {
 	if config.Shards < 1 || config.EntriesPerShard < 1 ||
 		int64(config.EntriesPerShard) > math.MaxUint32 ||
-		config.AdmissionWindow < 0 ||
 		config.Samples < 1 || config.Samples > maxSamples {
 		return nil, errors.New("invalid shard capacity or sample count")
 	}
 
 	reserved := int64(config.EntriesPerShard) * slotBudget
-	if config.AdmissionWindow > 0 {
-		reserved += admissionBytes
-	}
 	if config.BytesPerShard <= reserved {
 		return nil, errors.New("shard byte budget must exceed metadata reservation")
 	}
@@ -102,9 +95,6 @@ func New(config Config) (*Store, error) {
 		sh.index = make(map[string]uint32, config.EntriesPerShard)
 		sh.entries = make([]entry, 0, config.EntriesPerShard)
 		sh.usedBytes = reserved
-		if config.AdmissionWindow > 0 {
-			sh.admission = &admission{window: config.AdmissionWindow, seed: maphash.MakeSeed()}
-		}
 		sh.byteLimit = config.BytesPerShard
 		sh.samples = config.Samples
 	}
@@ -145,7 +135,7 @@ func (s *Store) Set(key string, value []byte, ttl time.Duration, onlyMissing boo
 }
 
 // SetCopy borrows value during the call and allocates an exact-capacity copy
-// only if the write passes the shard's admission and capacity checks.
+// only if the write passes the shard's conditional and capacity checks.
 func (s *Store) SetCopy(key string, value []byte, ttl time.Duration, onlyMissing bool) Result {
 	return s.set(key, value, ttl, onlyMissing, true)
 }
@@ -183,10 +173,6 @@ func (s *Store) set(key string, value []byte, ttl time.Duration, onlyMissing, co
 
 	if ttl > time.Duration(math.MaxInt64)-now {
 		return Invalid
-	}
-	if onlyMissing && sh.admission != nil && len(victims) > 0 &&
-		!sh.entries[victims[len(victims)-1]].expired(now) && !sh.admission.seen(key, now) {
-		return NotCached
 	}
 	if copyValue {
 		next.value = make([]byte, len(value))
