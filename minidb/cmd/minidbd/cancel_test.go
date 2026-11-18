@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"testing"
 	"time"
@@ -84,9 +83,8 @@ func TestCanceledOrderReleasesLocks(t *testing.T) {
 		t.Fatal("the canceled client did not return")
 	}
 	clientReturned := time.Since(started)
-	var unknown *client.Error
-	if bErr == nil || errors.Is(bErr, driver.ErrBadConn) || errors.As(bErr, &unknown) && unknown.Code == client.CommitUnknown {
-		t.Fatalf("the canceled statement could not commit or be replayed: %v", bErr)
+	if !errors.Is(bErr, context.Canceled) {
+		t.Fatalf("expected cancellation for a statement before COMMIT: %v", bErr)
 	}
 	select {
 	case err := <-cDone:
@@ -119,12 +117,17 @@ func TestCanceledOrderReleasesLocks(t *testing.T) {
 	if err := reserveOrder(t, bPool).Commit(); err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("cancel_to_retried_commit=%s", time.Since(started))
 	assertOrderRecovered(t, db)
 	kill()
 	addr, _ = launch(t, dir)
 	recovered := client.Open(addr)
 	defer recovered.Close()
 	assertOrderRecovered(t, recovered)
+	var available int64
+	if err := recovered.QueryRowContext(t.Context(), "select available from inventory where sku = 3").Scan(&available); err != nil || available != 29 {
+		t.Fatalf("lost the unrelated commit: %d, %v", available, err)
+	}
 }
 
 func TestCanceledBeforeSendPreservesTransaction(t *testing.T) {
@@ -151,6 +154,105 @@ func TestCanceledBeforeSendPreservesTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertOrderAbsent(t, db)
+}
+
+func TestDeadlineWhileWaitingForLock(t *testing.T) {
+	addr, _ := launch(t, t.TempDir())
+	db := client.Open(addr)
+	defer db.Close()
+	setup(t, db)
+	a := begin(t, db)
+	execute(t, a, reserveStock, 1, 1, 1)
+	b := begin(t, db)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	_, err := b.ExecContext(ctx, reserveStock, 1, 1, 1)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected the application's deadline error: %v", err)
+	}
+}
+
+func TestUnknownCommitCanRecoverWithoutOrder(t *testing.T) {
+	dir := t.TempDir()
+	addr, kill := launch(t, dir)
+	db := client.Open(addr)
+	defer db.Close()
+	setup(t, db)
+
+	proxy, interrupted := interruptRequest(t, addr, requestFault{statement: "COMMIT", beforeForward: true})
+	connection := client.Open(proxy)
+	defer connection.Close()
+	tx := reserveOrder(t, connection)
+	assertUnknownCommit(t, tx.Commit())
+	awaitInterruption(t, interrupted)
+	kill()
+
+	addr, _ = launch(t, dir)
+	recovered := client.Open(addr)
+	defer recovered.Close()
+	assertOrderAbsent(t, recovered)
+	if err := reserveOrder(t, recovered).Commit(); err != nil {
+		t.Fatal(err)
+	}
+	assertOrderRecovered(t, recovered)
+}
+
+func TestCanceledAutocommitAfterPublicationIsUnknown(t *testing.T) {
+	addr, _ := launch(t, t.TempDir())
+	db := client.Open(addr)
+	defer db.Close()
+	setup(t, db)
+
+	published, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	proxy, interrupted := interruptRequest(t, addr, requestFault{
+		statement: reserveStock,
+		afterSuccess: func() {
+			close(published)
+			<-release
+		},
+	})
+	connection := client.Open(proxy)
+	defer connection.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := connection.ExecContext(ctx, reserveStock, 1, 1, 1)
+		done <- err
+	}()
+	select {
+	case <-published:
+	case err := <-interrupted:
+		t.Fatalf("interrupted before server confirmed autocommit: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not confirm autocommit")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		assertUnknownCommit(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("client ignored cancellation")
+	}
+	var available int64
+	if err := db.QueryRowContext(t.Context(), "select available from inventory where sku = 1").Scan(&available); err != nil || available != 9 {
+		t.Fatalf("the durable update should have run once: %d, %v", available, err)
+	}
+}
+
+func TestAutocommitLostReplyDoesNotRetry(t *testing.T) {
+	addr, _ := launch(t, t.TempDir())
+	db := client.Open(addr)
+	defer db.Close()
+	setup(t, db)
+
+	proxy, interrupted := interruptRequest(t, addr, requestFault{statement: reserveStock})
+	connection := client.Open(proxy)
+	defer connection.Close()
+	_, err := connection.ExecContext(t.Context(), reserveStock, 1, 1, 1)
+	assertUnknownCommit(t, err)
+	awaitInterruption(t, interrupted)
 }
 
 func assertOrderAbsent(t *testing.T, db *sql.DB) {

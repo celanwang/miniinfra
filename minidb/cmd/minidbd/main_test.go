@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -70,7 +72,13 @@ func launch(t *testing.T, dir string) (string, func()) {
 	}
 }
 
-func dropCommitResponse(t *testing.T, upstream string) (string, <-chan error) {
+type requestFault struct {
+	statement     string
+	beforeForward bool
+	afterSuccess  func()
+}
+
+func interruptRequest(t *testing.T, upstream string, fault requestFault) (string, <-chan error) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -79,12 +87,13 @@ func dropCommitResponse(t *testing.T, upstream string) (string, <-chan error) {
 	t.Cleanup(func() { listener.Close() })
 	dropped := make(chan error, 1)
 	go func() {
-		dropped <- proxyUntilCommit(listener, upstream)
+		defer listener.Close()
+		dropped <- proxyUntilFault(listener, upstream, fault)
 	}()
 	return listener.Addr().String(), dropped
 }
 
-func proxyUntilCommit(listener net.Listener, upstream string) error {
+func proxyUntilFault(listener net.Listener, upstream string, fault requestFault) error {
 	clientConn, err := listener.Accept()
 	if err != nil {
 		return err
@@ -104,6 +113,10 @@ func proxyUntilCommit(listener net.Listener, upstream string) error {
 		if err := wire.Read(requestReader, &request); err != nil {
 			return err
 		}
+		target := request.SQL == fault.statement
+		if target && fault.beforeForward {
+			return nil
+		}
 		data, err := wire.Encode(request)
 		if err != nil {
 			return err
@@ -115,9 +128,12 @@ func proxyUntilCommit(listener net.Listener, upstream string) error {
 		if err := wire.Read(responseReader, &response); err != nil {
 			return err
 		}
-		if request.SQL == "COMMIT" {
+		if target {
 			if response.Code != "" {
-				return fmt.Errorf("server did not commit: %s", response.Message)
+				return fmt.Errorf("server did not report success: %s", response.Message)
+			}
+			if fault.afterSuccess != nil {
+				fault.afterSuccess()
 			}
 			return nil
 		}
@@ -224,13 +240,47 @@ func TestDriverPreservesUTF8Text(t *testing.T) {
 	execute(t, db, "insert into names values (?)", "raw�")
 }
 
+func TestTCPHalfCloseDeliversFinalReply(t *testing.T) {
+	addr, _ := launch(t, t.TempDir())
+	for i := range 12 {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			conn, err := net.DialTimeout("tcp", addr, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			frame, err := wire.Encode(wire.Request{SQL: fmt.Sprintf("create table final_%d (id int primary key)", i)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := conn.Write(frame); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			reader := wire.Reader(conn)
+			var response wire.Response
+			if err := wire.Read(reader, &response); err != nil || response.Code != "" {
+				t.Fatalf("final reply: %+v, %v", response, err)
+			}
+			if err := wire.Read(reader, &response); !errors.Is(err, io.EOF) {
+				t.Fatalf("server did not finish the half-closed session: %v", err)
+			}
+		})
+	}
+}
+
 func TestOrderSurvivesLostReplyAndAbruptRestart(t *testing.T) {
 	dir := t.TempDir()
 	addr, kill := launch(t, dir)
 	db := client.Open(addr)
 	defer db.Close()
 	setup(t, db)
-	proxy, dropped := dropCommitResponse(t, addr)
+	proxy, dropped := interruptRequest(t, addr, requestFault{statement: "COMMIT"})
 	connection := client.Open(proxy)
 	defer connection.Close()
 	tx := reserveOrder(t, connection)
@@ -238,26 +288,16 @@ func TestOrderSurvivesLostReplyAndAbruptRestart(t *testing.T) {
 	if err := db.QueryRowContext(t.Context(), "select id from orders where request_id = ?", "r42").Scan(&id); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("second connection saw uncommitted order: %v, %v", id, err)
 	}
-	err := tx.Commit()
-	var dbErr *client.Error
-	if !errors.As(err, &dbErr) || dbErr.Code != client.CommitUnknown {
-		t.Fatalf("wanted unknown commit, got %v", err)
-	}
-	select {
-	case err := <-dropped:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("proxy did not observe the successful commit")
-	}
+	assertUnknownCommit(t, tx.Commit())
+	awaitInterruption(t, dropped)
 	kill()
 
 	addr, _ = launch(t, dir)
 	recovered := client.Open(addr)
 	defer recovered.Close()
 	retry := begin(t, recovered)
-	_, err = retry.ExecContext(t.Context(), "insert into orders values (?, ?, ?)", 43, "r42", "1:2,2:3")
+	_, err := retry.ExecContext(t.Context(), "insert into orders values (?, ?, ?)", 43, "r42", "1:2,2:3")
+	var dbErr *client.Error
 	if !errors.As(err, &dbErr) || dbErr.Code != client.Unique {
 		t.Fatalf("same request was not rejected: %v", err)
 	}
@@ -265,6 +305,27 @@ func TestOrderSurvivesLostReplyAndAbruptRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertOrderRecovered(t, recovered)
+}
+
+func assertUnknownCommit(t *testing.T, err error) {
+	t.Helper()
+	var dbErr *client.Error
+	if !errors.As(err, &dbErr) || dbErr.Code != client.CommitUnknown ||
+		errors.Is(err, driver.ErrBadConn) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wanted unknown commit, got %v", err)
+	}
+}
+
+func awaitInterruption(t *testing.T, interrupted <-chan error) {
+	t.Helper()
+	select {
+	case err := <-interrupted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy did not reach the requested interruption")
+	}
 }
 
 func reserveOrder(t *testing.T, db *sql.DB) *sql.Tx {

@@ -68,10 +68,7 @@ func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
 	var readErr error
 	receiving.Go(func() {
 		defer close(requests)
-		readErr = readRequests(ctx, conn, requests)
-		if errors.Is(readErr, io.EOF) {
-			disconnect()
-		}
+		readErr = readRequests(ctx, conn, requests, disconnect)
 	})
 	for req := range requests {
 		if ctx.Err() != nil {
@@ -98,15 +95,19 @@ func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
 	}
 }
 
-func readRequests(ctx context.Context, conn net.Conn, requests chan<- wire.Request) error {
+func readRequests(ctx context.Context, conn net.Conn, requests chan<- wire.Request, disconnect context.CancelFunc) error {
 	reader := wire.Reader(conn)
 	for {
 		var req wire.Request
 		if err := wire.Read(reader, &req); err != nil {
-			// Scanner errors other than frame size indicate the end of the
-			// transport. Malformed frames still get a protocol error.
+			// FIN may be a half-close. Finish processing accepted requests
+			// and send their replies. A transport error cancels execution.
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
 			if reader.Err() != nil && !errors.Is(err, bufio.ErrTooLong) {
-				return io.EOF
+				disconnect()
+				return nil
 			}
 			return err
 		}
