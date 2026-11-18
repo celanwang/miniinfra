@@ -20,7 +20,7 @@ def mount(binaries):
 
 
 @contextmanager
-def engine(binaries, image, name):
+def engine(binaries, image, name, go_memory_limit):
     container = f"minikv-capacity-{uuid.uuid4().hex[:12]}"
     flags = [
         "run", "-d", "--name", container, "--pull=never", "--network", "none",
@@ -32,6 +32,8 @@ def engine(binaries, image, name):
             "-e", "MINIKV_CAPACITY_PEER=1", "-e", "GOMAXPROCS=2",
             "--mount", mount(binaries), "--entrypoint", "/work/peer",
         ]
+        if go_memory_limit:
+            flags += ["-e", f"GOMEMLIMIT={go_memory_limit}"]
         args = ["-test.run=^TestCapacityPeer$", "-test.timeout=0"]
         probe = ["wget", "-qO-", "http://127.0.0.1:9122/stats"]
     else:
@@ -74,8 +76,8 @@ def rss(container):
     return memory
 
 
-def replay(binaries, image, name, profile, rate, duration, tick):
-    with engine(binaries, image, name) as container:
+def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit):
+    with engine(binaries, image, name, go_memory_limit) as container:
         flags = [
             "run", "--rm", "--pull=never", "--network", f"container:{container}",
             "--pid", f"container:{container}", "--cpus=4",
@@ -85,9 +87,17 @@ def replay(binaries, image, name, profile, rate, duration, tick):
         ]
         if name == "redis":
             flags.append("-redis")
-        result = json.loads(docker(*flags))
-        metadata = {"Engine": name, "Profile": profile, "Rate": rate, "Duration": duration, "Tick": tick}
-        print(json.dumps({**metadata, **rss(container), **result}), flush=True)
+        metadata = {"Engine": name, "Profile": profile, "Rate": rate,
+                    "Duration": duration, "Tick": tick,
+                    "GoMemoryLimit": go_memory_limit if name == "minikv" else None}
+        driver = subprocess.run(["docker", *map(str, flags)], capture_output=True, text=True)
+        if driver.returncode:
+            if docker("inspect", "--format", "{{.State.OOMKilled}}", container) != "true":
+                raise RuntimeError(f"load driver exited {driver.returncode}: {driver.stderr}")
+            result = {"OOMKilled": True, "DriverStderr": driver.stderr.strip()}
+        else:
+            result = {**rss(container), **json.loads(driver.stdout)}
+        print(json.dumps({**metadata, **result}), flush=True)
 
 
 def build(binaries, module):
@@ -107,6 +117,7 @@ def main():
     parser.add_argument("--profiles", default="small,mixed,slow,capacity")
     parser.add_argument("--duration", default="6s")
     parser.add_argument("--tick", default="1ms", help="schedule slots in fixed-duration batches")
+    parser.add_argument("--go-memory-limit", help="set GOMEMLIMIT on the MiniKV server for this run")
     args = parser.parse_args()
     profiles = args.profiles.split(",")
     if any(p not in ("small", "mixed", "slow", "capacity") for p in profiles):
@@ -124,7 +135,7 @@ def main():
         ):
             engines = ("minikv", "redis") if i % 2 == 0 else ("redis", "minikv")
             for name in engines:
-                replay(binaries, args.image, name, profile, rate, args.duration, args.tick)
+                replay(binaries, args.image, name, profile, rate, args.duration, args.tick, args.go_memory_limit)
 
 
 if __name__ == "__main__":

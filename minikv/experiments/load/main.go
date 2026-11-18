@@ -466,16 +466,21 @@ func main() {
 	encoder := json.NewEncoder(os.Stdout)
 	if *profile == "capacity" {
 		prefill := fill(t, "fill", 32, 100000, 1024)
+		fmt.Fprintln(os.Stderr, "capacity prefill finished:", prefill)
 		before, err := diagnostics(t)
 		if err != nil {
 			log.Fatal(err)
 		}
+		started := time.Now()
+		cpu := serverTicks()
 		writes := fill(t, "large", 8, 256, largeSize)
+		elapsed := time.Since(started)
+		cpu = serverTicks() - cpu
 		after, err := diagnostics(t)
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := encoder.Encode(map[string]any{"Prefill": prefill, "Writes": writes, "Before": before, "Stats": after}); err != nil {
+		if err := encoder.Encode(map[string]any{"Prefill": prefill, "Writes": writes, "Before": before, "Stats": after, "WriteSeconds": elapsed.Seconds(), "WriteServerCPUTicks": cpu}); err != nil {
 			log.Fatal(err)
 		}
 		return
