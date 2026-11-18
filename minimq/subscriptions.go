@@ -152,8 +152,7 @@ func (p *Partition) applySubscriptions(tx transaction) error {
 	}
 	for _, sub := range p.subscriptions {
 		for sub.Floor < p.nextOffset() {
-			msg := p.history[sub.Floor-p.firstOffset]
-			if msg.AcceptedSequence > sub.Registered && !sub.Tasks[sub.Floor].Finished {
+			if !sub.Tasks[sub.Floor].Finished && p.locateHistory(sub.Floor).record.accepted > sub.Registered {
 				break
 			}
 			delete(sub.Tasks, sub.Floor)
@@ -225,7 +224,9 @@ func (p *Partition) Pull(name, worker string, limit Limits) ([]Delivery, error) 
 		if task, found := p.readyRedrive(name, now, limit.Bytes); found {
 			update := task.update()
 			update.NextRedriveAt = now.Upper.Add(redriveInterval)
-			delivery, err := p.grant(&tx, update, task.Message, worker, now)
+			msg := task.Message
+			msg.Body = bytes.Clone(msg.Body)
+			delivery, err := p.grant(&tx, update, msg, worker, now)
 			if err != nil {
 				return nil, err
 			}
@@ -234,21 +235,26 @@ func (p *Partition) Pull(name, worker string, limit Limits) ([]Delivery, error) 
 		}
 	}
 	end := min(p.nextOffset(), sub.Floor+sub.Config.Window)
+	reader := historyReader{dir: p.journal.Dir()}
+	defer reader.close()
 	for offset := sub.Floor; offset < end && len(deliveries) < limit.Messages; offset++ {
-		msg := p.history[offset-p.firstOffset]
 		state, known := sub.Tasks[offset]
-		if msg.AcceptedSequence <= sub.Registered || state.Finished ||
-			state.Attempts >= sub.Config.MaxAttempts ||
+		if state.Finished || state.Attempts >= sub.Config.MaxAttempts ||
 			state.Lease.Token != "" || now.Lower.Before(state.ReadyAt) {
 			continue
 		}
-		if len(msg.Body) > limit.Bytes {
+		loc := p.locateHistory(offset)
+		if loc.record.accepted <= sub.Registered || loc.record.bodyBytes > limit.Bytes {
 			continue
 		}
 		if !known {
-			state.Remaining = sub.Config.taskReserve(len(msg.Body))
+			state.Remaining = sub.Config.taskReserve(loc.record.bodyBytes)
 		}
-		delivery, err := p.grant(&tx, taskUpdate{Subscription: name, Offset: offset, State: state}, msg.Message, worker, now)
+		msg, err := p.readHistoryLocked(&reader, offset, loc)
+		if err != nil {
+			return nil, err
+		}
+		delivery, err := p.grant(&tx, taskUpdate{Subscription: name, Offset: offset, State: state}, msg, worker, now)
 		if err != nil {
 			return nil, err
 		}
@@ -272,13 +278,6 @@ func (u taskUpdate) instance() string {
 	return historyInstance(u.Offset)
 }
 
-func (p *Partition) messageForTask(u taskUpdate) Message {
-	if u.Redrive != "" {
-		return p.redrives[u.Redrive].Message
-	}
-	return p.history[u.Offset-p.firstOffset].Message
-}
-
 func (p *Partition) grant(tx *transaction, update taskUpdate, msg Message, worker string, now TimeBounds) (Delivery, error) {
 	token, err := newToken()
 	if err != nil {
@@ -290,7 +289,6 @@ func (p *Partition) grant(tx *transaction, update taskUpdate, msg Message, worke
 	update.State.Lease = leaseState{Token: token, Worker: worker, Deadline: deadline}
 	tx.Tasks = append(tx.Tasks, update)
 	tx.ReserveDelta -= transitionReserve
-	msg.Body = bytes.Clone(msg.Body)
 	return Delivery{
 		Message: msg, Instance: update.instance(), Token: token, Attempt: update.State.Attempts, Deadline: deadline,
 	}, nil
