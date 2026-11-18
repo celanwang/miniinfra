@@ -12,8 +12,6 @@ Each component is a separate Go module. Run the checks from its directory.
 go test -race -count=1 ./... && go vet ./... && go build ./...
 ```
 
-GitHub Actions runs these checks on Linux for all three modules on pushes and pull requests to `main`.
-
 ## Commits
 
 Use one English line in the form `type(scope): description`. Name the feature or subsystem you changed in the scope, and start the description with an imperative verb.
