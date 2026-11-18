@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniKV separates capacity experiments by topic and links current contracts from the component guide.
 - MiniDB decouples its TCP client and wire protocol from the query engine and disk storage.
 - MiniKV sends values up to 512 bytes with their reply headers in one TCP write.
 - MiniDB verifies unknown commit results and same-disk recovery after a simulated group sync failure.
