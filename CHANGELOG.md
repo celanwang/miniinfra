@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB reclaims row and index versions between active statement snapshots during long-running queries.
 - MiniMQ assembles message frames directly in sealed segments to reduce checkpoint copying and allocations.
 - MiniKV measures same-shard and cross-shard read latency during large overwrites.
 - MiniMQ batches directory syncs for new checkpoint files before publishing the durable checkpoint head.
