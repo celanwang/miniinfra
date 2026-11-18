@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniMQ binds its address before opening the partition and rejects unexpected positional arguments.
 - MiniDB validates startup and binds its address before opening database files.
 - MiniMQ groups history reads with segment ownership and isolates optional timing observers.
 - MiniKV separates capacity experiments by topic and links current contracts from the component guide.
