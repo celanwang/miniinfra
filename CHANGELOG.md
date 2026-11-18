@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniKV verifies idle connection reclamation and documents how pooled clients recover after a timeout.
 - MiniMQ orders only the earliest batch of expired leases while preserving retry and dead-letter delivery order.
 - MiniDB prefers fully bound non-null unique indexes for equality lookups, reducing waits on tenant-scoped queries.
 - MiniKV verifies ordered pipelined responses and documents the latency tradeoff for small page reads.
