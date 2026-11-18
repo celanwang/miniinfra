@@ -1,6 +1,11 @@
 package engine
 
-import "slices"
+import (
+	"context"
+	"slices"
+	"time"
+	"unsafe"
+)
 
 type ReclaimObservation struct {
 	Sequence  uint64
@@ -10,6 +15,7 @@ type ReclaimObservation struct {
 }
 
 type VersionObservation struct {
+	VersionBytes                                   uint64
 	Current, Private, Required, Deferred, Eligible int
 	Heap, Primary, Secondary                       int
 }
@@ -42,6 +48,11 @@ func (db *DB) ObserveReclamation(names ...string) ReclaimObservation {
 		for _, page := range tbl.pages {
 			for _, row := range page {
 				counts.Heap++
+				// Count version, slot and slice backing storage. Shared text,
+				// table pages and allocator rounding are outside this number.
+				counts.VersionBytes += uint64(unsafe.Sizeof(*row) + unsafe.Sizeof(row) +
+					uintptr(cap(row.values))*unsafe.Sizeof(Value{}) +
+					uintptr(cap(row.indexLinks))*unsafe.Sizeof(indexLink{}))
 				created := row.created.sequence.Load()
 				var ended uint64
 				if row.ended != nil {
@@ -92,5 +103,40 @@ func countCandidates(idx *index, page *indexPage) int {
 			row = row.indexLinks[idx.slot].next
 		}
 	}
+	return result
+}
+
+type SweepMeasurement struct {
+	Steps, Scanned, Removed int
+	Time, Max               time.Duration
+}
+
+// MeasureReclaimSweeps uses the same cadence and sweep as the service while
+// recording wall time, including time waiting for engine latches.
+func (db *DB) MeasureReclaimSweeps(ctx context.Context) <-chan SweepMeasurement {
+	db.stopReclaimer()
+	<-db.reclaimerDone
+	result := make(chan SweepMeasurement, 1)
+	go func() {
+		timer := time.NewTicker(reclaimInterval)
+		defer timer.Stop()
+		var stats SweepMeasurement
+		for {
+			select {
+			case <-ctx.Done():
+				result <- stats
+				return
+			case <-timer.C:
+				started := time.Now()
+				scanned, removed := db.reclaimStep()
+				elapsed := time.Since(started)
+				stats.Steps++
+				stats.Scanned += scanned
+				stats.Removed += removed
+				stats.Time += elapsed
+				stats.Max = max(stats.Max, elapsed)
+			}
+		}
+	}()
 	return result
 }
