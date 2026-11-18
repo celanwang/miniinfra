@@ -86,3 +86,31 @@ func TestCapacityRejectionLeavesSpaceForTaskCompletion(t *testing.T) {
 		t.Fatalf("refused publish took an offset: %+v", got)
 	}
 }
+
+func TestCompactReclaimsExpiredPartialSegment(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cfg := Config{Clock: testClock(&now), SegmentMessages: 16, HistoryRetention: time.Minute}
+	p := openTest(t, dir, cfg)
+	publishTest(t, p, "only-message")
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, cfg)
+	if history, err := p.Read(0, pageLimit); err != nil || len(history.Messages) != 1 {
+		t.Fatalf("unexpired partial segment: %+v, %v", history, err)
+	}
+	now = now.Add(time.Minute)
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Read(0, pageLimit); err == nil {
+		t.Fatal("expired partial segment was not reclaimed")
+	}
+	if got := publishTest(t, p, "later"); got.Offset != 1 {
+		t.Fatalf("new publication reused offset: %+v", got)
+	}
+}

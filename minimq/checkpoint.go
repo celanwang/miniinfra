@@ -185,20 +185,26 @@ func (p *Partition) compact(now TimeBounds) error {
 		sealed += s.Count
 	}
 	width := p.config.SegmentMessages
-	for ; len(p.history)-sealed >= width; sealed += width {
-		chunk := p.history[sealed : sealed+width]
+	for sealed < len(p.history) {
+		count := min(width, len(p.history)-sealed)
+		chunk := p.history[sealed : sealed+count]
+		newest := chunk[0].PublishedAt
+		for _, msg := range chunk[1:] {
+			if msg.PublishedAt.After(newest) {
+				newest = msg.PublishedAt
+			}
+		}
+		if count < width && now.Lower.Before(newest.Add(p.config.HistoryRetention)) {
+			break
+		}
 		data, err := encodeSegment(chunk)
 		if err != nil {
 			return err
 		}
-		s := segment{Base: chunk[0].Offset, Count: width, Bytes: int64(len(data))}
-		for _, msg := range chunk {
-			if msg.PublishedAt.After(s.Newest) {
-				s.Newest = msg.PublishedAt
-			}
-		}
+		s := segment{Base: chunk[0].Offset, Count: count, Bytes: int64(len(data)), Newest: newest}
 		image.Segments = append(image.Segments, s)
 		files[s.name()] = data
+		sealed += count
 	}
 	floor := p.nextOffset()
 	for _, sub := range p.subscriptions {
