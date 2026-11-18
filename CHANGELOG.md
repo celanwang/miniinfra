@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniMQ releases one extra bounded batch between maintenance ticks to shorten waits during scheduled delivery bursts.
 - MiniDB stops canceled row scans at bounded intervals so writers can regain the table lock promptly.
 - MiniKV documents when a near-full shard can accept a 64 KiB refill after keys expire.
 - MiniDB releases locks promptly when its Go client cancels an in-flight request and preserves final replies after a TCP half-close.
