@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniMQ writes large WAL frames without copying their payloads while preserving the on-disk format and sync order.
 - MiniDB batches checkpoint page writes to shorten commit stalls while preserving the recovery format.
 - MiniKV removes the unused two-fill admission policy from the server and keeps the original comparison reproducible.
 - MiniKV verifies idle connection reclamation and documents how pooled clients recover after a timeout.
