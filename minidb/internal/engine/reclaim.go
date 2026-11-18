@@ -150,9 +150,7 @@ func (row *version) obsolete(views *reclaimViews) bool {
 
 func (tbl *table) removeVersion(page, slot int, row *version) {
 	for i := range tbl.indexes {
-		idx := &tbl.indexes[i]
-		key, _ := key(row.values, idx.def.Columns)
-		idx.remove(key, row)
+		tbl.indexes[i].remove(row)
 	}
 	if row.next != nil {
 		row.next.previous = row.previous

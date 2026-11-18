@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/celanwang/miniinfra/minidb/client"
 	"github.com/celanwang/miniinfra/minidb/internal/engine"
@@ -28,6 +29,11 @@ func TestTCPSecondaryIndexWritesRecover(t *testing.T) {
 	const byLocation = "select id from secondary_stock where region = ? and bin_label = ?"
 	const byRequest = "select id from secondary_stock where request_id = ?"
 	const move = "update secondary_stock set region = ?, bin_label = ?, qty = ? where id = ?"
+	locationCount := func(region, bin string, want int) bool {
+		key := []engine.Value{engine.String(region), engine.String(bin)}
+		got, ok := store.IndexCandidates("secondary_stock", "by_location", key)
+		return ok && got == want
+	}
 	check := func(conn secondaryQueryer, query string, expected []int, args ...any) {
 		t.Helper()
 		checkSecondaryIDs(t, conn, query, expected, args...)
@@ -53,12 +59,22 @@ func TestTCPSecondaryIndexWritesRecover(t *testing.T) {
 	check(active, byLocation, []int{2}, "east\x00rack", "shelf")
 	check(pool, byLocation, nil, "west", "rack-b")
 	check(pool, byLocation, []int{1, 2}, "east\x00rack", "shelf")
+	// Roll back both a chain head on the shared key and the only entry
+	// on the temporary key.
+	execSQL(t, active, move, "east\x00rack", "shelf", 12, 1)
 	if err := active.Rollback(); err != nil {
 		t.Fatal(err)
 	}
+	until(t, "reclamation of rolled-back secondary entries", 2*time.Second, func() bool {
+		return locationCount("east\x00rack", "shelf", 2) && locationCount("west", "rack-b", 0)
+	})
 	check(pool, byLocation, nil, "west", "rack-b")
 	check(pool, byLocation, []int{1, 2}, "east\x00rack", "shelf")
 	execSQL(t, pool, move, "west", "rack-b", 12, 1)
+	until(t, "reclamation of committed old secondary key", 2*time.Second, func() bool {
+		return locationCount("east\x00rack", "shelf", 1) && locationCount("west", "rack-b", 1)
+	})
+	check(pool, byLocation, []int{2}, "east\x00rack", "shelf")
 
 	checkRecovered := func(oldLocation []int, nullKeys int, qty int64) {
 		t.Helper()
