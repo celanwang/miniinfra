@@ -218,11 +218,12 @@ func TestLargeTCPReplyReturnsOutboundBudget(t *testing.T) {
 			if cache.Set("k", old, 0, false) != store.Stored {
 				t.Fatal("could not store old value")
 			}
-			slow.exchange(t, "GET 1\nk", fmt.Sprintf("VALUE %d\n", len(old)))
+			slow.exchange(t, "GET 1\nkSET 1 1 NONE\nzZ", fmt.Sprintf("VALUE %d\n", len(old)))
 			waitBudget(t, &s.outbound, int64(len(old)))
 			other := s.pipe(t)
 			other.exchange(t, "SET 1 3 NONE\nknew", "STORED\n")
 			other.exchange(t, "GET 1\nk", "BUSY\n")
+			other.exchange(t, "GET 1\nz", "MISS\n")
 
 			switch ending {
 			case "success":
@@ -230,11 +231,15 @@ func TestLargeTCPReplyReturnsOutboundBudget(t *testing.T) {
 				if n, err := io.ReadFull(slow.reader, payload); err != nil || !bytes.Equal(payload, old) {
 					t.Fatalf("old TCP response: got %d bytes, error %v", n, err)
 				}
+				slow.line(t, "STORED\n")
+				other.send(t, "GET 1\nz")
+				other.value(t, "Z")
 			case "deadline":
 				waitBudget(t, &s.outbound, 0)
 				if n, err := io.Copy(io.Discard, slow.reader); err != nil || n >= int64(len(old)) {
 					t.Fatalf("deadline should end an incomplete reply: got %d bytes, error %v", n, err)
 				}
+				other.exchange(t, "GET 1\nz", "MISS\n")
 			case "disconnect":
 				_ = slow.Close()
 			}
@@ -245,11 +250,8 @@ func TestLargeTCPReplyReturnsOutboundBudget(t *testing.T) {
 	}
 }
 
-func TestTCPCommandsAndShutdown(t *testing.T) {
-	s := testServer(t, 3, func(c *Config) {
-		c.MaxValueBytes = 1000
-		c.SweepInterval = time.Millisecond
-	})
+func (s *Server) listenTestTCP(t *testing.T) (string, context.CancelFunc) {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -268,13 +270,29 @@ func TestTCPCommandsAndShutdown(t *testing.T) {
 			t.Error("server did not stop")
 		}
 	})
-	conn, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+	return listener.Addr().String(), cancel
+}
+
+func dialTestTCP(t *testing.T, address string) *client {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", address, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	c := &client{conn, bufio.NewReader(conn)}
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	return &client{conn, bufio.NewReader(conn)}
+}
+
+func TestTCPCommandsAndShutdown(t *testing.T) {
+	s := testServer(t, 3, func(c *Config) {
+		c.MaxValueBytes = 1000
+		c.SweepInterval = time.Millisecond
+	})
+	address, cancel := s.listenTestTCP(t)
+	c := dialTestTCP(t, address)
 	c.exchange(t, "GET 2\nk\n", "MISS\n")
 	c.exchange(t, "SET 2 3 700 NX\nk\na\x00b", "STORED\n")
 	c.exchange(t, "SET 2 3 NONE NX\nk\nnew", "EXISTS\n")
@@ -294,6 +312,68 @@ func TestTCPCommandsAndShutdown(t *testing.T) {
 	c.value(t, "")
 	cancel()
 	c.end(t)
+}
+
+func TestTCPPipelinePreservesOrderAndContinuesAfterRejection(t *testing.T) {
+	cache, err := store.New(store.Config{
+		Shards: 1, BytesPerShard: 2 << 20, EntriesPerShard: 8, Samples: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.OutboundPerConn = 256 << 10
+	s, err := New(cache, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	large := strings.Repeat("l\n\x00b", 64<<10)
+	if cache.Set("l", []byte(large), 0, false) != store.Stored ||
+		cache.Set("x", make([]byte, len(large)+1), 0, false) != store.Stored {
+		t.Fatal("could not prefill large values")
+	}
+	address, _ := s.listenTestTCP(t)
+	c := dialTestTCP(t, address)
+	c.send(t, "SET 1 4 NONE\naold\n"+"GET 1\na"+"GET 1\nl"+
+		"SET 1 4 NONE NX\naBAD!"+"GET 1\nx"+"SET 1 4 NONE\nbnew\x00"+
+		"GET 1\na"+"GET 1\nb")
+	c.line(t, "STORED\n")
+	c.value(t, "old\n")
+	c.value(t, large)
+	c.line(t, "EXISTS\n")
+	c.line(t, "BUSY\n")
+	c.line(t, "STORED\n")
+	c.value(t, "old\n")
+	c.value(t, "new\x00")
+}
+
+func TestTCPPipelineClosesOnIncompleteRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name, suffix, rejected string
+	}{
+		{"truncated", "SET 1 5 NONE\nkxx", ""},
+		{"inbound busy", "SET 1 8 NONE\nk12345678SET 1 1 NONE\nzZ", "BUSY\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testServer(t, 4, func(c *Config) { c.InboundPerConn = 8 })
+			address, _ := s.listenTestTCP(t)
+			c := dialTestTCP(t, address)
+			c.send(t, "SET 1 3 NONE\nkold"+tc.suffix)
+			if err := c.Conn.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			c.line(t, "STORED\n")
+			if tc.rejected != "" {
+				c.line(t, tc.rejected)
+			}
+			c.end(t)
+			waitBudget(t, &s.inbound, 0)
+			fresh := dialTestTCP(t, address)
+			fresh.send(t, "GET 1\nkGET 1\nz")
+			fresh.value(t, "old")
+			fresh.line(t, "MISS\n")
+		})
+	}
 }
 
 func TestUnconsumedRequestClosesConnection(t *testing.T) {
