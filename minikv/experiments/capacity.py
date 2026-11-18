@@ -74,19 +74,19 @@ def rss(container):
     return memory
 
 
-def replay(binaries, image, name, profile, rate, duration):
+def replay(binaries, image, name, profile, rate, duration, tick):
     with engine(binaries, image, name) as container:
         flags = [
             "run", "--rm", "--pull=never", "--network", f"container:{container}",
             "--pid", f"container:{container}", "--cpus=4",
             "--memory=256m", "--memory-swap=256m", "-e", "GOMAXPROCS=4",
             "--mount", mount(binaries), "--entrypoint", "/work/load", image,
-            "-profile", profile, "-rate", rate, "-duration", duration,
+            "-profile", profile, "-rate", rate, "-duration", duration, "-tick", tick,
         ]
         if name == "redis":
             flags.append("-redis")
         result = json.loads(docker(*flags))
-        metadata = {"Engine": name, "Profile": profile, "Rate": rate, "Duration": duration}
+        metadata = {"Engine": name, "Profile": profile, "Rate": rate, "Duration": duration, "Tick": tick}
         print(json.dumps({**metadata, **rss(container), **result}), flush=True)
 
 
@@ -106,6 +106,7 @@ def main():
     parser.add_argument("--rates", default="10000,30000,60000,100000,150000")
     parser.add_argument("--profiles", default="small,mixed,slow,capacity")
     parser.add_argument("--duration", default="6s")
+    parser.add_argument("--tick", default="1ms", help="schedule slots in fixed-duration batches")
     args = parser.parse_args()
     profiles = args.profiles.split(",")
     if any(p not in ("small", "mixed", "slow", "capacity") for p in profiles):
@@ -123,7 +124,7 @@ def main():
         ):
             engines = ("minikv", "redis") if i % 2 == 0 else ("redis", "minikv")
             for name in engines:
-                replay(binaries, args.image, name, profile, rate, args.duration)
+                replay(binaries, args.image, name, profile, rate, args.duration, args.tick)
 
 
 if __name__ == "__main__":

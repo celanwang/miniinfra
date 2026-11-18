@@ -243,16 +243,17 @@ func (l lane) run(queue <-chan arrival) (counts, sample) {
 	return res, timings
 }
 
-func schedule(start time.Time, window time.Duration, rate int, ordinaryQ, backgroundQ chan arrival, ordinary, background *counts) {
+func schedule(start time.Time, window, tick time.Duration, rate int, ordinaryQ, backgroundQ chan arrival, ordinary, background *counts) {
 	nextSmall, nextBackground := 0, 0
-	for tick := 0; tick < int(window/time.Millisecond); tick++ {
-		at := start.Add(time.Duration(tick) * time.Millisecond)
-		time.Sleep(time.Until(at) - 300*time.Microsecond)
+	for elapsed := time.Duration(0); elapsed < window; elapsed += tick {
+		at := start.Add(elapsed)
+		time.Sleep(time.Until(at) - min(300*time.Microsecond, tick))
 		for time.Now().Before(at) {
 		}
 		late := time.Since(at) > grace
-		nextSmall = offer(ordinaryQ, ordinary, at, late, nextSmall, (tick+1)*rate/1000)
-		nextBackground = offer(backgroundQ, background, at, late, nextBackground, (tick+1)*40/1000)
+		through := min(elapsed+tick, window)
+		nextSmall = offer(ordinaryQ, ordinary, at, late, nextSmall, int(through*time.Duration(rate)/time.Second))
+		nextBackground = offer(backgroundQ, background, at, late, nextBackground, int(through*40/time.Second))
 	}
 	close(ordinaryQ)
 	close(backgroundQ)
@@ -304,7 +305,7 @@ func percentile(times []time.Duration, perThousand int) float64 {
 	return float64(times[i]) / float64(time.Microsecond)
 }
 
-func runCurve(t target, profile string, rate int, window time.Duration) (result, error) {
+func runCurve(t target, profile string, rate int, window, tick time.Duration) (result, error) {
 	load := prepare(t)
 	warm := client{target: t}
 	defer warm.close()
@@ -325,10 +326,10 @@ func runCurve(t target, profile string, rate int, window time.Duration) (result,
 		}
 		lanes[i] = lane{client: c, load: load, profile: profile, background: i >= ordinary}
 	}
-	return runLanes(lanes, rate, window), nil
+	return runLanes(lanes, rate, window, tick), nil
 }
 
-func runLanes(lanes []lane, rate int, window time.Duration) result {
+func runLanes(lanes []lane, rate int, window, tick time.Duration) result {
 	aggregate := result{
 		Ordinary:   counts{Responses: make(map[outcome]int)},
 		Background: counts{Responses: make(map[outcome]int)},
@@ -350,7 +351,7 @@ func runLanes(lanes []lane, rate int, window time.Duration) result {
 			laneCounts[i], timings[i] = l.run(queue)
 		})
 	}
-	schedule(start, window, rate, ordinaryQ, backgroundQ, &aggregate.Ordinary, &aggregate.Background)
+	schedule(start, window, tick, rate, ordinaryQ, backgroundQ, &aggregate.Ordinary, &aggregate.Background)
 	wg.Wait()
 	aggregate.ClientCPUSeconds = cpuSeconds() - before
 	aggregate.ServerCPUTicks = serverTicks() - serverBefore
@@ -459,6 +460,7 @@ func main() {
 	profile := flag.String("profile", "small", "small, mixed, slow, or capacity")
 	rate := flag.Int("rate", 10000, "ordinary offered requests per second")
 	window := flag.Duration("duration", 6*time.Second, "offered workload duration")
+	tick := flag.Duration("tick", time.Millisecond, "fixed arrival batch interval")
 	flag.Parse()
 	t := target{address: "127.0.0.1:7321", redis: *redis}
 	encoder := json.NewEncoder(os.Stdout)
@@ -478,10 +480,10 @@ func main() {
 		}
 		return
 	}
-	if (*profile != "small" && *profile != "mixed" && *profile != "slow") || *rate <= 0 || *window <= 0 {
+	if (*profile != "small" && *profile != "mixed" && *profile != "slow") || *rate <= 0 || *window <= 0 || *tick <= 0 {
 		log.Fatal("invalid profile, rate, or duration")
 	}
-	load, err := runCurve(t, *profile, *rate, *window)
+	load, err := runCurve(t, *profile, *rate, *window, *tick)
 	if err != nil {
 		log.Fatal(err)
 	}
