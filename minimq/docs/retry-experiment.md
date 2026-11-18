@@ -52,3 +52,59 @@ Keep the bounded selection. Ordering a small durable prefix saves work in both e
 The boundary regression exercises the trusted lower time bound, textual ordering of tied history offsets, subscription order and scope, count limits, and a byte limit that stops before a smaller later candidate. It reopens between batches, rejects the superseded token, and verifies each persisted dead letter and body. A second case ties a history lease with a redrive lease and verifies the original order and source link. The pre-existing interrupted conversion test checks replay at the previous HEAD.
 
 In a two-binary check, `59c33e4` created the segments, leases, and an ordinary ACK receipt. The candidate opened that directory, committed one final-attempt conversion, and exited before closing the partition. The original binary reopened, verified the committed letter, finished both subscriptions' remaining expirations, and recovered the ordinary receipt and a new attempt on the original retry instance.
+
+## Dead-letter transaction framing
+
+Run the same staggered expiry workload to break down the first 8 MiB dead-letter batch. Run the live control with the same fixture and no expirations.
+
+```sh
+GOWORK=off MINIMQ_RETRY_EXPERIMENT=expired MINIMQ_RETRY_DEADLINES=staggered go test -run '^TestRetryExperiment$' -count=1 -v .
+GOWORK=off MINIMQ_RETRY_EXPERIMENT=live MINIMQ_RETRY_DEADLINES=staggered go test -run '^TestRetryExperiment$' -count=1 -v .
+GOWORK=off go test -run '^$' -bench '^BenchmarkPrepareWALFrame$' -benchtime=120x ./internal/journal
+```
+
+The baseline `5bfa9c8` adds phase measurements to production behavior from `9fa25a7`. Candidate `f6b360a` uses two positional WAL writes for JSON payloads of at least 1 MiB. It writes the eight-byte length/CRC header followed by the existing JSON buffer. Smaller records still use the contiguous frame and one WAL write. The bytes and accounted frame size are identical. The WAL sync still precedes staging and syncing the replacement HEAD and syncing its directory.
+
+Runs were serial on a shared macOS 15.5 arm64 host using Go 1.27.3 and local APFS. One-minute load at trial starts was 1.4–3.1. Five alternating trials per version ran the expired workload and framing microbenchmark. Three per version ran the live workload. Compile the module and journal test binaries for each revision with `GOWORK=off go test -c -o <output> .` and `GOWORK=off go test -c -o <output> ./internal/journal`. Run the module test binary with the workload environment variables above and `-test.run '^TestRetryExperiment$' -test.v`. Run the journal test binary with `-test.run '^$' -test.bench '^BenchmarkPrepareWALFrame$' -test.benchtime=120x`.
+
+| First dead-letter batch, 128 × 64 KiB | Baseline median | Split WAL median |
+| --- | ---: | ---: |
+| Read sealed frame, including open and CRC | 3.94 ms | 3.63 ms |
+| Decode sealed JSON and body | 18.73 ms | 18.27 ms |
+| Encode transaction JSON | 8.80 ms | 8.43 ms |
+| Prepare length/CRC frame | 1.96 ms | 1.48 ms |
+| Write WAL and staged HEAD contents | 1.11 ms | 1.13 ms |
+| Sync WAL, staged HEAD, and directory | 15.40 ms | 15.24 ms |
+| Whole commit, including sync | 27.84 ms | 26.91 ms |
+| Whole lock hold | 59.48 ms | 57.84 ms |
+
+The committed frame was 11,255,882 bytes in every trial. The write column measures file write calls. The commit total also covers capacity checking, file administration, and applying state. The lock total includes candidate selection and constructing the dead-letter records. Each row has its own median. One baseline trial reached 75.87 ms of lock hold and 24.97 ms of sync time. The largest costs remain decoding and synchronization.
+
+| Isolated frame preparation | Baseline median | Split WAL median | Bytes allocated per operation |
+| --- | ---: | ---: | ---: |
+| Small ACK, 564-byte payload | 168 ns | 143 ns | 576 → 576 |
+| Pure retry, 64,417-byte payload | 11.23 µs | 10.86 µs | 65,536 → 65,536 |
+| Dead-letter batch, 11,255,874-byte payload | 1.323 ms | 0.945 ms | 11,264,024 → 8 |
+
+The microbenchmark isolates frame preparation. JSON encoding still allocates its output, and dead letters still hold the decoded bodies. In the mixed workload the ordinary ACK and Pull P99 medians were 38.91 → 37.04 ms and 53.99 → 51.72 ms. With all leases live they were 16.98 → 16.11 ms and 16.77 → 16.94 ms. Pure retry batches held the lock for 23.90 → 24.10 ms with median commits of 15.18 → 14.83 ms across 20 batches per version. The stable benefit is removal of one approximately 10.74 MiB frame allocation and copy per full batch. The trade is one extra WAL write call on large frames. Keep the split on that basis.
+
+### WAL recovery and TCP checks
+
+```sh
+GOWORK=off go test -run '^TestDeadLetterWALProcessExit$' -count=1 -v .
+GOWORK=off MINIMQ_WAL_TCP_TEST=1 go test -run '^TestFullDeadLetterBatchOverTCP$' -count=1 -v ./cmd/minimqd
+```
+
+The journal tests compare bytes on both sides of the split threshold, count all three durability syncs, and force an error on the body write. The process test starts from copies of an on-disk fixture with 128 expired leases on 64 KiB sealed messages. It exits after the header write, after the WAL sync, and after the HEAD directory sync. Recovery discards the two unpublished attempts and reads the full batch at the published boundary. The same test checks capacity rejection, reservation accounting, payload identity, an ordinary ACK receipt, and one dead letter per lease.
+
+To reopen these same candidate-written directories with the original production code, build a test binary from `9fa25a7` after copying only the recovery driver into its module. The candidate still performs each write and interruption.
+
+```sh
+wal_compat_dir=$(mktemp -d)
+git -C .. archive 9fa25a7 minimq | tar -xf - -C "$wal_compat_dir"
+cp wal_test.go "$wal_compat_dir/minimq/"
+(cd "$wal_compat_dir/minimq" && GOWORK=off go test -c -o "$wal_compat_dir/original.test" .)
+GOWORK=off MINIMQ_WAL_RECOVERY_BINARY="$wal_compat_dir/original.test" go test -run '^TestDeadLetterWALProcessExit$' -count=1 -v .
+```
+
+All three boundaries also passed with the original binary. The TCP test runs the broker's actual listener and maintenance loop, confirms one full visible batch of 128, and checks the same IDs and bodies plus an ordinary ACK receipt after the daemon exits and restarts. These checks exercise process interruption and local recovery.
