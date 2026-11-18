@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniKV reuses the connection reply buffer for short status lines, eliminating their per-response allocation.
 - MiniMQ verifies lease recovery and idempotent acknowledgment retries after a lost reply and broker restart.
 - MiniDB skips redundant secondary index key encoding during uniqueness checks on inserts and updates.
 - MiniKV verifies that concurrent conditional refills publish one complete value and start its TTL at publication.
