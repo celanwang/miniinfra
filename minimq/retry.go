@@ -2,7 +2,8 @@ package minimq
 
 import (
 	"bytes"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -109,6 +110,21 @@ func (p *Partition) AdvanceRetries(limit Limits) (int, error) {
 	return p.expireLocked("", now, limit)
 }
 
+type expiredLease struct {
+	update   taskUpdate
+	instance string
+}
+
+func compareExpiredLeases(a, b expiredLease) int {
+	if deadline := a.update.State.Lease.Deadline.Compare(b.update.State.Lease.Deadline); deadline != 0 {
+		return deadline
+	}
+	if subscription := strings.Compare(a.update.Subscription, b.update.Subscription); subscription != 0 {
+		return subscription
+	}
+	return strings.Compare(a.instance, b.instance)
+}
+
 func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int, error) {
 	var stats *retryTiming
 	var start time.Time
@@ -116,7 +132,30 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 		stats = &p.timings.retry
 		start = time.Now()
 	}
-	var expired []taskUpdate
+	var expired []expiredLease
+	order := func() {
+		var began time.Time
+		if stats != nil {
+			began = time.Now()
+		}
+		slices.SortFunc(expired, compareExpiredLeases)
+		if stats != nil {
+			stats.order += time.Since(began)
+		}
+	}
+	collect := func(update taskUpdate) {
+		if stats != nil {
+			stats.candidates++
+		}
+		expired = append(expired, expiredLease{update: update, instance: update.instance()})
+		// A batch can only commit a prefix of this order. A candidate
+		// behind the first limit.Messages can never enter that prefix.
+		if len(expired) == 2*limit.Messages {
+			order()
+			clear(expired[limit.Messages:])
+			expired = expired[:limit.Messages]
+		}
+	}
 	for subName, sub := range p.subscriptions {
 		if name != "" && name != subName {
 			continue
@@ -126,7 +165,7 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 		}
 		for offset, state := range sub.Tasks {
 			if state.Lease.Token != "" && !now.Lower.Before(state.Lease.Deadline) {
-				expired = append(expired, taskUpdate{Subscription: subName, Offset: offset, State: state})
+				collect(taskUpdate{Subscription: subName, Offset: offset, State: state})
 			}
 		}
 	}
@@ -136,32 +175,22 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 	for _, task := range p.redrives {
 		if (name == "" || name == task.Subscription) && task.State.Lease.Token != "" &&
 			!now.Lower.Before(task.State.Lease.Deadline) {
-			expired = append(expired, task.update())
+			collect(task.update())
 		}
 	}
 	if stats != nil {
-		stats.scan = time.Since(start)
-		stats.candidates = len(expired)
-		start = time.Now()
+		stats.scan = time.Since(start) - stats.order
 	}
-	sort.Slice(expired, func(i, j int) bool {
-		a, b := expired[i], expired[j]
-		if !a.State.Lease.Deadline.Equal(b.State.Lease.Deadline) {
-			return a.State.Lease.Deadline.Before(b.State.Lease.Deadline)
-		}
-		if a.Subscription != b.Subscription {
-			return a.Subscription < b.Subscription
-		}
-		return a.instance() < b.instance()
-	})
+	order()
+	expired = expired[:min(len(expired), limit.Messages)]
 	if stats != nil {
-		stats.order = time.Since(start)
 		start = time.Now()
 	}
 	tx := transaction{Lower: now.Lower}
 	reader := historyReader{dir: p.journal.Dir()}
 	defer reader.close()
-	for _, update := range expired {
+	for _, candidate := range expired {
+		update := candidate.update
 		size := 0
 		if update.State.Attempts >= p.subscriptions[update.Subscription].Config.MaxAttempts {
 			if update.Redrive != "" {
@@ -170,7 +199,7 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 				size = p.locateHistory(update.Offset).record.bodyBytes
 			}
 		}
-		if len(tx.Tasks) == limit.Messages || size > limit.Bytes {
+		if size > limit.Bytes {
 			break
 		}
 		if _, err := p.recordFailure(&tx, &reader, update, "lease expired", update.State.Lease.Deadline, now.Upper); err != nil {
@@ -248,7 +277,7 @@ func (p *Partition) ListDeadLetters(name, after string, limit int) ([]DeadLetter
 			ids = append(ids, id)
 		}
 	}
-	sort.Strings(ids)
+	slices.Sort(ids)
 	var letters []DeadLetter
 	bytesLeft := MaxBatchBytes
 	for _, id := range ids[:min(limit, len(ids))] {
