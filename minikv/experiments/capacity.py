@@ -112,12 +112,12 @@ def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit
         print(json.dumps({**metadata, **result}), flush=True)
 
 
-def build(binaries, module):
+def build(binaries, module, peer_module=None):
     arch = docker("info", "--format", "{{.Architecture}}")
     goarch = {"aarch64": "arm64", "x86_64": "amd64", "arm64": "arm64", "amd64": "amd64"}[arch]
     env = {**os.environ, "CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": goarch}
     subprocess.run(["go", "test", "-c", "-o", binaries / "peer", "./internal/server"],
-                   cwd=module, env=env, check=True)
+                   cwd=peer_module or module, env=env, check=True)
     subprocess.run(["go", "build", "-o", binaries / "load", "./experiments/load"],
                    cwd=module, env=env, check=True)
 
@@ -133,6 +133,7 @@ def main():
     parser.add_argument("--server-cpus", help="pin the server to a Docker CPU set")
     parser.add_argument("--driver-cpus", help="pin the driver to a Docker CPU set")
     parser.add_argument("--pressure-lengths", default="fixed", choices=("fixed", "repeated", "adjacent"))
+    parser.add_argument("--peer-module", type=Path, help="build the MiniKV peer from another checkout")
     args = parser.parse_args()
     profiles = args.profiles.split(",")
     if any(p not in ("small", "mixed", "slow", "capacity", "pressure") for p in profiles):
@@ -144,7 +145,7 @@ def main():
     module = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(dir="/tmp") as scratch:
         binaries = Path(scratch).resolve()
-        build(binaries, module)
+        build(binaries, module, args.peer_module.resolve() if args.peer_module else None)
         for i, (profile, rate) in enumerate(
             (p, r) for p in profiles for r in ([0] if p in ("capacity", "pressure") else rates)
         ):
