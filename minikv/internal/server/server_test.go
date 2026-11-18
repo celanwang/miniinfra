@@ -148,7 +148,7 @@ func TestEvictedValueOutlivesSlotWhileReplyIsBlocked(t *testing.T) {
 			slow := s.pipe(t)
 			other := s.pipe(t)
 			other.exchange(t, "SET 1 3 NONE\nkold", "STORED\n")
-			slow.exchange(t, "GET 1\nk", "VALUE 3\n")
+			slow.send(t, "GET 1\nk")
 			waitBudget(t, &s.outbound, 3)
 
 			other.exchange(t, "GET 1\nk", "BUSY\n")
@@ -158,10 +158,7 @@ func TestEvictedValueOutlivesSlotWhileReplyIsBlocked(t *testing.T) {
 			waitBudget(t, &s.outbound, 3)
 			switch ending {
 			case "success":
-				payload := make([]byte, 3)
-				if _, err := io.ReadFull(slow.reader, payload); err != nil || string(payload) != "old" {
-					t.Fatalf("old response = %q (%v)", payload, err)
-				}
+				slow.value(t, "old")
 			case "deadline":
 				waitBudget(t, &s.outbound, 0)
 				slow.end(t)

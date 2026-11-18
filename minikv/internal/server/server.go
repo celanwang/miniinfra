@@ -149,11 +149,13 @@ func (s *Server) sweep(ctx context.Context) {
 	}
 }
 
+const replyHeaderBytes = 32
+
 func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReaderSize(conn, headerBytes)
 	var keyBuffer []byte
-	reply := make([]byte, 0, 32)
+	reply := make([]byte, 0, replyHeaderBytes)
 	for {
 		if conn.SetReadDeadline(time.Now().Add(s.config.ReadTimeout)) != nil {
 			return
@@ -174,13 +176,13 @@ func (s *Server) serveConn(conn net.Conn) {
 			_ = s.writeStatus(conn, reply, "TOO_LARGE\n")
 			return
 		}
-		if !s.handle(conn, reader, &keyBuffer, reply, req) {
+		if !s.handle(conn, reader, &keyBuffer, &reply, req) {
 			return
 		}
 	}
 }
 
-func (s *Server) handle(conn net.Conn, reader *bufio.Reader, keyBuffer *[]byte, reply []byte, req request) bool {
+func (s *Server) handle(conn net.Conn, reader *bufio.Reader, keyBuffer, reply *[]byte, req request) bool {
 	bufferSize := s.writes.rounded(req.valueBytes, s.config.MaxValueBytes)
 	inBytes, reserved := s.reserveInbound(req.keyBytes, bufferSize)
 	if !reserved && bufferSize != req.valueBytes {
@@ -188,7 +190,7 @@ func (s *Server) handle(conn net.Conn, reader *bufio.Reader, keyBuffer *[]byte, 
 		inBytes, reserved = s.reserveInbound(req.keyBytes, bufferSize)
 	}
 	if !reserved {
-		_ = s.writeStatus(conn, reply, "BUSY\n")
+		_ = s.writeStatus(conn, *reply, "BUSY\n")
 		return false
 	}
 
@@ -224,7 +226,7 @@ func (s *Server) handle(conn net.Conn, reader *bufio.Reader, keyBuffer *[]byte, 
 	case store.Invalid:
 		response = "BAD_REQUEST\n"
 	}
-	return s.writeStatus(conn, reply, response) == nil
+	return s.writeStatus(conn, *reply, response) == nil
 }
 
 func (s *Server) reserveInbound(keySize, valueSize int) (int64, bool) {
@@ -273,13 +275,22 @@ func (s *Server) writeStatus(conn net.Conn, reply []byte, status string) error {
 	return err
 }
 
-func (s *Server) writeValue(conn net.Conn, header, value []byte) error {
+func (s *Server) writeValue(conn net.Conn, reply *[]byte, value []byte) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout)); err != nil {
 		return err
 	}
-	header = append(header[:0], "VALUE "...)
+	const smallValueBytes = 512
+	pack := len(value) > 0 && len(value) <= smallValueBytes
+	if pack && cap(*reply) < replyHeaderBytes+smallValueBytes {
+		*reply = make([]byte, 0, replyHeaderBytes+smallValueBytes)
+	}
+	header := append((*reply)[:0], "VALUE "...)
 	header = strconv.AppendInt(header, int64(len(value)), 10)
 	header = append(header, '\n')
+	if pack {
+		_, err := conn.Write(append(header, value...))
+		return err
+	}
 	if _, err := conn.Write(header); err != nil {
 		return err
 	}
