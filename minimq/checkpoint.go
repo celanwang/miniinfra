@@ -153,6 +153,9 @@ func (p *Partition) compact(now TimeBounds) error {
 	for _, sub := range p.subscriptions {
 		floor = min(floor, sub.Floor)
 	}
+	if p.readStart != nil {
+		floor = min(floor, *p.readStart)
+	}
 	removed := 0
 	for _, s := range image.Segments {
 		end := s.Base + uint64(s.Count)
@@ -199,6 +202,9 @@ func (p *Partition) compact(now TimeBounds) error {
 	}
 	clear(p.tail[:sealed])
 	p.tail = image.Tail
+	if len(p.tail) == 0 {
+		p.tail = nil
+	}
 	p.tailOffset += uint64(sealed)
 	p.firstOffset, p.segments = image.First, image.Segments
 	p.timeLower, p.checkpointBytes = image.TimeLower, int64(len(payload))

@@ -148,3 +148,100 @@ func TestExpiredSealedLeaseCopiesDeadLetterBeforeReclaim(t *testing.T) {
 		t.Fatalf("redriven record = %+v", redriven)
 	}
 }
+
+func TestHistoryPagePinsItsSegmentsDuringCompaction(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cfg := Config{Clock: testClock(&now), SegmentMessages: 2, HistoryRetention: time.Second}
+	dir := t.TempDir()
+	p := openTest(t, dir, cfg)
+	for range 5 {
+		publishTest(t, p, fmt.Sprint(p.nextOffset()))
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	func() {
+		p.historyReadMu.Lock()
+		defer p.historyReadMu.Unlock()
+		batch, err := p.planHistoryRead(3, pageLimit)
+		if err != nil || len(batch) != 2 {
+			t.Fatalf("history plan = %v, %v", batch, err)
+		}
+		defer p.finishHistoryRead(nil)
+		done := make(chan error, 1)
+		go func() { done <- p.Compact() }()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if status, err := p.Status(); err != nil || status.FirstOffset != 2 {
+			t.Fatalf("checkpoint passed the active reader: %+v, %v", status, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "history-0000000000000000")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unreferenced prefix still on disk: %v", err)
+		}
+		reader := historyReader{dir: dir}
+		defer reader.close()
+		for i, loc := range batch {
+			offset := uint64(3 + i)
+			msg, err := reader.read(offset, loc)
+			if err != nil || msg.Offset != offset || string(msg.Body) != fmt.Sprint(offset) {
+				t.Fatalf("snapshot at %d after checkpoint = %+v, %v", offset, msg, err)
+			}
+		}
+	}()
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	var gap *OffsetGap
+	if _, err := p.Read(3, pageLimit); !errors.As(err, &gap) || gap.First != 5 {
+		t.Fatalf("history after read released its segments: %v", err)
+	}
+}
+
+func TestReadRacingReclaimReturnsPageOrGap(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cfg := Config{Clock: testClock(&now), SegmentMessages: 1, HistoryRetention: time.Second}
+	p := openTest(t, t.TempDir(), cfg)
+	for i := range 4 {
+		publishTest(t, p, fmt.Sprint(i))
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	type result struct {
+		page HistoryPage
+		err  error
+	}
+	start := make(chan struct{})
+	pages := make(chan result, 8)
+	for range cap(pages) {
+		go func() {
+			<-start
+			page, err := p.Read(0, pageLimit)
+			pages <- result{page: page, err: err}
+		}()
+	}
+	close(start)
+	compactErr := p.Compact()
+	for range cap(pages) {
+		r := <-pages
+		var gap *OffsetGap
+		if errors.As(r.err, &gap) && gap.First == 4 {
+			continue
+		}
+		if r.err != nil || r.page.Next != 4 || len(r.page.Messages) != 4 {
+			t.Errorf("read during reclaim = %+v, %v", r.page, r.err)
+			continue
+		}
+		for i, msg := range r.page.Messages {
+			if msg.Offset != uint64(i) || string(msg.Body) != fmt.Sprint(i) {
+				t.Errorf("wrong record during reclaim: %+v", msg)
+			}
+		}
+	}
+	if compactErr != nil {
+		t.Fatal(compactErr)
+	}
+}
