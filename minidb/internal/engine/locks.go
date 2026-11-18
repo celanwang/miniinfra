@@ -46,6 +46,11 @@ func (locks *lockManager) acquire(ctx context.Context, tx *Txn, r resource) erro
 		}
 		owner := locks.holders[r]
 		if owner == nil || owner == tx {
+			if tx.done == nil {
+				// Initialize the wake signal before any waiter can see tx.
+				tx.held = make(map[resource]bool)
+				tx.done = make(chan struct{})
+			}
 			locks.holders[r] = tx
 			tx.held[r] = true
 			locks.mu.Unlock()

@@ -199,6 +199,9 @@ func TestUniqueKeyWaitAndDeadlockVictim(t *testing.T) {
 		t.Fatal(err)
 	}
 	commit(t, second)
+	if len(db.locks.waiting) != 0 {
+		t.Fatal("deadlock left a waiting edge behind")
+	}
 	_, fresh := start(t, db)
 	rows, _, err := fresh.Rows(t.Context(), "inventory", []int{1}, []Value{String("request")})
 	if err != nil || len(rows) != 1 || rows[0][0] != Int(803) {
