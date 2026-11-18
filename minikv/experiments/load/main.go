@@ -430,6 +430,10 @@ func diagnostics(t target) (json.RawMessage, error) {
 }
 
 func fill(t target, prefix string, clients, n, size int) map[outcome]int {
+	return fillKeys(t, clients, n, size, func(i int) string { return fmt.Sprintf("%s%06d", prefix, i) })
+}
+
+func fillKeys(t target, clients, n, size int, key func(int) string) map[outcome]int {
 	value := bytes.Repeat([]byte("v"), size)
 	partial := make([]map[outcome]int, clients)
 	var workers sync.WaitGroup
@@ -439,7 +443,7 @@ func fill(t target, prefix string, clients, n, size int) map[outcome]int {
 			defer c.close()
 			partial[i] = make(map[outcome]int)
 			for k := i; k < n; k += clients {
-				cmd := t.makeCommand(fmt.Sprintf("%s%06d", prefix, k), value, size)
+				cmd := t.makeCommand(key(k), value, size)
 				_, result := c.execute(cmd, 0, 0)
 				partial[i][result]++
 			}
@@ -469,7 +473,7 @@ func main() {
 	if *profile == "pressure" && !*redis {
 		switch *lengths {
 		case "fixed", "repeated", "adjacent", "publish", "publish-locality", "publish-aligned",
-			"large-to-half", "half-to-large", "cold-half", "alternating":
+			"large-to-half", "half-to-large", "cold-half", "alternating", "business":
 		default:
 			log.Fatal("invalid pressure length pattern")
 		}
