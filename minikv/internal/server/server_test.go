@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -40,6 +41,11 @@ type client struct {
 func (s *Server) pipe(t *testing.T) *client {
 	t.Helper()
 	server, peer := net.Pipe()
+	return s.testConn(t, server, peer)
+}
+
+func (s *Server) testConn(t *testing.T, server, peer net.Conn) *client {
+	t.Helper()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -164,6 +170,76 @@ func TestEvictedValueOutlivesSlotWhileReplyIsBlocked(t *testing.T) {
 			}
 			waitBudget(t, &s.outbound, 0)
 			other.send(t, "GET 1\nn")
+			other.value(t, "new")
+		})
+	}
+}
+
+func TestLargeTCPReplyReturnsOutboundBudget(t *testing.T) {
+	for _, ending := range []string{"success", "deadline", "disconnect"} {
+		t.Run(ending, func(t *testing.T) {
+			cache, err := store.New(store.Config{
+				Shards: 1, BytesPerShard: 4 << 20, EntriesPerShard: 2, Samples: 2,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := DefaultConfig()
+			cfg.OutboundBytes = int64(cfg.MaxValueBytes)
+			cfg.WriteTimeout = time.Second
+			s, err := New(cache, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			peer, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer peer.Close()
+			conn, err := listener.AcceptTCP()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetWriteBuffer(16 << 10); err != nil {
+				t.Fatal(err)
+			}
+			if err := peer.SetReadBuffer(64 << 10); err != nil {
+				t.Fatal(err)
+			}
+			slow := s.testConn(t, conn, peer)
+
+			old := bytes.Repeat([]byte("o"), cfg.MaxValueBytes)
+			if cache.Set("k", old, 0, false) != store.Stored {
+				t.Fatal("could not store old value")
+			}
+			slow.exchange(t, "GET 1\nk", fmt.Sprintf("VALUE %d\n", len(old)))
+			waitBudget(t, &s.outbound, int64(len(old)))
+			other := s.pipe(t)
+			other.exchange(t, "SET 1 3 NONE\nknew", "STORED\n")
+			other.exchange(t, "GET 1\nk", "BUSY\n")
+
+			switch ending {
+			case "success":
+				payload := make([]byte, len(old))
+				if n, err := io.ReadFull(slow.reader, payload); err != nil || !bytes.Equal(payload, old) {
+					t.Fatalf("old TCP response: got %d bytes, error %v", n, err)
+				}
+			case "deadline":
+				waitBudget(t, &s.outbound, 0)
+				if n, err := io.Copy(io.Discard, slow.reader); err != nil || n >= int64(len(old)) {
+					t.Fatalf("deadline should end an incomplete reply: got %d bytes, error %v", n, err)
+				}
+			case "disconnect":
+				_ = slow.Close()
+			}
+			waitBudget(t, &s.outbound, 0)
+			other.send(t, "GET 1\nk")
 			other.value(t, "new")
 		})
 	}
