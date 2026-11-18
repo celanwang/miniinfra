@@ -21,6 +21,8 @@ func switchPrimeSize(lengths string) int {
 
 func pressureWriteCount(lengths string) int {
 	switch lengths {
+	case "eviction":
+		return pressureWriters * evictionWritesPerShard
 	case "large-to-half", "cold-half", "business":
 		return 512
 	case "alternating":

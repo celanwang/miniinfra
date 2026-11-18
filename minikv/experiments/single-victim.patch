@@ -1,0 +1,19 @@
+diff --git a/minikv/internal/store/store.go b/minikv/internal/store/store.go
+index 441f103..bc2f5ac 100644
+--- a/minikv/internal/store/store.go
++++ b/minikv/internal/store/store.go
+@@ -231 +231,4 @@ func (sh *shard) plan(candidates []uint32, target uint32, exists bool, delta int
+-	slices.SortFunc(candidates, func(a, b uint32) int {
++	if len(candidates) == 0 {
++		return nil, false
++	}
++	compare := func(a, b uint32) int {
+@@ -240 +243,7 @@ func (sh *shard) plan(candidates []uint32, target uint32, exists bool, delta int
+-	})
++	}
++	first := slices.MinFunc(candidates, compare)
++	if sh.entries[first].bytes() >= needBytes {
++		candidates[0] = first
++		return candidates[:1], true
++	}
++	slices.SortFunc(candidates, compare)
