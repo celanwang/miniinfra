@@ -519,3 +519,37 @@ done
 GOWORK=off go test -race -count=3 -v ./internal/server \
     -run '^(TestTCPIdlePoolReclaimsSlots|TestLargeTCPReplyReturnsOutboundBudget)$'
 ```
+
+## 热 GET 的键查找
+
+用 Go 1.27.3，在服务端复用读帧和键缓冲，按键长各跑 1000 次命中和未命中。计量覆盖读入键、路由、查索引和预留命中值的出站额度。基线是 `68136d8`，在调用 Store 前先把键转换成字符串。借用版直接对字节哈希，并在字符串索引的查找表达式里转换。
+
+| 键长 | 基线分配次数 / 请求，命中与未命中 | 借用版分配次数 / 请求，命中与未命中 |
+| --- | ---: | ---: |
+| 16、32 B | 0 | 0 |
+| 33、64、128、256、1024 B | 1 | 0 |
+
+沿用页读取回放，以窗口 1、每秒 1,250 页和另 10,000 次单次 GET 读 512 B 值。以 16 B 和 64 B 命名空间键各做三对，双方运行同一个 Linux arm64 发压器，每轮 6 秒，每对交换顺序。服务和驱动分别固定 CPU 0–1 和 2–5，容器上限 160 MiB。页内容逐个验对，`/runtime` 在预热后和读完后采样，堆分配量与 cgroup CPU 除以成功 GET 数。两个快照包含诊断本身的少量开销。
+
+| 键长 | 服务堆分配 B / GET | 窗口内 GC 次数 | 服务 CPU µs / GET | 单次 GET 在线 P99 | 单次 GET RTT P99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16 B | 0.02 / 0.00 | 0 / 0 | 4.34 / 4.28 | 3.88 / 3.89 ms | 1.51 / 1.50 ms |
+| 64 B | 65.05 / 0.02 | 2 / 0 | 4.49 / 4.37 | 3.93 / 3.89 ms | 1.61 / 1.51 ms |
+
+表中为基线 / 借用版的三轮中位数。所有已发送请求均成功，计划总完成率最低为 99.93%。64 B 每对的服务 CPU 降幅为 0.4%–16.1%，单次 GET RTT P99 差为 +0.002、−0.032、−0.540 ms，整页在线 P99 差为 −0.028、+0.691、−2.761 ms。堆分配下降和窗口内 GC 减少在三对都复现，TCP 尾延迟的变化随轮次而异。
+
+**保留帧内借用。** 在原有查找路径消除长键的临时分配。真实 TCP 回归覆盖不同分片上的短键和 1024 B 二进制键、长键未命中与 `SET NX`、以及并发覆盖时已开始发送的旧值仍完整。接收路径的命中与未命中分配是单独测量的，表中端到端回放为已预热的命中负载。
+
+从组件目录复跑，每对可以交换两个 peer 的顺序。
+
+```sh
+base=$(mktemp -d)
+git -C .. archive 68136d8 minikv | tar -x -C "$base"
+for size in 16 64; do
+    for peer in "$base/minikv" "$PWD"; do
+        GOWORK=off python3 experiments/capacity.py --profiles page --rates 1250 \
+            --page-window 1 --page-key-bytes "$size" --tick 250us \
+            --server-cpus 0-1 --driver-cpus 2-5 --peer-module "$peer"
+    done
+done
+```
