@@ -85,12 +85,7 @@ func (p *Partition) restore(path string) error {
 	if image.RedriveReceipts != nil {
 		p.redriveReceipts = image.RedriveReceipts
 	}
-	for _, item := range image.Scheduled {
-		if err := p.applySchedule(transaction{Schedule: &item}); err != nil {
-			return err
-		}
-	}
-	return nil
+	return p.restoreScheduled(image.Scheduled)
 }
 
 // Compact installs a checkpoint and reclaims the eligible history prefix.

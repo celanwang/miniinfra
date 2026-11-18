@@ -45,6 +45,30 @@ func (q *scheduleQueue) Pop() any {
 
 func scheduleReserve(size int) int64 { return 2*int64(size) + transitionReserve }
 
+func (p *Partition) restoreScheduled(items map[string]scheduledPublication) error {
+	if len(items) == 0 {
+		return nil
+	}
+	queue := make(scheduleQueue, 0, len(items))
+	for id, item := range items {
+		if id != item.ID {
+			// Preserve recovery by the embedded ID, including duplicate checks,
+			// for checkpoints whose map keys differ from their records.
+			for _, item := range items {
+				if err := p.applySchedule(transaction{Schedule: &item}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		p.publishes[id] = item.Receipt
+		queue = append(queue, scheduleEntry{ID: id, At: item.DeliverAt, Sequence: item.Sequence})
+	}
+	p.scheduled, p.due = items, queue
+	heap.Init(&p.due)
+	return nil
+}
+
 func (p *Partition) schedule(req PublishRequest, digest [32]byte, now TimeBounds) (PublishResult, error) {
 	result := PublishResult{ID: req.ID, Scheduled: true}
 	tx := transaction{
