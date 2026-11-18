@@ -104,6 +104,7 @@ func runPressure(target target, lengths string) map[string]any {
 	writeBefore := readRuntime(&httpClient)
 	writeStart := time.Now()
 	writeResults := make([]map[outcome]int, writers)
+	writeLatency := make([][]time.Duration, writers)
 	recovered := make([]bool, writers)
 	value := bytes.Repeat([]byte("v"), largeSize)
 	var writes sync.WaitGroup
@@ -116,8 +117,12 @@ func runPressure(target target, lengths string) map[string]any {
 			for k := i; k < 256; k += writers {
 				size := pressureWriteSize(lengths, k)
 				cmd := target.makeCommand(pressureWriteKey(lengths, k), value[:size], size)
+				started := time.Now()
 				_, status := client.execute(cmd, 0, 0)
 				statuses[status]++
+				if status == ok || status == noSpace {
+					writeLatency[i] = append(writeLatency[i], time.Since(started))
+				}
 			}
 			if previous := client.conn; previous != nil {
 				_, status := client.execute(hot[i], smallSize, 0)
@@ -134,7 +139,9 @@ func runPressure(target target, lengths string) map[string]any {
 
 	writeCounts := make(map[outcome]int)
 	recoveredCount := 0
+	var writeSamples []time.Duration
 	for i, lane := range writeResults {
+		writeSamples = append(writeSamples, writeLatency[i]...)
 		for kind, n := range lane {
 			writeCounts[kind] += n
 		}
@@ -170,7 +177,10 @@ func runPressure(target target, lengths string) map[string]any {
 	result["Stats"] = after
 	result["ReadSchedule"] = map[string]int{"Offered": scheduled.Offered, "Waiting": scheduled.Waiting, "Late": scheduled.Late}
 	result["ReadPhases"] = phases
+	slices.Sort(writeSamples)
 	result["Writes"] = writeCounts
+	result["WriteSamples"] = len(writeSamples)
+	result["WriteP99Microseconds"] = percentile(writeSamples, 990)
 	result["WriterConnectionsRecovered"] = recoveredCount
 	result["WriteSeconds"] = writeEnd.Sub(writeStart).Seconds()
 	result["RuntimeBefore"] = writeBefore
