@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB releases locks promptly when its Go client cancels an in-flight request and preserves final replies after a TCP half-close.
 - MiniKV verifies TTL visibility, overwrite safety, and conditional refills during clustered expirations.
 - MiniMQ verifies that recent short tails stay inline for fast history reads across checkpoints and restarts.
 - MiniDB measures foreground lock waits during version reclamation under concurrent reads and writes.
