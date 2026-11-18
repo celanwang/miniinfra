@@ -132,7 +132,7 @@ def main():
     parser.add_argument("--go-memory-limit", help="set GOMEMLIMIT on the MiniKV server for this run")
     parser.add_argument("--server-cpus", help="pin the server to a Docker CPU set")
     parser.add_argument("--driver-cpus", help="pin the driver to a Docker CPU set")
-    parser.add_argument("--pressure-lengths", default="fixed", choices=("fixed", "repeated", "adjacent"))
+    parser.add_argument("--pressure-lengths", default="fixed", choices=("fixed", "repeated", "adjacent", "publish"))
     parser.add_argument("--peer-module", type=Path, help="build the MiniKV peer from another checkout")
     args = parser.parse_args()
     profiles = args.profiles.split(",")
