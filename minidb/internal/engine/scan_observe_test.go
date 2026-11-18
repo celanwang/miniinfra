@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"runtime"
 	"time"
 )
@@ -48,7 +49,7 @@ type ScanMaterialization struct {
 	Bytes   uint64
 }
 
-func (db *DB) MeasureScanMaterialization(table string, columns []int, values []Value) (ScanMaterialization, error) {
+func (db *DB) MeasureScanMaterialization(ctx context.Context, table string, columns []int, values []Value) (ScanMaterialization, error) {
 	tx, err := db.Begin()
 	if err != nil {
 		return ScanMaterialization{}, err
@@ -63,7 +64,7 @@ func (db *DB) MeasureScanMaterialization(table string, columns []int, values []V
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	started := time.Now()
-	rows, indexed, err := view.Rows(table, columns, values)
+	rows, indexed, err := view.Rows(ctx, table, columns, values)
 	elapsed := time.Since(started)
 	runtime.ReadMemStats(&after)
 	return ScanMaterialization{len(rows), indexed, elapsed, tx.timing.tableWait, after.TotalAlloc - before.TotalAlloc}, err

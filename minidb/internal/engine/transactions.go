@@ -119,19 +119,34 @@ func (view Snapshot) sees(state *transactionState) bool {
 
 // Rows returns all visible rows, or probes an equality index when the supplied
 // columns match one. indexed reports whether the probe was performed.
-func (view Snapshot) Rows(name string, columns []int, values []Value) (rows [][]Value, indexed bool, err error) {
+// Reclamation can move live versions between slots, so a heap scan keeps
+// the latch until it finishes or is canceled.
+func (view Snapshot) Rows(ctx context.Context, name string, columns []int, values []Value) (rows [][]Value, indexed bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	tbl, err := view.table(name)
 	if err != nil {
 		return nil, false, err
 	}
 	view.tx.lockTable(tbl, tbl.mu.RLock)
 	defer tbl.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	if len(columns) != 0 {
 		for i := range tbl.indexes {
 			if !slices.Equal(tbl.indexes[i].def.Columns, columns) {
 				continue
 			}
+			examined := 0
 			for row := range tbl.indexes[i].lookup(lookupKey(values)) {
+				if examined%heapPageRows == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, true, err
+					}
+				}
+				examined++
 				if view.visible(row) {
 					rows = append(rows, slices.Clone(row.values))
 				}
@@ -140,6 +155,9 @@ func (view Snapshot) Rows(name string, columns []int, values []Value) (rows [][]
 		}
 	}
 	for _, page := range tbl.pages {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
 		for _, row := range page {
 			if view.visible(row) {
 				rows = append(rows, slices.Clone(row.values))

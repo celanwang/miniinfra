@@ -36,7 +36,7 @@ func TestTCPSelectiveScanCancellation(t *testing.T) {
 		}
 	}
 	for _, columns := range [][]int{nil, {2}} {
-		sample, err := store.MeasureScanMaterialization(scanTable, columns, []engine.Value{engine.Int(int64(rows))})
+		sample, err := store.MeasureScanMaterialization(t.Context(), scanTable, columns, []engine.Value{engine.Int(int64(rows))})
 		if err != nil || sample.Indexed != (len(columns) != 0) {
 			t.Fatalf("materialization: %+v, %v", sample, err)
 		}
@@ -48,6 +48,34 @@ func TestTCPSelectiveScanCancellation(t *testing.T) {
 		statement, commit := finishScanWriter(t, writer)
 		t.Logf("idle rows=%d writer_statement=%s writer_commit=%s", rows, statement, commit)
 		measureCanceledScan(t, store, pool, rows)
+	}
+	if rows > 10_000 {
+		checkScanResultLimit(t, pool)
+	}
+}
+
+func checkScanResultLimit(t *testing.T, pool *sql.DB) {
+	t.Helper()
+	const selectIDs = "select id from " + scanTable + " where external_ref <= ?"
+	result, err := pool.QueryContext(t.Context(), selectIDs, 10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Close()
+	count := 0
+	for result.Next() {
+		count++
+	}
+	if count != 10_000 || result.Err() != nil {
+		t.Fatalf("result at limit: rows=%d err=%v", count, result.Err())
+	}
+	result, err = pool.QueryContext(t.Context(), selectIDs, 10_001)
+	if err == nil {
+		result.Close()
+		t.Fatal("accepted more than 10,000 rows")
+	}
+	if !strings.Contains(err.Error(), "query result exceeds 10000 rows") {
+		t.Fatalf("result beyond limit: %v", err)
 	}
 }
 

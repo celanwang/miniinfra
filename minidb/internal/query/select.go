@@ -94,7 +94,7 @@ func selectRows(ctx context.Context, view engine.Snapshot, stmt statement) (Resu
 				break
 			}
 		}
-		rows, _, err := view.Rows(plan.table, columns, values)
+		rows, _, err := view.Rows(ctx, plan.table, columns, values)
 		if err != nil {
 			return err
 		}

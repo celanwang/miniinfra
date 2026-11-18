@@ -171,7 +171,7 @@ func latencyRequest(t *testing.T, db *DB, id int64, write bool) (latencyProbeReq
 		}
 	} else {
 		var rows [][]Value
-		rows, _, err = view.Rows(schema.Name, []int{0}, []Value{Int(id)})
+		rows, _, err = view.Rows(t.Context(), schema.Name, []int{0}, []Value{Int(id)})
 		if err == nil && len(rows) != 1 {
 			err = errors.New("ordinary key did not return one visible row")
 		}

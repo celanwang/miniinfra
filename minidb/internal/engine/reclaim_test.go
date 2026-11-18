@@ -25,7 +25,7 @@ func TestPinnedStatementsKeepOnlyVisibleHistory(t *testing.T) {
 	}{{oldest, 0}, {middle, updates / 4}} {
 		wantStock(t, previous.view, 0, Int(1), previous.qty)
 		wantStock(t, previous.view, 1, String("hot"), previous.qty)
-		rows, _, err := previous.view.Rows(schema.Name, nil, nil)
+		rows, _, err := previous.view.Rows(t.Context(), schema.Name, nil, nil)
 		if err != nil || len(rows) != 1 || rows[0][2] != Int(previous.qty) {
 			t.Fatalf("heap scan lost the pinned row: %v %v", rows, err)
 		}
