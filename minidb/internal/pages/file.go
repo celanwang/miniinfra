@@ -1,6 +1,7 @@
 package pages
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,10 +15,11 @@ import (
 )
 
 const (
-	Size           = 4096
-	dataOffset     = 16
-	magic          = "MINIDB-PAGES-1\n"
-	metadataOffset = 4 + len(magic)
+	Size            = 4096
+	dataOffset      = 16
+	magic           = "MINIDB-PAGES-1\n"
+	metadataOffset  = 4 + len(magic)
+	writeBufferSize = 64 << 10
 )
 
 type Metadata struct {
@@ -54,11 +56,15 @@ func SaveWithTiming(path string, meta Metadata, encode func(io.Writer) error, ti
 		out = timedPageOutput{file, timing}
 		started = time.Now()
 	}
-	writer := pageWriter{out: out}
+	buffer := bufio.NewWriterSize(out, writeBufferSize)
+	writer := pageWriter{out: buffer}
 	if err := encode(&writer); err != nil {
 		return err
 	}
 	if err := writer.flush(); err != nil {
+		return err
+	}
+	if err := buffer.Flush(); err != nil {
 		return err
 	}
 	var header [Size]byte
