@@ -134,3 +134,26 @@ GOWORK=off go test -c -o /tmp/minidb-index ./internal/engine
 MINIDB_ORDER_LOOKUP_ROWS=120000 GOMAXPROCS=4 /tmp/minidb-index \
   -test.run '^TestTCPOrderLookupIndexOrder$/^tenant_first$' -test.count=1 -test.v
 ```
+
+## 首层行与最终投影
+
+`Snapshot.RowsMatching` 已在表读锁内复制每个返回行。执行器首层直接使用这份独立副本，并将切片容量限制为行长度。联接向首层切片追加内侧列时会另建存储。每条最终结果继续按投影顺序分配自己的值切片，重复列各占一个位置。
+
+真实 TCP 探针使用 512 条订单和每单两条明细。比较唯一键取一行、堆扫描或普通索引取 128 行，以及 128 个外层订单各联接两条明细。每次读取完整结果并检查列顺序、重复投影和所有前缀的匹配数。分配统计合计服务端与客户端。Apple M4 Max、darwin/arm64、`GOMAXPROCS=4`，共享基准锁下按 A B B A 交错，每轮每种查询执行 600 次。两版使用同一探针，A 只恢复基线的 `select.go`。
+
+| 路径 | 输出行数 | 每查询分配次数，基线 → 复用 | TCP 往返中位，µs |
+| --- | ---: | ---: | ---: |
+| 唯一索引 | 1 | 77.18–77.22 → 76.13–76.19 | 45–50 → 39–48 |
+| 堆扫描 | 128 | 1879.65–1879.94 → 1751.08–1751.56 | 171–188 → 173–184 |
+| 普通索引 | 128 | 1879.64–1879.81 → 1751.47–1751.73 | 171–179 → 169–180 |
+| 联接 | 256 | 4839.74–4839.89 → 4711.23–4711.43 | 335–353 → 332–354 |
+
+首层每行少一次分配。两种 128 行单表查询各少约 16–19 KB，联接少约 18 KB。TCP 时间的观测范围有重叠，采用依据是分配减少。回归还核对三层同表别名、不同外层行与多匹配、结果行互不影响、并发提交期间的旧语句快照，以及取消联接后新语句读取完整的已提交结果。
+
+基线提交 `96af232` 包含相同负载。两版各构建一次，交错执行。
+
+```sh
+GOWORK=off go test -c -o /tmp/minidb-projection ./internal/engine
+MINIDB_PROJECTION_QUERIES=600 GOMAXPROCS=4 /tmp/minidb-projection \
+  -test.run '^TestTCPProjectionLoad$' -test.count=1 -test.v
+```

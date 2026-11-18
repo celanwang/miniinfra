@@ -98,7 +98,12 @@ func selectRows(ctx context.Context, view engine.Snapshot, stmt statement) (Resu
 			return err
 		}
 		for _, row := range rows {
-			joined := append(prefix, row...)
+			// The scan already owns a copy. Cap the root row so a join
+			// cannot write into its backing storage when adding columns.
+			joined := row[:len(row):len(row)]
+			if depth != 0 {
+				joined = append(prefix, row...)
+			}
 			if matches(plan.on, joined) {
 				if err := visit(joined, depth+1); err != nil {
 					return err
