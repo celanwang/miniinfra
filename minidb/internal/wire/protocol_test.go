@@ -68,3 +68,24 @@ func TestReadPreservesTransportErrorAfterLongFrame(t *testing.T) {
 		t.Fatalf("end of stream: %v (scanner: %v)", err, reader.Err())
 	}
 }
+
+func TestReadShrinksAfterTwoShortFrames(t *testing.T) {
+	large := strings.Repeat("x", 8192)
+	largeFrame := `"` + large + "\"\n"
+	input := largeFrame + "\"short\"\n" + largeFrame + "\"one\"\n\"two\"\n\"tail\"\n"
+	reader := Reader(strings.NewReader(input))
+	grown := reader.scanner
+	for _, want := range []string{large, "short", large, "one"} {
+		var got string
+		if err := Read(reader, &got); err != nil || got != want || reader.scanner != grown {
+			t.Fatalf("expected the same scanner and a frame of length %d: got %d bytes, %v", len(want), len(got), err)
+		}
+	}
+	var got string
+	if err := Read(reader, &got); err != nil || got != "two" || reader.scanner == grown {
+		t.Fatalf("second short frame did not shrink the reader: %q, %v", got, err)
+	}
+	if err := Read(reader, &got); err != nil || got != "tail" {
+		t.Fatalf("lost read-ahead after shrinking: %q, %v", got, err)
+	}
+}

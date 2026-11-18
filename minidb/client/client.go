@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -55,7 +54,7 @@ func (c connector) Connect(ctx context.Context) (driver.Conn, error) {
 
 type connection struct {
 	socket net.Conn
-	reader *bufio.Scanner
+	reader *wire.FrameReader
 	broken bool
 	inTx   bool
 }
