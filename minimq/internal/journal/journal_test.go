@@ -14,7 +14,7 @@ func TestRecoveryRequiresDurableHeadBeforeCollection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Checkpoint([]byte("state")); err != nil {
+	if err := j.Checkpoint([]byte("state"), nil); err != nil {
 		j.Close()
 		t.Fatal(err)
 	}

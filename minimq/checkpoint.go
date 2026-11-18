@@ -9,8 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/celanwang/miniinfra/minimq/internal/journal"
 )
 
 type checkpoint struct {
@@ -97,8 +95,7 @@ func (p *Partition) restore(path string) error {
 
 // Compact installs a checkpoint and reclaims the eligible history prefix.
 func (p *Partition) Compact() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	defer p.endOperation("checkpoint", p.beginOperation())
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
@@ -190,13 +187,7 @@ func (p *Partition) compact(now TimeBounds) error {
 	if scratch > available || scratch+p.storageBytes() > p.config.CapacityBytes {
 		return ErrCapacity
 	}
-	for name, data := range files {
-		if err := journal.InstallFile(p.journal.Dir(), filepath.Join(p.journal.Dir(), name), data); err != nil {
-			p.failed = fmt.Errorf("partition requires recovery after writing history segment: %w", err)
-			return p.failed
-		}
-	}
-	if err := p.journal.Checkpoint(payload); err != nil {
+	if err := p.journal.Checkpoint(payload, files); err != nil {
 		p.failed = err
 		return err
 	}
