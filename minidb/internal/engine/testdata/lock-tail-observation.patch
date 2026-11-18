@@ -1,0 +1,318 @@
+diff --git a/minidb/internal/engine/locks_tcp_test.go b/minidb/internal/engine/locks_tcp_test.go
+index 723cf98..80bd71a 100644
+--- a/minidb/internal/engine/locks_tcp_test.go
++++ b/minidb/internal/engine/locks_tcp_test.go
+@@ -27 +27,2 @@ func TestTCPMultiRowLockLoad(t *testing.T) {
+-		_, pool, drain := openLockLoad(t)
++		parent, observeTail := lockTailObserver(t)
++		_, pool, drain := openLockLoadContext(t, parent)
+@@ -54,0 +56,3 @@ func TestTCPMultiRowLockLoad(t *testing.T) {
++		if observeTail != nil {
++			observeTail.start()
++		}
+@@ -73,0 +78,3 @@ func TestTCPMultiRowLockLoad(t *testing.T) {
++		if observeTail != nil {
++			observeTail.report(t, samples)
++		}
+@@ -178,0 +186,4 @@ func openLockLoad(t *testing.T) (*engine.DB, *sql.DB, func() engine.CheckpointLo
++	return openLockLoadContext(t, t.Context())
++}
++
++func openLockLoadContext(t *testing.T, parent context.Context) (*engine.DB, *sql.DB, func() engine.CheckpointLoadObservation) {
+@@ -185 +196 @@ func openLockLoad(t *testing.T) (*engine.DB, *sql.DB, func() engine.CheckpointLo
+-	_, pool, _ := serveTCP(t, store)
++	_, pool, _ := serveTCPContext(t, store, parent)
+@@ -198,0 +210 @@ type lockLoadSample struct {
++	order                    int
+@@ -236,0 +249 @@ func writeLockOrder(ctx context.Context, pool *sql.DB, order, sku int) (sample l
++	sample.order = order
+diff --git a/minidb/internal/engine/reclaim_tcp_test.go b/minidb/internal/engine/reclaim_tcp_test.go
+index ce26791..8beac83 100644
+--- a/minidb/internal/engine/reclaim_tcp_test.go
++++ b/minidb/internal/engine/reclaim_tcp_test.go
+@@ -45,0 +46,4 @@ func serveTCP(t *testing.T, store *engine.DB) (*engine.DB, *sql.DB, func()) {
++	return serveTCPContext(t, store, t.Context())
++}
++
++func serveTCPContext(t *testing.T, store *engine.DB, parent context.Context) (*engine.DB, *sql.DB, func()) {
+@@ -52 +56 @@ func serveTCP(t *testing.T, store *engine.DB) (*engine.DB, *sql.DB, func()) {
+-	ctx, cancel := context.WithCancel(t.Context())
++	ctx, cancel := context.WithCancel(parent)
+diff --git a/minidb/internal/engine/transactions.go b/minidb/internal/engine/transactions.go
+index dfe10f7..ff4e710 100644
+--- a/minidb/internal/engine/transactions.go
++++ b/minidb/internal/engine/transactions.go
+@@ -245,0 +246,4 @@ func (tx *Txn) acquire(ctx context.Context, r resource) error {
++	var started time.Time
++	if tx.timing != nil {
++		started = time.Now()
++	}
+@@ -246,0 +251,3 @@ func (tx *Txn) acquire(ctx context.Context, r resource) error {
++	if tx.timing != nil {
++		tx.timing.acquire += time.Since(started)
++	}
+@@ -302,0 +310 @@ type transactionTiming struct {
++	acquire                                         time.Duration
+@@ -307,0 +316,16 @@ type transactionTiming struct {
++type LockTiming struct {
++	Acquire, ManagerWait, RowWait, UniqueWait, TableWait time.Duration
++}
++
++// MeasureLocks records timings for the next operation on this session's
++// transaction. Call finish before the session starts another operation.
++func (tx *Txn) MeasureLocks() (finish func() LockTiming) {
++	previous := tx.timing
++	timing := &transactionTiming{}
++	tx.timing = timing
++	return func() LockTiming {
++		tx.timing = previous
++		return LockTiming{timing.acquire, timing.lockManagerWait, timing.rowWait, timing.uniqueWait, timing.tableWait}
++	}
++}
++
+diff --git a/minidb/internal/query/execute.go b/minidb/internal/query/execute.go
+index 34f1c07..49771e6 100644
+--- a/minidb/internal/query/execute.go
++++ b/minidb/internal/query/execute.go
+@@ -49,0 +50,12 @@ func (s *Session) abort() {
++// ExecuteWithLockTiming measures locks on a statement inside an explicit
++// transaction. The execution and transaction boundaries are unchanged.
++func (s *Session) ExecuteWithLockTiming(ctx context.Context, sql string, args []engine.Value) (Result, engine.LockTiming, error) {
++	if s.tx == nil {
++		result, err := s.Execute(ctx, sql, args)
++		return result, engine.LockTiming{}, err
++	}
++	finish := s.tx.MeasureLocks()
++	result, err := s.Execute(ctx, sql, args)
++	return result, finish(), err
++}
++
+diff --git a/minidb/internal/server/server.go b/minidb/internal/server/server.go
+index 3ec99ea..846a817 100644
+--- a/minidb/internal/server/server.go
++++ b/minidb/internal/server/server.go
+@@ -28,0 +29 @@ func Serve(ctx context.Context, listener net.Listener, db *engine.DB) error {
++	observe, _ := ctx.Value(statementObserverKey{}).(func(StatementTiming))
+@@ -41 +42 @@ func Serve(ctx context.Context, listener net.Listener, db *engine.DB) error {
+-				serveConnection(ctx, conn, db)
++				serveConnection(ctx, conn, db, observe)
+@@ -49 +50 @@ func Serve(ctx context.Context, listener net.Listener, db *engine.DB) error {
+-func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
++func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB, observe func(StatementTiming)) {
+@@ -67 +68,5 @@ func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
+-	requests := make(chan wire.Request)
++	requests := make(chan decodedRequest)
++	var peer string
++	if observe != nil {
++		peer = conn.RemoteAddr().String()
++	}
+@@ -71 +76 @@ func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
+-		readErr = readRequests(ctx, conn, requests, disconnect)
++		readErr = readRequests(ctx, conn, requests, disconnect, observe != nil)
+@@ -78 +83,10 @@ func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
+-		result, err := session.Execute(statement, req.SQL, req.Args)
++		var timing StatementTiming
++		var result query.Result
++		var err error
++		if observe == nil {
++			result, err = session.Execute(statement, req.SQL, req.Args)
++		} else {
++			timing = StatementTiming{Peer: peer, Request: req.Request, Decoded: req.decoded, Started: time.Now()}
++			result, timing.Locks, err = session.ExecuteWithLockTiming(statement, req.SQL, req.Args)
++			timing.Executed = time.Now()
++		}
+@@ -86 +100,8 @@ func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
+-		if !send(conn, response) {
++		if observe != nil {
++			timing.Replying = time.Now()
++		}
++		sent := send(conn, response)
++		if observe != nil {
++			observe(timing)
++		}
++		if !sent {
+@@ -98 +119 @@ func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
+-func readRequests(ctx context.Context, conn net.Conn, requests chan<- wire.Request, disconnect context.CancelFunc) error {
++func readRequests(ctx context.Context, conn net.Conn, requests chan<- decodedRequest, disconnect context.CancelFunc, timed bool) error {
+@@ -101,2 +122,2 @@ func readRequests(ctx context.Context, conn net.Conn, requests chan<- wire.Reque
+-		var req wire.Request
+-		if err := wire.Read(reader, &req); err != nil {
++		var req decodedRequest
++		if err := wire.Read(reader, &req.Request); err != nil {
+@@ -113,0 +135,3 @@ func readRequests(ctx context.Context, conn net.Conn, requests chan<- wire.Reque
++		if timed {
++			req.decoded = time.Now()
++		}
+diff --git a/minidb/internal/engine/locks_tail_test.go b/minidb/internal/engine/locks_tail_test.go
+new file mode 100644
+index 0000000..d289ab8
+--- /dev/null
++++ b/minidb/internal/engine/locks_tail_test.go
+@@ -0,0 +1,132 @@
++package engine_test
++
++import (
++	"cmp"
++	"context"
++	"math"
++	"os"
++	"runtime/metrics"
++	"slices"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/celanwang/miniinfra/minidb/internal/server"
++)
++
++type lockTailCosts struct {
++	statements                                               int
++	dispatch, exec, reply, acquire, manager, row, key, table time.Duration
++}
++
++type lockTailTrace struct {
++	mu     sync.Mutex
++	active map[string]int
++	costs  map[int]lockTailCosts
++	before *metrics.Float64Histogram
++}
++
++func lockTailObserver(t *testing.T) (context.Context, *lockTailTrace) {
++	t.Helper()
++	if os.Getenv("MINIDB_LOCK_TRACE") == "" {
++		return t.Context(), nil
++	}
++	observer := &lockTailTrace{active: make(map[string]int), costs: make(map[int]lockTailCosts)}
++	return server.ObserveStatements(t.Context(), observer.observe), observer
++}
++
++func (trace *lockTailTrace) start() {
++	trace.before = schedulerLatency()
++}
++
++func (trace *lockTailTrace) observe(sample server.StatementTiming) {
++	trace.mu.Lock()
++	defer trace.mu.Unlock()
++	switch sample.Request.SQL {
++	case "insert into lock_orders values (?,?)":
++		trace.active[sample.Peer] = int(sample.Request.Args[0].Int)
++	case lockLoadUpdate, "insert into lock_items values (?,?),(?,?)":
++	default:
++		return
++	}
++	id := trace.active[sample.Peer]
++	cost := trace.costs[id]
++	cost.statements++
++	cost.dispatch += sample.Started.Sub(sample.Decoded)
++	cost.exec += sample.Executed.Sub(sample.Started)
++	cost.reply += sample.Replying.Sub(sample.Executed)
++	cost.acquire += sample.Locks.Acquire
++	cost.manager += sample.Locks.ManagerWait
++	cost.row += sample.Locks.RowWait
++	cost.key += sample.Locks.UniqueWait
++	cost.table += sample.Locks.TableWait
++	trace.costs[id] = cost
++}
++
++func (trace *lockTailTrace) report(t *testing.T, samples []lockLoadSample) {
++	t.Helper()
++	trace.mu.Lock()
++	defer trace.mu.Unlock()
++	for _, sample := range samples {
++		if cost := trace.costs[sample.order]; cost.statements != 4 || cost.row != 0 || cost.key != 0 ||
++			cost.dispatch+cost.exec+cost.reply > sample.sql {
++			t.Fatalf("order %d unexpected trace: %+v", sample.order, cost)
++		}
++	}
++	slices.SortFunc(samples, func(a, b lockLoadSample) int { return cmp.Compare(a.sql, b.sql) })
++	threshold := (len(samples)*99+99)/100 - 1
++	sample := samples[threshold]
++	cost := trace.costs[sample.order]
++	t.Logf("p99_order sql=%s residual=%s dispatch=%s exec=%s reply=%s lock=%s manager=%s table=%s",
++		sample.sql, sample.sql-cost.dispatch-cost.exec-cost.reply, cost.dispatch, cost.exec, cost.reply, cost.acquire, cost.manager, cost.table)
++	var total, outside, dispatch, exec, reply, acquire, manager, table, acquireMax time.Duration
++	tail := samples[threshold+1:]
++	if len(tail) == 0 {
++		tail = samples[threshold:]
++	}
++	for _, sample := range tail {
++		cost := trace.costs[sample.order]
++		total += sample.sql
++		outside += sample.sql - cost.dispatch - cost.exec - cost.reply
++		dispatch += cost.dispatch
++		exec += cost.exec
++		reply += cost.reply
++		acquire += cost.acquire
++		manager += cost.manager
++		table += cost.table
++		acquireMax = max(acquireMax, cost.acquire)
++	}
++	n := time.Duration(len(tail))
++	t.Logf("tail count=%d sql_mean=%s residual_mean=%s dispatch_mean=%s exec_mean=%s reply_mean=%s lock_mean=%s lock_max=%s manager_mean=%s table_mean=%s",
++		n, total/n, outside/n, dispatch/n, exec/n, reply/n, acquire/n, acquireMax, manager/n, table/n)
++	t.Logf("runtime runnable_p99_ceiling=%s", schedulerP99Ceiling(trace.before, schedulerLatency()))
++}
++
++func schedulerLatency() *metrics.Float64Histogram {
++	sample := []metrics.Sample{{Name: "/sched/latencies:seconds"}}
++	metrics.Read(sample)
++	latency := sample[0].Value.Float64Histogram()
++	return &metrics.Float64Histogram{Counts: slices.Clone(latency.Counts), Buckets: latency.Buckets}
++}
++
++func schedulerP99Ceiling(before, after *metrics.Float64Histogram) time.Duration {
++	var total uint64
++	for i, count := range after.Counts {
++		total += count - before.Counts[i]
++	}
++	target := (total*99 + 99) / 100
++	if target == 0 {
++		return 0
++	}
++	for i, count := range after.Counts {
++		added := count - before.Counts[i]
++		if added >= target {
++			if math.IsInf(after.Buckets[i+1], 1) {
++				return 0
++			}
++			return time.Duration(after.Buckets[i+1] * float64(time.Second))
++		}
++		target -= added
++	}
++	return 0
++}
+diff --git a/minidb/internal/server/observation.go b/minidb/internal/server/observation.go
+new file mode 100644
+index 0000000..c6c0455
+--- /dev/null
++++ b/minidb/internal/server/observation.go
+@@ -0,0 +1,29 @@
++package server
++
++import (
++	"context"
++	"time"
++
++	"github.com/celanwang/miniinfra/minidb/internal/engine"
++	"github.com/celanwang/miniinfra/minidb/internal/wire"
++)
++
++type StatementTiming struct {
++	Peer                                 string
++	Request                              wire.Request
++	Decoded, Started, Executed, Replying time.Time
++	Locks                                engine.LockTiming
++}
++
++type statementObserverKey struct{}
++
++// ObserveStatements opts a server into request timing. The server publishes
++// observations after attempting each reply. Calls can overlap across sessions.
++func ObserveStatements(ctx context.Context, observe func(StatementTiming)) context.Context {
++	return context.WithValue(ctx, statementObserverKey{}, observe)
++}
++
++type decodedRequest struct {
++	wire.Request
++	decoded time.Time
++}
