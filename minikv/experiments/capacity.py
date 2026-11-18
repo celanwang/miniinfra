@@ -20,7 +20,7 @@ def mount(binaries):
 
 
 @contextmanager
-def engine(binaries, image, name, go_memory_limit, cpuset):
+def engine(binaries, image, name, go_memory_limit, cpuset, block_profile):
     container = f"minikv-capacity-{uuid.uuid4().hex[:12]}"
     flags = [
         "run", "-d", "--name", container, "--pull=never", "--network", "none",
@@ -36,6 +36,8 @@ def engine(binaries, image, name, go_memory_limit, cpuset):
         ]
         if go_memory_limit:
             flags += ["-e", f"GOMEMLIMIT={go_memory_limit}"]
+        if block_profile:
+            flags += ["-e", "MINIKV_LOCK_PROFILE=1"]
         args = ["-test.run=^TestCapacityPeer$", "-test.timeout=0"]
         probe = ["wget", "-qO-", "http://127.0.0.1:9122/stats"]
     else:
@@ -78,8 +80,8 @@ def rss(container):
     return memory
 
 
-def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit, server_cpus, driver_cpus, pressure_lengths="fixed"):
-    with engine(binaries, image, name, go_memory_limit, server_cpus) as container:
+def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit, server_cpus, driver_cpus, pressure_lengths="fixed", block_profile=False):
+    with engine(binaries, image, name, go_memory_limit, server_cpus, block_profile) as container:
         flags = [
             "run", "--rm", "--pull=never", "--network", f"container:{container}",
             "--cpus=4",
@@ -89,6 +91,8 @@ def replay(binaries, image, name, profile, rate, duration, tick, go_memory_limit
         ]
         if profile == "pressure":
             flags += ["-pressure-lengths", pressure_lengths]
+            if block_profile:
+                flags += ["-block-profile"]
         else:
             flags[2:2] = ["--pid", f"container:{container}"]
         if driver_cpus:
@@ -132,8 +136,9 @@ def main():
     parser.add_argument("--go-memory-limit", help="set GOMEMLIMIT on the MiniKV server for this run")
     parser.add_argument("--server-cpus", help="pin the server to a Docker CPU set")
     parser.add_argument("--driver-cpus", help="pin the driver to a Docker CPU set")
-    parser.add_argument("--pressure-lengths", default="fixed", choices=("fixed", "repeated", "adjacent", "publish"))
+    parser.add_argument("--pressure-lengths", default="fixed", choices=("fixed", "repeated", "adjacent", "publish", "publish-locality", "publish-aligned"))
     parser.add_argument("--peer-module", type=Path, help="build the MiniKV peer from another checkout")
+    parser.add_argument("--block-profile", action="store_true", help="collect an instrumented Go block profile")
     args = parser.parse_args()
     profiles = args.profiles.split(",")
     if any(p not in ("small", "mixed", "slow", "capacity", "pressure") for p in profiles):
@@ -154,7 +159,7 @@ def main():
                 engines = ("minikv",)
             for name in engines:
                 replay(binaries, args.image, name, profile, rate, args.duration, args.tick,
-                       args.go_memory_limit, args.server_cpus, args.driver_cpus, args.pressure_lengths)
+                       args.go_memory_limit, args.server_cpus, args.driver_cpus, args.pressure_lengths, args.block_profile)
 
 
 if __name__ == "__main__":

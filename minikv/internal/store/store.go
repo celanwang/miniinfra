@@ -111,8 +111,12 @@ func New(config Config) (*Store, error) {
 	return s, nil
 }
 
+func (s *Store) ShardIndex(key string) int {
+	return int(maphash.String(s.seed, key) % uint64(len(s.shards)))
+}
+
 func (s *Store) shardFor(key string) *shard {
-	return &s.shards[maphash.String(s.seed, key)%uint64(len(s.shards))]
+	return &s.shards[s.ShardIndex(key)]
 }
 
 // Get borrows an immutable value after reserve has approved its capacity.
