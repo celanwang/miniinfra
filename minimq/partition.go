@@ -82,13 +82,15 @@ type Message struct {
 }
 
 type PublishRequest struct {
-	ID   string
-	Body []byte
+	ID        string
+	Body      []byte
+	DeliverAt time.Time
 }
 
 type PublishResult struct {
-	ID     string
-	Offset uint64
+	ID        string
+	Offset    uint64
+	Scheduled bool
 }
 
 type HistoryPage struct {
@@ -105,15 +107,19 @@ func (g *OffsetGap) Error() string {
 }
 
 type publishReceipt struct {
-	Digest  [32]byte
-	Result  PublishResult
-	Expires time.Time
+	Digest        [32]byte
+	Result        PublishResult
+	Expires       time.Time
+	VisibleOffset uint64
+	DeliverAt     time.Time
 }
 
 type transaction struct {
 	Sequence     uint64
 	Lower        time.Time
 	Publish      *publication
+	Schedule     *scheduledPublication
+	Due          []publication
 	Register     *registration
 	Tasks        []taskUpdate
 	Ack          *ackReceipt
@@ -121,8 +127,9 @@ type transaction struct {
 }
 
 type publication struct {
-	Message Message
-	Receipt publishReceipt
+	Message          Message
+	Receipt          publishReceipt
+	AcceptedSequence uint64
 }
 
 type storedMessage struct {
@@ -145,6 +152,8 @@ type Partition struct {
 	subscriptions   map[string]*subscription
 	acknowledgments map[string]ackReceipt
 	reserved        int64
+	scheduled       map[string]scheduledPublication
+	due             scheduleQueue
 }
 
 // Open loads the partition in dir and takes exclusive ownership until Close.
@@ -159,6 +168,7 @@ func Open(dir string, config Config) (*Partition, error) {
 		config: config, publishes: make(map[string]publishReceipt),
 		subscriptions:   make(map[string]*subscription),
 		acknowledgments: make(map[string]ackReceipt),
+		scheduled:       make(map[string]scheduledPublication),
 	}
 	j, err := journal.Open(dir, func(string) error {
 		return fmt.Errorf("%w: unexpected checkpoint", ErrCorrupt)
@@ -203,11 +213,12 @@ func (p *Partition) apply(tx transaction) error {
 		return fmt.Errorf("%w: transaction sequence or time regressed", ErrCorrupt)
 	}
 	if pub := tx.Publish; pub != nil {
-		if pub.Message.Offset != p.nextOffset() {
-			return fmt.Errorf("%w: unexpected message offset", ErrCorrupt)
+		if err := p.applyPublication(*pub, tx.Sequence); err != nil {
+			return err
 		}
-		p.history = append(p.history, storedMessage{Message: pub.Message, AcceptedSequence: tx.Sequence})
-		p.publishes[pub.Message.ID] = pub.Receipt
+	}
+	if err := p.applySchedule(tx); err != nil {
+		return err
 	}
 	if err := p.applySubscriptions(tx); err != nil {
 		return err
@@ -217,6 +228,15 @@ func (p *Partition) apply(tx transaction) error {
 		return fmt.Errorf("%w: negative completion budget", ErrCorrupt)
 	}
 	p.sequence, p.timeLower = tx.Sequence, tx.Lower
+	return nil
+}
+
+func (p *Partition) applyPublication(pub publication, acceptedSequence uint64) error {
+	if pub.Message.Offset != p.nextOffset() {
+		return fmt.Errorf("%w: unexpected message offset", ErrCorrupt)
+	}
+	p.history = append(p.history, storedMessage{Message: pub.Message, AcceptedSequence: acceptedSequence})
+	p.publishes[pub.Message.ID] = pub.Receipt
 	return nil
 }
 
@@ -259,16 +279,20 @@ func (p *Partition) Publish(req PublishRequest) (PublishResult, error) {
 		return PublishResult{}, err
 	}
 	digest := sha256.Sum256(req.Body)
-	if old, found := p.publishes[req.ID]; found && now.Lower.Before(old.Expires) {
-		if digest != old.Digest {
+	_, pending := p.scheduled[req.ID]
+	if old, found := p.publishes[req.ID]; found && (pending || now.Lower.Before(old.Expires)) {
+		if digest != old.Digest || !req.DeliverAt.Equal(old.DeliverAt) {
 			return PublishResult{}, ErrConflict
 		}
 		return old.Result, nil
 	}
+	if req.DeliverAt.After(now.Lower) {
+		return p.schedule(req, digest, now)
+	}
 	result := PublishResult{ID: req.ID, Offset: p.nextOffset()}
 	tx := transaction{Lower: now.Lower, ReserveDelta: p.publicationReserve(len(req.Body)), Publish: &publication{
 		Message: Message{ID: req.ID, Offset: result.Offset, Body: bytes.Clone(req.Body), PublishedAt: now.Upper},
-		Receipt: publishReceipt{Digest: digest, Result: result, Expires: now.Upper.Add(p.config.DedupRetention)},
+		Receipt: publishReceipt{Digest: digest, Result: result, VisibleOffset: result.Offset, DeliverAt: req.DeliverAt.UTC(), Expires: now.Upper.Add(p.config.DedupRetention)},
 	}}
 	if err := p.commit(tx); err != nil {
 		return PublishResult{}, err
