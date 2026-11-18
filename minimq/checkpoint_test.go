@@ -1,12 +1,94 @@
 package minimq
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
+
+func TestCheckpointProcessExitAtSyncBoundaries(t *testing.T) {
+	const crashCode = 74
+	cfg := Config{SegmentMessages: 1}
+	if stop := os.Getenv("MINIMQ_TEST_CHECKPOINT_SYNC"); stop != "" {
+		boundary, err := strconv.Atoi(stop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := openTest(t, os.Getenv("MINIMQ_TEST_CHECKPOINT_DIR"), cfg)
+		var calls int
+		p.journal.ObserveSync = func(time.Duration) {
+			calls++
+			if calls == boundary {
+				os.Exit(crashCode)
+			}
+		}
+		if err := p.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatalf("completed without reaching sync %d", boundary)
+	}
+
+	for _, cut := range []struct {
+		name       string
+		sync       int
+		generation uint64
+	}{
+		{"first-segment-data", 1, 2},
+		{"staged-entries-durable", 5, 2},
+		{"head-data-before-replace", 6, 2},
+		{"head-durable-before-collection", 7, 3},
+	} {
+		t.Run(cut.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := openTest(t, dir, cfg)
+			registerTest(t, p, "notify", SubscriptionConfig{LeaseDuration: 2 * time.Minute})
+			publishTest(t, p, "first")
+			if err := p.Compact(); err != nil {
+				t.Fatal(err)
+			}
+			publishTest(t, p, "second")
+			publishTest(t, p, "third")
+			leases := pullTest(t, p, "notify", "worker", 3)
+			ackTest(t, p, "notify", "worker", leases[0], AckAccepted)
+			ackTest(t, p, "notify", "worker", leases[1], AckAccepted)
+			if err := p.Close(); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(os.Args[0], "-test.run=^TestCheckpointProcessExitAtSyncBoundaries$")
+			cmd.Env = append(os.Environ(), "MINIMQ_TEST_CHECKPOINT_DIR="+dir,
+				"MINIMQ_TEST_CHECKPOINT_SYNC="+strconv.Itoa(cut.sync))
+			output, err := cmd.CombinedOutput()
+			var exited *exec.ExitError
+			if !errors.As(err, &exited) || exited.ExitCode() != crashCode {
+				t.Fatalf("child did not exit at the requested boundary: %v\n%s", err, output)
+			}
+			head, err := os.ReadFile(filepath.Join(dir, "HEAD"))
+			if err != nil || len(head) != 24 || binary.LittleEndian.Uint64(head[4:]) != cut.generation {
+				t.Fatalf("expected HEAD generation %d, got %x, %v", cut.generation, head, err)
+			}
+
+			recovered := openTest(t, dir, cfg)
+			page, err := recovered.Read(0, pageLimit)
+			if err != nil || page.Next != 3 || len(page.Messages) != 3 {
+				t.Fatalf("recovered history = %+v, %v", page, err)
+			}
+			for i, want := range []string{"first", "second", "third"} {
+				if string(page.Messages[i].Body) != want {
+					t.Fatalf("body %d = %q, want %q", i, page.Messages[i].Body, want)
+				}
+			}
+			ackTest(t, recovered, "notify", "worker", leases[0], AckPreviouslyAccepted)
+			ackTest(t, recovered, "notify", "worker", leases[1], AckPreviouslyAccepted)
+			pullTest(t, recovered, "notify", "other-worker", 0)
+			ackTest(t, recovered, "notify", "worker", leases[2], AckAccepted)
+		})
+	}
+}
 
 func TestCheckpointPreservesProtectedHistoryAndReclaimsSealedPrefix(t *testing.T) {
 	dir := t.TempDir()

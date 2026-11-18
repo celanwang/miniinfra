@@ -235,23 +235,33 @@ func (j *Journal) installHead(generation uint64, end int64) error {
 	binary.LittleEndian.PutUint64(data[4:], generation)
 	binary.LittleEndian.PutUint64(data[12:], uint64(end))
 	binary.LittleEndian.PutUint32(data[20:], crc32.ChecksumIEEE(data[:20]))
-	return j.InstallFile(filepath.Join(j.dir, "HEAD"), data)
+	if err := j.stageFile(filepath.Join(j.dir, "HEAD"), data); err != nil {
+		return err
+	}
+	return openAndSync(j.dir, j.sync)
 }
 
-func (j *Journal) Checkpoint(data []byte) error {
+// Checkpoint installs new immutable files and rotates to a fresh journal.
+// Segment names must be new to the currently committed generation.
+func (j *Journal) Checkpoint(data []byte, segments map[string][]byte) error {
 	if j.failed != nil {
 		return j.failed
 	}
-	if err := j.checkpoint(data); err != nil {
+	if err := j.checkpoint(data, segments); err != nil {
 		j.failed = fmt.Errorf("partition requires recovery after checkpoint write: %w", err)
 		return j.failed
 	}
 	return nil
 }
 
-func (j *Journal) checkpoint(data []byte) error {
+func (j *Journal) checkpoint(data []byte, segments map[string][]byte) error {
 	next := j.generation + 1
-	if err := j.InstallFile(generationPath(j.dir, "checkpoint", next), data); err != nil {
+	for name, segment := range segments {
+		if err := j.stageFile(filepath.Join(j.dir, name), segment); err != nil {
+			return fmt.Errorf("stage %s: %w", name, err)
+		}
+	}
+	if err := j.stageFile(generationPath(j.dir, "checkpoint", next), data); err != nil {
 		return err
 	}
 	file, err := os.OpenFile(generationPath(j.dir, "journal", next), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -262,6 +272,8 @@ func (j *Journal) checkpoint(data []byte) error {
 		file.Close()
 		return err
 	}
+	// Publish no reference to these files until all of their directory entries
+	// are durable. One barrier covers the segments, image and next journal.
 	if err := openAndSync(j.dir, j.sync); err != nil {
 		file.Close()
 		return err
@@ -317,8 +329,9 @@ func ownedFile(name, prefix string) bool {
 	return true
 }
 
-// InstallFile makes data durable before publishing its name.
-func (j *Journal) InstallFile(path string, data []byte) error {
+// stageFile syncs file contents and renames it. The caller syncs the directory
+// before publishing any durable reference to its name.
+func (j *Journal) stageFile(path string, data []byte) error {
 	temp, err := os.CreateTemp(j.dir, ".minimq-*")
 	if err != nil {
 		return err
@@ -331,10 +344,7 @@ func (j *Journal) InstallFile(path string, data []byte) error {
 	if err := errors.Join(writeErr, temp.Close()); err != nil {
 		return err
 	}
-	if err := os.Rename(temp.Name(), path); err != nil {
-		return err
-	}
-	return openAndSync(j.dir, j.sync)
+	return os.Rename(temp.Name(), path)
 }
 
 func syncDirectory(dir string) error {

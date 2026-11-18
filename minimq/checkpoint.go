@@ -187,13 +187,7 @@ func (p *Partition) compact(now TimeBounds) error {
 	if scratch > available || scratch+p.storageBytes() > p.config.CapacityBytes {
 		return ErrCapacity
 	}
-	for name, data := range files {
-		if err := p.journal.InstallFile(filepath.Join(p.journal.Dir(), name), data); err != nil {
-			p.failed = fmt.Errorf("partition requires recovery after writing history segment: %w", err)
-			return p.failed
-		}
-	}
-	if err := p.journal.Checkpoint(payload); err != nil {
+	if err := p.journal.Checkpoint(payload, files); err != nil {
 		p.failed = err
 		return err
 	}
