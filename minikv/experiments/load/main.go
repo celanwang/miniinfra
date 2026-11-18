@@ -470,15 +470,21 @@ func main() {
 	tick := flag.Duration("tick", time.Millisecond, "fixed arrival batch interval")
 	lengths := flag.String("pressure-lengths", "fixed", "pressure write size and locality pattern")
 	blockProfile := flag.Bool("block-profile", false, "fetch a Go block profile from the fixture")
-	ttlPattern := flag.String("ttl-pattern", "clustered", "clustered or spread TTL expiry")
+	ttlPattern := flag.String("ttl-pattern", "clustered", "clustered, spread, byte-fit, or byte-limit TTL expiry")
 	flag.Parse()
 	t := target{address: "127.0.0.1:7321", redis: *redis}
 	encoder := json.NewEncoder(os.Stdout)
 	if *profile == "ttl" && !*redis {
-		if *ttlPattern != "clustered" && *ttlPattern != "spread" {
+		var result map[string]any
+		switch *ttlPattern {
+		case "clustered", "spread":
+			result = runTTL(t, *ttlPattern)
+		case "byte-fit", "byte-limit":
+			result = runTTLBytes(t, *ttlPattern)
+		default:
 			log.Fatal("invalid TTL pattern")
 		}
-		if err := encoder.Encode(runTTL(t, *ttlPattern)); err != nil {
+		if err := encoder.Encode(result); err != nil {
 			log.Fatal(err)
 		}
 		return

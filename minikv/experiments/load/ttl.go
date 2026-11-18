@@ -46,14 +46,19 @@ type ttlWork struct {
 
 func runTTL(t target, pattern string) map[string]any {
 	result := make(map[string]any)
-	layout, err := ttlLayout()
+	layout, err := ttlLayout(ttlShardSlots, 4)
 	if err != nil {
 		result["SetupError"] = err.Error()
 		return result
 	}
 	oldValue := bytes.Repeat([]byte("o"), smallSize)
 	firstDeadline := time.Now().Add(4 * time.Second)
-	fill := populateTTL(t, layout, firstDeadline, pattern, oldValue)
+	fill := populateTTL(t, layout, ttlShardSlots, func(slot int) ([]byte, time.Time) {
+		if slot%2 == 0 {
+			return oldValue, ttlDeadline(firstDeadline, pattern, slot)
+		}
+		return oldValue, time.Time{}
+	})
 	result["Prefill"] = fill
 	if fill[ok] != ttlShards*ttlShardSlots || time.Until(firstDeadline) < 650*time.Millisecond {
 		result["SetupError"] = "could not prefill all slots before the read window"
@@ -78,28 +83,11 @@ func runTTL(t target, pattern string) map[string]any {
 	lastDeadline := deadlines[len(deadlines)-1]
 	result["LastDeadlineMS"] = lastDeadline.Sub(firstDeadline).Milliseconds()
 
-	var wg sync.WaitGroup
-	reads := make([][]pressureRead, ttlReads)
-	jobs := make(chan arrival, 256)
-	var scheduled, unused counts
-	readStart := firstDeadline.Add(-400 * time.Millisecond)
-	go schedule(readStart, 5*time.Second, 250*time.Microsecond, 10000, jobs, make(chan arrival, 8), &scheduled, &unused)
-	for shard := range ttlReads {
-		wg.Go(func() {
-			c := client{target: t}
-			defer c.close()
-			get := t.makeCommand(layout[shard][3073].key, nil, smallSize)
-			for job := range jobs {
-				started := time.Now()
-				_, status := c.execute(get, smallSize, 0)
-				end := time.Now()
-				reads[shard] = append(reads[shard], pressureRead{job.at, end.Sub(job.at), end.Sub(started), status})
-			}
-		})
-	}
+	finishReads := startTTLReads(t, layout, 3073, firstDeadline)
 
 	refillStart := firstDeadline.Add(40 * time.Millisecond)
 	work := make([]ttlWork, ttlShards)
+	var wg sync.WaitGroup
 	for shard := range ttlShards {
 		wg.Go(func() { work[shard] = exerciseTTL(t, layout[shard], firstDeadline, refillStart) })
 	}
@@ -121,15 +109,40 @@ func runTTL(t target, pattern string) map[string]any {
 	wg.Wait()
 	result["Samples"] = samples
 	result["ShardWork"] = work
-	result["ReadSchedule"] = map[string]int{"Offered": scheduled.Offered, "Waiting": scheduled.Waiting, "Late": scheduled.Late}
-	result["Reads"] = pressureReadPhases(reads, firstDeadline.Add(-50*time.Millisecond), firstDeadline.Add(500*time.Millisecond))
+	result["ReadSchedule"], result["Reads"] = finishReads()
 	return result
 }
 
-func ttlLayout() ([][]ttlEntry, error) {
-	const refillKeys = 4
+func startTTLReads(t target, layout [][]ttlEntry, hotSlot int, first time.Time) func() (map[string]int, map[string]*pressurePhase) {
+	var wg sync.WaitGroup
+	reads := make([][]pressureRead, ttlReads)
+	jobs := make(chan arrival, 256)
+	var scheduled, unused counts
+	readStart := first.Add(-400 * time.Millisecond)
+	go schedule(readStart, 5*time.Second, 250*time.Microsecond, 10000, jobs, make(chan arrival, 8), &scheduled, &unused)
+	for shard := range ttlReads {
+		wg.Go(func() {
+			c := client{target: t}
+			defer c.close()
+			get := t.makeCommand(layout[shard][hotSlot].key, nil, smallSize)
+			for job := range jobs {
+				started := time.Now()
+				_, status := c.execute(get, smallSize, 0)
+				end := time.Now()
+				reads[shard] = append(reads[shard], pressureRead{job.at, end.Sub(job.at), end.Sub(started), status})
+			}
+		})
+	}
+	return func() (map[string]int, map[string]*pressurePhase) {
+		wg.Wait()
+		return map[string]int{"Offered": scheduled.Offered, "Waiting": scheduled.Waiting, "Late": scheduled.Late},
+			pressureReadPhases(reads, first.Add(-50*time.Millisecond), first.Add(500*time.Millisecond))
+	}
+}
+
+func ttlLayout(slots, refillKeys int) ([][]ttlEntry, error) {
 	layout := make([][]ttlEntry, ttlShards)
-	remaining := ttlShards * (ttlShardSlots + refillKeys)
+	remaining := ttlShards * (slots + refillKeys)
 	keys := make([]string, 1024)
 	for base := 0; remaining > 0; base += len(keys) {
 		for i := range keys {
@@ -143,7 +156,7 @@ func ttlLayout() ([][]ttlEntry, error) {
 			if shard < 0 || shard >= ttlShards {
 				return nil, fmt.Errorf("invalid shard %d", shard)
 			}
-			if len(layout[shard]) < ttlShardSlots+refillKeys {
+			if len(layout[shard]) < slots+refillKeys {
 				layout[shard] = append(layout[shard], ttlEntry{key: keys[i]})
 				remaining--
 			}
@@ -168,7 +181,7 @@ func ttlWrite(key string, value []byte, ttl string, nx bool) command {
 	return command{frame: append(header, value...), reply: "STORED\n", set: true}
 }
 
-func populateTTL(t target, layout [][]ttlEntry, first time.Time, pattern string, value []byte) map[outcome]int {
+func populateTTL(t target, layout [][]ttlEntry, slots int, object func(int) ([]byte, time.Time)) map[outcome]int {
 	var wg sync.WaitGroup
 	partial := make([]map[outcome]int, len(layout))
 	for i, keys := range layout {
@@ -176,11 +189,12 @@ func populateTTL(t target, layout [][]ttlEntry, first time.Time, pattern string,
 			c := client{target: t}
 			defer c.close()
 			partial[i] = make(map[outcome]int)
-			for slot := range ttlShardSlots {
+			for slot := range slots {
 				entry := &keys[slot]
+				value, deadline := object(slot)
 				ttl := "NONE"
-				if slot%2 == 0 {
-					remaining := time.Until(ttlDeadline(first, pattern, slot))
+				if !deadline.IsZero() {
+					remaining := time.Until(deadline)
 					if remaining <= 0 {
 						partial[i][timeout]++
 						continue
@@ -278,18 +292,12 @@ func ttlValueMatches(c *client, key string, expected []byte) bool {
 }
 
 func ttlStats(t target, at, first time.Time, deadlines []time.Time) (ttlSample, error) {
-	raw, err := diagnostics(t)
+	shards, err := ttlShardStats(t)
 	if err != nil {
 		return ttlSample{}, err
 	}
-	var stats struct {
-		Shards []ttlSample
-	}
-	if err := json.Unmarshal(raw, &stats); err != nil || len(stats.Shards) != ttlShards {
-		return ttlSample{}, fmt.Errorf("could not decode all shard stats")
-	}
 	total := ttlSample{OffsetMS: at.Sub(first).Milliseconds()}
-	for _, shard := range stats.Shards {
+	for _, shard := range shards {
 		total.Expired += shard.Expired
 		total.Evicted += shard.Evicted
 		total.Rejected += shard.Rejected
@@ -307,4 +315,18 @@ func ttlStats(t target, at, first time.Time, deadlines []time.Time) (ttlSample, 
 	// replace one expired key in place via NX. Subtract both conservatively.
 	total.PendingAtLeast = max(0, due-int(total.Expired+total.Evicted)-ttlShards)
 	return total, nil
+}
+
+func ttlShardStats(t target) ([]ttlSample, error) {
+	raw, err := diagnostics(t)
+	if err != nil {
+		return nil, err
+	}
+	var stats struct {
+		Shards []ttlSample
+	}
+	if err := json.Unmarshal(raw, &stats); err != nil || len(stats.Shards) != ttlShards {
+		return nil, fmt.Errorf("could not decode all shard stats")
+	}
+	return stats.Shards, nil
 }
