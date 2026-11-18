@@ -103,10 +103,28 @@ func (p *Partition) Compact() error {
 	if err != nil {
 		return err
 	}
+	if timings := p.timings; timings != nil {
+		timings.checkpoint = checkpointTiming{}
+		if timings.checkpointLocked != nil {
+			timings.checkpointLocked()
+		}
+	}
 	return p.compact(now)
 }
 
+func checkpointStart(stats *checkpointTiming) time.Time {
+	if stats != nil {
+		return time.Now()
+	}
+	return time.Time{}
+}
+
 func (p *Partition) compact(now TimeBounds) error {
+	var stats *checkpointTiming
+	if p.timings != nil {
+		stats = &p.timings.checkpoint
+	}
+	start := checkpointStart(stats)
 	image := checkpoint{
 		Sequence: p.sequence, TimeLower: now.Lower, First: p.firstOffset, Reserved: p.reserved,
 		Segments:  append([]segment(nil), p.segments...),
@@ -121,6 +139,9 @@ func (p *Partition) compact(now TimeBounds) error {
 	maps.DeleteFunc(image.Acks, func(_ string, r ackReceipt) bool { return !now.Lower.Before(r.Expires) })
 	maps.DeleteFunc(image.Dead, func(_ string, d DeadLetter) bool { return !now.Lower.Before(d.Expires) })
 	maps.DeleteFunc(image.RedriveReceipts, func(_ string, r redriveReceipt) bool { return !now.Lower.Before(r.Expires) })
+	if stats != nil {
+		stats.prepare = time.Since(start)
+	}
 
 	var files = make(map[string][]byte)
 	sealed := 0
@@ -138,7 +159,7 @@ func (p *Partition) compact(now TimeBounds) error {
 			break
 		}
 		s := segment{Base: chunk[0].Offset, Count: count, Newest: newest}
-		data, err := encodeSegment(&s, chunk)
+		data, err := encodeSegment(&s, chunk, stats)
 		if err != nil {
 			return err
 		}
@@ -170,7 +191,11 @@ func (p *Partition) compact(now TimeBounds) error {
 		len(image.Dead) == len(p.dead) && len(image.RedriveReceipts) == len(p.redriveReceipts) {
 		return nil
 	}
+	start = checkpointStart(stats)
 	payload, err := json.Marshal(image)
+	if stats != nil {
+		stats.encode += time.Since(start)
+	}
 	if err != nil {
 		return err
 	}
@@ -201,7 +226,17 @@ func (p *Partition) compact(now TimeBounds) error {
 	p.timeLower, p.checkpointBytes = image.TimeLower, int64(len(payload))
 	p.publishes, p.acknowledgments, p.dead = image.Publishes, image.Acks, image.Dead
 	p.redriveReceipts = image.RedriveReceipts
-	if err := p.collectFiles(); err != nil {
+	start = checkpointStart(stats)
+	var syncBefore time.Duration
+	if stats != nil {
+		syncBefore = p.timings.time
+	}
+	err = p.collectFiles()
+	if stats != nil {
+		stats.cleanup = time.Since(start)
+		stats.cleanupSync = p.timings.time - syncBefore
+	}
+	if err != nil {
 		p.failed = fmt.Errorf("partition requires recovery after file collection: %w", err)
 		return p.failed
 	}

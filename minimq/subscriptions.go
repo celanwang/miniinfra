@@ -335,7 +335,9 @@ func validateLease(current leaseState, now TimeBounds, clockErr error, worker, t
 
 // Ack confirms a single lease and can be retried with the same token.
 func (p *Partition) Ack(name, worker, instance, token string) (AckResult, error) {
-	defer p.endOperation("ack", p.beginOperation())
+	sample := p.beginOperation()
+	sample.worker = worker
+	defer p.endOperation("ack", sample)
 	if err := p.checkOpen(); err != nil {
 		return "", err
 	}

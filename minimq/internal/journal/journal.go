@@ -29,7 +29,8 @@ type Journal struct {
 	failed     error
 
 	// ObserveSync is optional. Set it before serving requests.
-	ObserveSync func(time.Duration)
+	ObserveSync  func(time.Duration)
+	ObserveWrite func(time.Duration)
 }
 
 func generationPath(dir, name string, generation uint64) string {
@@ -337,7 +338,14 @@ func (j *Journal) stageFile(path string, data []byte) error {
 		return err
 	}
 	defer os.Remove(temp.Name())
+	var start time.Time
+	if j.ObserveWrite != nil {
+		start = time.Now()
+	}
 	_, writeErr := temp.Write(data)
+	if j.ObserveWrite != nil {
+		j.ObserveWrite(time.Since(start))
+	}
 	if writeErr == nil {
 		writeErr = j.sync(temp)
 	}

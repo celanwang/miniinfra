@@ -36,11 +36,16 @@ func (s *segment) name() string { return fmt.Sprintf("history-%016x", s.Base) }
 // fields and the eight-byte length/checksum header.
 const maxHistoryFrame = (MaxMessageBytes+2)/3*4 + 4096
 
-func encodeSegment(s *segment, messages []storedMessage) ([]byte, error) {
+func encodeSegment(s *segment, messages []storedMessage, stats *checkpointTiming) ([]byte, error) {
 	var data bytes.Buffer
 	s.records = make([]segmentRecord, 0, len(messages))
 	for _, msg := range messages {
+		start := checkpointStart(stats)
 		payload, err := json.Marshal(msg)
+		if stats != nil {
+			stats.encode += time.Since(start)
+			start = time.Now()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -52,6 +57,9 @@ func encodeSegment(s *segment, messages []storedMessage) ([]byte, error) {
 			position: int64(data.Len()), accepted: msg.AcceptedSequence, bodyBytes: len(msg.Body),
 		})
 		data.Write(frame)
+		if stats != nil {
+			stats.frame += time.Since(start)
+		}
 	}
 	s.Bytes = int64(data.Len())
 	return data.Bytes(), nil
