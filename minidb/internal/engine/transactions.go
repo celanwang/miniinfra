@@ -119,9 +119,16 @@ func (view Snapshot) sees(state *transactionState) bool {
 
 // Rows returns all visible rows, or probes an equality index when the supplied
 // columns match one. indexed reports whether the probe was performed.
+func (view Snapshot) Rows(ctx context.Context, name string, columns []int, values []Value) ([][]Value, bool, error) {
+	return view.RowsMatching(ctx, name, columns, values, nil)
+}
+
+// RowsMatching copies only the visible rows accepted by keep. A nil predicate
+// accepts every visible row. The predicate runs under the table read latch.
+// It may inspect the row but must not mutate or retain it, access tables, or do I/O.
 // Reclamation can move live versions between slots, so a heap scan keeps
 // the latch until it finishes or is canceled.
-func (view Snapshot) Rows(ctx context.Context, name string, columns []int, values []Value) (rows [][]Value, indexed bool, err error) {
+func (view Snapshot) RowsMatching(ctx context.Context, name string, columns []int, values []Value, keep func([]Value) bool) (rows [][]Value, indexed bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
@@ -147,7 +154,7 @@ func (view Snapshot) Rows(ctx context.Context, name string, columns []int, value
 					}
 				}
 				examined++
-				if view.visible(row) {
+				if view.visible(row) && (keep == nil || keep(row.values)) {
 					rows = append(rows, slices.Clone(row.values))
 				}
 			}
@@ -159,7 +166,7 @@ func (view Snapshot) Rows(ctx context.Context, name string, columns []int, value
 			return nil, false, err
 		}
 		for _, row := range page {
-			if view.visible(row) {
+			if view.visible(row) && (keep == nil || keep(row.values)) {
 				rows = append(rows, slices.Clone(row.values))
 			}
 		}

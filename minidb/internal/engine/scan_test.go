@@ -36,9 +36,13 @@ func TestRowsStopMidScan(t *testing.T) {
 			defer cancel()
 			// Observe cancellation after one page of candidates.
 			interrupted := &scanCancelContext{Context: ctx, cancel: cancel, checks: 4}
-			rows, indexed, err := view.Rows(interrupted, def.Name, tc.columns, []Value{Int(1)})
-			if !errors.Is(err, context.Canceled) || len(rows) != 0 || indexed != (len(tc.columns) > 0) {
-				t.Fatalf("canceled scan returned %d rows indexed=%t err=%v", len(rows), indexed, err)
+			examined := 0
+			rows, indexed, err := view.RowsMatching(interrupted, def.Name, tc.columns, []Value{Int(1)}, func([]Value) bool {
+				examined++
+				return false
+			})
+			if !errors.Is(err, context.Canceled) || len(rows) != 0 || indexed != (len(tc.columns) > 0) || examined != heapPageRows {
+				t.Fatalf("canceled scan examined %d candidates and returned %d rows indexed=%t err=%v", examined, len(rows), indexed, err)
 			}
 			rows, _, err = view.Rows(t.Context(), def.Name, tc.columns, []Value{Int(1)})
 			if err != nil || len(rows) != 4*heapPageRows {
