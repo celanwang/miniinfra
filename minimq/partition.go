@@ -98,23 +98,10 @@ type PublishResult struct {
 	Scheduled bool
 }
 
-type HistoryPage struct {
-	Messages []Message
-	Next     uint64
-}
-
 type PartitionStatus struct {
 	FirstOffset, NextOffset                 uint64
 	StoredBytes, ReservedBytes              int64
 	Scheduled, DeadLetters, PendingRedrives int
-}
-
-type OffsetGap struct {
-	Requested, First uint64
-}
-
-func (g *OffsetGap) Error() string {
-	return fmt.Sprintf("offset %d is below readable start %d", g.Requested, g.First)
 }
 
 type publishReceipt struct {
@@ -151,6 +138,7 @@ type storedMessage struct {
 }
 
 type Partition struct {
+	// Read and Close acquire historyReadMu before mu.
 	historyReadMu sync.Mutex
 	mu            sync.Mutex
 	config        Config
@@ -162,7 +150,7 @@ type Partition struct {
 	sequence        uint64
 	timeLower       time.Time
 	firstOffset     uint64
-	readStart       atomic.Pointer[uint64]
+	readStart       atomic.Pointer[uint64] // First offset of an active page that starts in sealed history.
 	tailOffset      uint64
 	tail            []storedMessage
 	publishes       map[string]publishReceipt
@@ -453,82 +441,6 @@ func (p *Partition) Publish(req PublishRequest) (PublishResult, error) {
 		return PublishResult{}, err
 	}
 	return result, nil
-}
-
-func (p *Partition) planHistoryRead(offset uint64, limit Limits) ([]historyLocation, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := p.checkOpen(); err != nil {
-		return nil, err
-	}
-	if !limit.valid() {
-		return nil, ErrInvalid
-	}
-	if offset < p.firstOffset {
-		return nil, &OffsetGap{Requested: offset, First: p.firstOffset}
-	}
-	if offset >= p.nextOffset() {
-		return nil, nil
-	}
-	end := offset + min(p.nextOffset()-offset, uint64(limit.Messages))
-	batch := make([]historyLocation, 0, end-offset)
-	for next := offset; next < end; next++ {
-		loc := p.locateHistory(next)
-		if loc.record.bodyBytes > limit.Bytes {
-			if len(batch) == 0 {
-				return nil, fmt.Errorf("%w: next message requires %d bytes", ErrInvalid, loc.record.bodyBytes)
-			}
-			break
-		}
-		limit.Bytes -= loc.record.bodyBytes
-		batch = append(batch, loc)
-	}
-	if batch[0].segment != nil {
-		p.readStart.Store(&offset)
-	}
-	return batch, nil
-}
-
-func (p *Partition) finishHistoryRead(err error) {
-	if err != nil {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		if p.failed == nil {
-			p.failed = err
-		}
-	}
-	p.readStart.Store(nil)
-}
-
-func (p *Partition) Read(offset uint64, limit Limits) (HistoryPage, error) {
-	// Serialize history reads to bound scratch space and disk concurrency per
-	// partition. The selected range pins its sealed segments until the read ends.
-	p.historyReadMu.Lock()
-	defer p.historyReadMu.Unlock()
-	batch, err := p.planHistoryRead(offset, limit)
-	if err != nil {
-		return HistoryPage{}, err
-	}
-	page := HistoryPage{Next: offset}
-	if len(batch) == 0 {
-		return page, nil
-	}
-	reader := historyReader{dir: p.journal.Dir()}
-	defer func() {
-		reader.close()
-		p.finishHistoryRead(err)
-	}()
-	page.Messages = make([]Message, 0, len(batch))
-	for _, loc := range batch {
-		var msg Message
-		msg, err = reader.read(page.Next, loc)
-		if err != nil {
-			return HistoryPage{}, err
-		}
-		page.Messages = append(page.Messages, msg)
-		page.Next++
-	}
-	return page, nil
 }
 
 func (p *Partition) Close() error {
