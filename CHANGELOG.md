@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB measures foreground lock waits during version reclamation under concurrent reads and writes.
 - MiniKV documents its memory limit under mixed-size writes and verifies successful and rejected requests in one workload.
 - MiniKV replaces idle buffers when write sizes change so near-full caches can reuse memory across workloads.
 - MiniDB reclaims row and index versions between active statement snapshots during long-running queries.
