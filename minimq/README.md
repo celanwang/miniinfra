@@ -30,3 +30,5 @@ See the [design](docs/plan/design.md) for failure guarantees and the [recovery n
 The [checkpoint experiment](docs/checkpoint-experiment.md) covers repeatable backlog and history workloads under the broker's default maintenance cycle.
 
 The [scheduled release experiment](docs/scheduling-experiment.md) covers simultaneous deadlines, foreground traffic, and broker restarts.
+
+The [lease expiration experiment](docs/retry-experiment.md) measures lock contention during retry and dead-letter batches.
