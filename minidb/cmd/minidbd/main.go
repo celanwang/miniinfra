@@ -18,6 +18,10 @@ func main() {
 	addr := flag.String("listen", "127.0.0.1:7432", "TCP listen address")
 	dir := flag.String("data", ".", "existing data directory")
 	flag.Parse()
+	if flag.NArg() != 0 {
+		log.Printf("unexpected positional arguments: %q", flag.Args())
+		os.Exit(2)
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if err := run(ctx, *addr, *dir); err != nil {
@@ -27,15 +31,16 @@ func main() {
 }
 
 func run(ctx context.Context, addr, dir string) (err error) {
-	db, err := engine.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, db.Close()) }()
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
+	db, err := engine.Open(dir)
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	defer func() { err = errors.Join(err, db.Close()) }()
 	log.Printf("MiniDB listening on %s", listener.Addr())
 	return server.Serve(ctx, listener, db)
 }

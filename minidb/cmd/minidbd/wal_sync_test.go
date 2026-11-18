@@ -29,7 +29,7 @@ type batchOrder struct {
 // reopens that directory. Hardware durability is outside this fault model.
 func TestWALGroupSyncFailureRecoversCompletePrefix(t *testing.T) {
 	dir := t.TempDir()
-	addr, kill := launchCommand(t, exec.Command(buildSyncFailureDaemon(t), "-listen", "127.0.0.1:0", "-data", dir))
+	addr, kill, _ := launchCommand(t, exec.Command(buildSyncFailureDaemon(t), "-listen", "127.0.0.1:0", "-data", dir))
 	db := client.Open(addr)
 	defer db.Close()
 	defer kill()

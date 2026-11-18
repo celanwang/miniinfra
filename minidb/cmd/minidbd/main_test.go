@@ -34,10 +34,11 @@ func launch(t *testing.T, dir string) (string, func()) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestServeProcess$")
 	cmd.Env = append(os.Environ(), "MINIDB_TEST_DAEMON_DIR="+dir)
-	return launchCommand(t, cmd)
+	addr, stop, _ := launchCommand(t, cmd)
+	return addr, stop
 }
 
-func launchCommand(t *testing.T, cmd *exec.Cmd) (string, func()) {
+func launchCommand(t *testing.T, cmd *exec.Cmd) (string, func(), func() error) {
 	t.Helper()
 	output, err := cmd.StderrPipe()
 	if err != nil {
@@ -47,11 +48,14 @@ func launchCommand(t *testing.T, cmd *exec.Cmd) (string, func()) {
 		t.Fatal(err)
 	}
 	var once sync.Once
+	var waitErr error
+	wait := func() error {
+		once.Do(func() { waitErr = cmd.Wait() })
+		return waitErr
+	}
 	stop := func() {
-		once.Do(func() {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		})
+		_ = cmd.Process.Kill()
+		_ = wait()
 	}
 	t.Cleanup(stop)
 	address := make(chan string, 1)
@@ -70,10 +74,10 @@ func launchCommand(t *testing.T, cmd *exec.Cmd) (string, func()) {
 		if addr == "" {
 			t.Fatal("daemon exited before opening its listener")
 		}
-		return addr, stop
+		return addr, stop, wait
 	case <-time.After(5 * time.Second):
 		t.Fatal("daemon did not open its listener")
-		return "", stop
+		return "", stop, wait
 	}
 }
 
