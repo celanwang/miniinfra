@@ -1,12 +1,148 @@
 package minimq
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestRedriveBodySurvivesExternalMutationAndSourceRemoval(t *testing.T) {
+	dir := t.TempDir()
+	base := walFixtureTime
+	now := base
+	cfg := Config{
+		Clock: testClock(&now), SegmentMessages: 1,
+		HistoryRetention: time.Minute, DeadRetention: 2 * time.Minute,
+	}
+	p := openTest(t, dir, cfg)
+	const delay = time.Second
+	registerTest(t, p, "notify", SubscriptionConfig{MaxAttempts: 2, RetryDelay: delay})
+	wantBody := bytes.Repeat([]byte{'m'}, 128<<10)
+	input := bytes.Clone(wantBody)
+	if _, err := p.Publish(PublishRequest{ID: "original", Body: input}); err != nil {
+		t.Fatal(err)
+	}
+	input[0] = 'x'
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	limit := Limits{Messages: 1, Bytes: len(wantBody)}
+	pull := func() Delivery {
+		t.Helper()
+		got, err := p.Pull("notify", "worker", limit)
+		if err != nil || len(got) != 1 || !bytes.Equal(got[0].Message.Body, wantBody) {
+			t.Fatalf("Pull returned %d deliveries, %v, or changed body", len(got), err)
+		}
+		return got[0]
+	}
+	fail := func(d Delivery) FailureResult {
+		t.Helper()
+		got, err := p.Fail("notify", "worker", d.Instance, d.Token, "fixture")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	source := pull()
+	source.Message.Body[0] = 'y'
+	now = fail(source).RetryAt
+	deadID := fail(pull()).DeadLetterID
+	if deadID == "" {
+		t.Fatal("source did not become a dead letter")
+	}
+	expires := now.Add(cfg.DeadRetention)
+	now = base.Add(cfg.HistoryRetention)
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	var gap *OffsetGap
+	if _, err := p.Read(0, limit); !errors.As(err, &gap) || gap.First != 1 {
+		t.Fatalf("source history was not reclaimed: %v", err)
+	}
+
+	before, err := p.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCapacity, oldEnd := p.config.CapacityBytes, p.journal.End()
+	p.config.CapacityBytes = 4096
+	_, err = p.Redrive("notify", deadID, "operator-1")
+	p.config.CapacityBytes = oldCapacity
+	if status, statusErr := p.Status(); !errors.Is(err, ErrCapacity) || statusErr != nil ||
+		status != before || len(p.redriveReceipts) != 0 || p.journal.End() != oldEnd {
+		t.Fatalf("rejected redrive changed status, receipt or WAL: %v, %v", err, statusErr)
+	}
+	admit := func(op string) RedriveResult {
+		t.Helper()
+		result, err := p.Redrive("notify", deadID, op)
+		if err != nil || result.Instance == "" || result.SourceDeadLetterID != deadID {
+			t.Fatalf("operation %s returned %+v, %v", op, result, err)
+		}
+		return result
+	}
+	first, second, third := admit("operator-1"), admit("operator-2"), admit("operator-3")
+	if first.Instance == second.Instance || first.Instance == third.Instance || second.Instance == third.Instance ||
+		admit("operator-1") != first {
+		t.Fatal("wrong instance identity for an independent or repeated operation")
+	}
+	reserve := p.subscriptions["notify"].Config.taskReserve(len(wantBody))
+	if status, err := p.Status(); err != nil || status.PendingRedrives != 3 || status.ReservedBytes != before.ReservedBytes+3*reserve {
+		t.Fatalf("redrive reservation = %+v, %v", status, err)
+	}
+
+	letter, err := p.GetDeadLetter("notify", deadID)
+	if err != nil || !bytes.Equal(letter.Message.Body, wantBody) {
+		t.Fatalf("GetDeadLetter body = %v", err)
+	}
+	letter.Message.Body[0] = 'a'
+	list, err := p.ListDeadLetters("notify", "", 1)
+	if err != nil || len(list) != 1 || !bytes.Equal(list[0].Message.Body, wantBody) {
+		t.Fatalf("ListDeadLetters body = %v", err)
+	}
+	list[0].Message.Body[len(wantBody)-1] = 'b'
+	pullRedrive := func(result RedriveResult, attempt int) Delivery {
+		t.Helper()
+		d := pull()
+		if d.Instance != result.Instance || d.Attempt != attempt {
+			t.Fatalf("got instance %s attempt %d, want %s attempt %d", d.Instance, d.Attempt, result.Instance, attempt)
+		}
+		return d
+	}
+	d := pullRedrive(first, 1)
+	d.Message.Body[0] = 'c'
+	now = fail(d).RetryAt
+	ackTest(t, p, "notify", "worker", pullRedrive(first, 2), AckAccepted)
+	if letter, err := p.GetDeadLetter("notify", deadID); err != nil || !bytes.Equal(letter.Message.Body, wantBody) {
+		t.Fatalf("retry changed the original dead letter: %v", err)
+	}
+	now = expires
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.dead) != 0 {
+		t.Fatal("checkpoint retained the expired source letter")
+	}
+	d = pullRedrive(second, 1)
+	d.Message.Body[0] = 'd'
+	ackTest(t, p, "notify", "worker", d, AckAccepted)
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, cfg)
+	ackTest(t, p, "notify", "worker", d, AckPreviouslyAccepted)
+	if admit("operator-3") != third {
+		t.Fatal("recovery lost the redrive operation receipt")
+	}
+	now = now.Add(redriveInterval)
+	ackTest(t, p, "notify", "worker", pullRedrive(third, 1), AckAccepted)
+	if status, err := p.Status(); err != nil || status.PendingRedrives != 0 ||
+		status.ReservedBytes != before.ReservedBytes || status.NextOffset != before.NextOffset {
+		t.Fatalf("status after settling redrives = %+v, %v", status, err)
+	}
+}
 
 func TestRedriveAfterOriginalSegmentAndDeadLetterAreRemoved(t *testing.T) {
 	dir := t.TempDir()
