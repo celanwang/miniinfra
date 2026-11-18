@@ -466,7 +466,7 @@ GOWORK=off python3 experiments/capacity.py --profiles ttl --ttl-pattern byte-lim
 
 ## 小 GET 响应发送
 
-逐段写先发 `VALUE` 头，再发非空值。对照用 `net.Buffers.WriteTo`，在 Linux TCP 上把同一响应的两段交给 `writev`。连接复用两个切片描述符，发送结束或出错时清除值引用。空值只发头部。一次写截止时间覆盖完整响应，出站额度一直保留至发送返回。响应正文直接引用不可变值。 [Go `net.Buffers`](https://pkg.go.dev/net#Buffers.WriteTo)
+逐段写基线先发 `VALUE` 头，再发非空值。对照用 `net.Buffers.WriteTo`，在 Linux TCP 上把同一响应的两段交给 `writev`。连接复用两个切片描述符，发送结束或出错时清除值引用。空值只发头部。一次写截止时间覆盖完整响应，出站额度一直保留至发送返回。响应正文直接引用不可变值。 [Go `net.Buffers`](https://pkg.go.dev/net#Buffers.WriteTo)
 
 用同一发压二进制和 250 µs 节拍，分别在 30k/s 回放小值、即时混合和慢读，在 100k/s 回放小值。每个负载跑三对，交换组内顺序。服务和客户端分别固定 CPU 0–1、2–5，服务容器上限 160 MiB。每轮新容器，连续发压 6 秒。服务端取 `/proc/1/stat` 用户态加内核态 CPU，并以 `/proc/1/io` 的 `syscw` 差值记录 `write` 和 `writev` 在内的进程写调用。用所有成功响应归一，其中小值组约 95% 是非空命中。在线 P99 从计划发送时刻计时，另报从实际发送到读完的 RTT P99，以及发压器 CPU、队列满和调度晚发。 [Linux 进程 I/O 计数](https://docs.kernel.org/filesystems/proc.html#proc-pid-io-display-the-io-accounting-fields) · [Linux `write` 和 `writev` 实现](https://github.com/torvalds/linux/blob/v6.14/fs/read_write.c)
 
@@ -484,7 +484,7 @@ GOWORK=off python3 experiments/capacity.py --profiles ttl --ttl-pattern byte-lim
 
 30k/s 小值组三对的服务 CPU 降幅为 8%–18%，中位数口径下降约 13%。三对 RTT P99 均上升。100k/s 小值的完成率配对变化为 +0.42、+0.14、−0.27 个百分点，150k/s 为 +0.36、+1.30、−0.54 个百分点。150k/s 的待发队列满计数中位数为 96,398 / 92,644，调度晚发每轮最多 675 个，客户端 CPU 中位数为 8.33 / 7.85 秒。队列计数定位了未发请求所在的位置，等待派发也受连接何时读完响应影响，单凭计数无法归因于发压器或服务上限。
 
-**保留逐段写。** 向量写节省了约一次非空命中的写调用和一部分服务 CPU。在本机回环与这些负载下，客户端尾延迟和高负载完成率均未达到采用门槛。真实 TCP 测试覆盖空值，以及 1 MiB 响应在覆盖后完整读出旧值、写超时截断、客户端断开和出站额度归还。向量写只保留为复跑补丁。
+**本轮保留逐段写。** 向量写节省了约一次非空命中的写调用和一部分服务 CPU。在本机回环与这些负载下，客户端尾延迟和高负载完成率均未达到采用门槛。真实 TCP 测试覆盖空值，以及 1 MiB 响应在覆盖后完整读出旧值、写超时截断、客户端断开和出站额度归还。向量写只保留为复跑补丁。
 
 从组件目录准备两个对照服务，复用当前驱动。只取输出中 `Engine` 为 `minikv` 的行，每对交换 `direct` 与 `vector` 的顺序。用同样参数把负载改成 `--profiles small --rates 100000,150000`，可复跑高负载。
 
@@ -498,6 +498,36 @@ git -C "$peers/vector" apply --unidiff-zero "$PWD/experiments/get-writev.patch"
 for mode in direct vector; do
     GOWORK=off python3 experiments/capacity.py --profiles small,mixed,slow --rates 30000 \
         --tick 250us --server-cpus 0-1 --driver-cpus 2-5 --peer-module "$peers/$mode/minikv"
+done
+```
+
+### 小值合并发送
+
+在 `ef54ed2` 上，以 100k/s 重放小值，采两次 32 秒 Go CPU profile。Linux arm64、Go 1.27.3，服务与驱动分别使用 CPU 10–11 和 12–15，资源限制沿用集成版复跑。两次各完成约 316 万个请求。剖析采到 10.29 和 10.02 秒 CPU，同窗口 `/proc/1/stat` 为 10.44 和 10.16 秒，其中系统态约占三分之二。两轮无剖析对照的完成率约为 99%，写调用约为 1.95 次/完成响应。
+
+按调用栈互斥计数，TCP 写栈占 59%–61%，读栈占 18%–20%，连接读写栈以外的 Go 调度与轮询约占 6%。存储栈含读时的出站预留，占约 5%–6%。截止时间设置约占 4%，头部解析约占 1%，其余主要在连接处理。Go 栈能定位写系统调用的入口，内核 TCP 子路径的成本仍需内核剖析。
+
+非空且不超过 512 B 的值复制到连接的回复缓冲，与头部一起发送。缓冲首次用到时从 32 B 扩到 544 B，随后复用。更大的值继续逐段发送，直接引用缓存值。写期限覆盖完整响应，出站额度在写完或中止时归还。
+
+无剖析的小值和慢读各做四对，交替首跑顺序，各有两次逐段写复跑。仍以 100k/s 和 250 µs 节拍运行，小值每轮 8 秒，慢读每轮 6 秒。下表为合并发送相对逐段写的配对中位变化，CPU 以全部成功完成响应归一，延迟统计普通组 GET。
+
+| 场景 | CPU/响应 | 系统态 CPU/响应 | 完成率 | 在线 P99 | RTT P99 / P99.9 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 小值 | −21.1% | −27.9% | +0.11 个百分点 | −3.3% | +0.7% / +2.4% |
+| 慢读 | −23.6% | −29.6% | +0.23 个百分点 | −5.2% | −2.4% / −5.1% |
+
+八对的总 CPU 均下降，同版本复跑的 CPU/响应差异为 2%–14%。写调用约从 1.95 降至 1.00 次/响应，RTT 在配对间有升有降。已发送请求全成功，慢读出站峰值为 5–6 MiB，结束时为零。TCP 回归逐字节检查 0、512 和 513 B 回复，以及 1 MiB 慢读时的旧值、超时、断开和额度回收。采用依据是可重复的 CPU 收益，适用范围为本次 Linux 回环负载。
+
+复跑时在组件目录用现有发压器，交错当前服务和基线，只取 `Engine` 为 `minikv` 的行。采集 CPU profile 时可在临时基线的诊断 mux 注册 `pprof.Profile`，预填和建连后请求 `/debug/pprof/profile?seconds=32`，用 `go tool pprof -top -cum` 查看，再以同窗口 `/proc/1/stat` 的第 14、15 字段与 `/proc/1/io` 的 `syscw` 差值核对。
+
+```sh
+old=$(mktemp -d)
+git -C .. archive ef54ed2 minikv | tar -xf - -C "$old"
+for module in "$old/minikv" "$PWD"; do
+    GOWORK=off python3 experiments/capacity.py --profiles small --rates 100000 --duration 8s \
+        --tick 250us --server-cpus 10-11 --driver-cpus 12-15 --peer-module "$module"
+    GOWORK=off python3 experiments/capacity.py --profiles slow --rates 100000 --duration 6s \
+        --tick 250us --server-cpus 10-11 --driver-cpus 12-15 --peer-module "$module"
 done
 ```
 
