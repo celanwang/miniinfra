@@ -155,7 +155,7 @@ def main():
     parser.add_argument("--page-key-bytes", type=int, default=12, help="key length for the page profile (12–1024)")
     args = parser.parse_args()
     profiles = args.profiles.split(",")
-    if any(p not in ("small", "mixed", "slow", "capacity", "pressure", "ttl", "page") for p in profiles):
+    if any(p not in ("small", "mixed", "slow", "status", "hit", "capacity", "pressure", "ttl", "page") for p in profiles):
         parser.error("invalid profile")
     rates = [int(rate) for rate in args.rates.split(",")]
     if any(rate <= 0 for rate in rates):
@@ -169,7 +169,7 @@ def main():
             (p, r) for p in profiles for r in ([0] if p in ("capacity", "pressure", "ttl") else rates)
         ):
             engines = ("minikv", "redis") if i % 2 == 0 else ("redis", "minikv")
-            if profile in ("pressure", "ttl", "page"):
+            if profile in ("pressure", "ttl", "page", "status", "hit"):
                 engines = ("minikv",)
             for name in engines:
                 replay(binaries, args.image, name, profile, rate, args.duration, args.tick,

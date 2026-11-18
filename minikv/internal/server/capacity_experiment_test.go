@@ -126,11 +126,13 @@ func pressureRuntime(s *Server) map[string]float64 {
 		{Name: "/gc/cycles/total:gc-cycles"},
 		{Name: "/gc/heap/live:bytes"},
 		{Name: "/gc/heap/allocs:bytes"},
+		{Name: "/gc/heap/allocs:objects"},
+		{Name: "/gc/heap/tiny/allocs:objects"},
 		{Name: "/cpu/classes/gc/total:cpu-seconds"},
 		{Name: "/cpu/classes/gc/mark/assist:cpu-seconds"},
 	}
 	metrics.Read(samples)
-	for i, name := range []string{"GCCycles", "LiveHeapBytes", "AllocBytes", "GCCPUSeconds", "GCAssistSeconds"} {
+	for i, name := range []string{"GCCycles", "LiveHeapBytes", "AllocBytes", "AllocObjects", "TinyAllocObjects", "GCCPUSeconds", "GCAssistSeconds"} {
 		value := samples[i].Value
 		switch value.Kind() {
 		case metrics.KindUint64:
