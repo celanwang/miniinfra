@@ -99,6 +99,41 @@ func TestCommittedCorruptionFailsOpen(t *testing.T) {
 	}
 }
 
+func TestCommitMarkerFailurePreservesPriorAcknowledgedWrites(t *testing.T) {
+	dir := t.TempDir()
+	p := openTest(t, dir, Config{})
+	publishTest(t, p, "committed")
+	head := filepath.Join(dir, "HEAD")
+	saved := filepath.Join(dir, "saved-head")
+	if err := os.Rename(head, saved); err != nil {
+		t.Fatal(err)
+	}
+	// Installing a regular file over a directory fails, even with the WAL writable.
+	if err := os.Mkdir(head, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Publish(PublishRequest{ID: "interrupted"}); err == nil {
+		t.Fatal("publish succeeded without installing its commit marker")
+	}
+	if _, err := p.Status(); err == nil {
+		t.Fatal("partition continued serving after ambiguous persistence failure")
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(head); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(saved, head); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, Config{})
+	page, err := p.Read(0, pageLimit)
+	if err != nil || len(page.Messages) != 1 || page.Messages[0].ID != "committed" {
+		t.Fatalf("read after marker failure: %+v, %v", page, err)
+	}
+}
+
 func testClock(at *time.Time) func() (TimeBounds, error) {
 	return func() (TimeBounds, error) {
 		return TimeBounds{Lower: *at, Upper: *at}, nil

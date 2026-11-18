@@ -103,3 +103,39 @@ func TestAckWindowAndUncertainClock(t *testing.T) {
 		t.Fatalf("ACK after clock rollback: %v", err)
 	}
 }
+
+func TestReopenWithUnavailableClockPreservesLeasesAndAckReceipts(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	untrusted := false
+	cfg := Config{Clock: func() (TimeBounds, error) {
+		if untrusted {
+			return TimeBounds{}, errors.New("clock provider lost its error bound")
+		}
+		return TimeBounds{Lower: now, Upper: now}, nil
+	}}
+	p := openTest(t, dir, cfg)
+	registerTest(t, p, "notify", SubscriptionConfig{LeaseDuration: time.Minute})
+	publishTest(t, p, "first")
+	publishTest(t, p, "second")
+	deliveries := pullTest(t, p, "notify", "a", 2)
+	ackTest(t, p, "notify", "a", deliveries[0], AckAccepted)
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	untrusted = true
+	p = openTest(t, dir, cfg)
+	ackTest(t, p, "notify", "a", deliveries[0], AckPreviouslyAccepted)
+	if _, err := p.Ack("notify", "a", deliveries[1].Instance, deliveries[1].Token); !errors.Is(err, ErrClockUncertain) {
+		t.Fatalf("new ACK with an untrusted clock: %v", err)
+	}
+	if _, err := p.AdvanceRetries(pageLimit); !errors.Is(err, ErrClockUncertain) {
+		t.Fatalf("expiry with an untrusted clock: %v", err)
+	}
+	if got, err := p.Read(0, pageLimit); err != nil || len(got.Messages) != 2 {
+		t.Fatalf("history with an untrusted clock: %+v, %v", got, err)
+	}
+	untrusted = false
+	pullTest(t, p, "notify", "b", 0)
+	ackTest(t, p, "notify", "a", deliveries[1], AckAccepted)
+}
