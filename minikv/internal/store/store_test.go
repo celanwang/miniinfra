@@ -101,3 +101,18 @@ func TestSetCopyChecksPublishedCapacityAndDoesNotRetainScratch(t *testing.T) {
 		t.Fatalf("charged %d bytes, want %d", got, slotBudget+4)
 	}
 }
+
+func TestExpiredReadBeforeSweepDoesNotExposeResidentValue(t *testing.T) {
+	s, now := testStore(t, 8, 1, 1)
+	put(t, s, "k", "old", time.Second, false, Stored)
+	before := s.Stats(0)
+	*now = time.Second
+	read(t, s, "k", "", Miss)
+	if got := s.Stats(0); got != before {
+		t.Fatalf("GET changed accounting before sweep: got %+v, want %+v", got, before)
+	}
+	s.Sweep(0, 1)
+	if got := s.Stats(0); got.Entries != 0 || got.Expired != 1 || got.UsedBytes != slotBudget {
+		t.Fatalf("sweep did not release payload and slot: %+v", got)
+	}
+}
