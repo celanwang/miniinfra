@@ -176,7 +176,6 @@ type Partition struct {
 	redriveReceipts map[string]redriveReceipt
 	segments        []segment
 	checkpointBytes int64
-	checkpointEnd   uint64
 }
 
 type operationTiming struct {

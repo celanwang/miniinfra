@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -76,7 +75,6 @@ func (p *Partition) restore(path string) error {
 		}
 	}
 	p.tail = image.Tail
-	p.checkpointEnd = p.nextOffset()
 	p.sequence, p.timeLower, p.reserved = image.Sequence, image.TimeLower, image.Reserved
 	p.segments, p.checkpointBytes = image.Segments, int64(len(data))
 	p.publishes, p.subscriptions = image.Publishes, image.Subscriptions
@@ -111,33 +109,7 @@ func (p *Partition) Compact() error {
 			timings.checkpointLocked()
 		}
 	}
-	prefix := p.checkpointedTailPrefix()
-	err = p.compact(now, prefix)
-	if prefix != 0 && errors.Is(err, ErrCapacity) {
-		// A segment has slightly more framing than an inline tail. If that
-		// framing doesn't fit the staging budget, keep the original layout.
-		return p.compact(now, 0)
-	}
-	return err
-}
-
-// A large prefix already present in the active image would otherwise have
-// its bodies encoded again. Only seal it at a checkpoint already needed
-// for journal work. A full segment follows the ordinary sealing path.
-func (p *Partition) checkpointedTailPrefix() int {
-	if p.journal.End() == 0 || len(p.tail) >= p.config.SegmentMessages || p.checkpointEnd <= p.tailOffset {
-		return 0
-	}
-	count := int(p.checkpointEnd - p.tailOffset)
-	var size int
-	for _, msg := range p.tail[:count] {
-		size += len(msg.Body)
-	}
-	// Avoid creating a succession of small files for low-volume tails.
-	if size < MaxBatchBytes {
-		return 0
-	}
-	return count
+	return p.compact(now)
 }
 
 func checkpointStart(stats *checkpointTiming) time.Time {
@@ -147,7 +119,7 @@ func checkpointStart(stats *checkpointTiming) time.Time {
 	return time.Time{}
 }
 
-func (p *Partition) compact(now TimeBounds, prefix int) error {
+func (p *Partition) compact(now TimeBounds) error {
 	var stats *checkpointTiming
 	if p.timings != nil {
 		stats = &p.timings.checkpoint
@@ -168,7 +140,7 @@ func (p *Partition) compact(now TimeBounds, prefix int) error {
 	maps.DeleteFunc(image.Dead, func(_ string, d DeadLetter) bool { return !now.Lower.Before(d.Expires) })
 	maps.DeleteFunc(image.RedriveReceipts, func(_ string, r redriveReceipt) bool { return !now.Lower.Before(r.Expires) })
 	if stats != nil {
-		stats.prepare += time.Since(start)
+		stats.prepare = time.Since(start)
 	}
 
 	var files = make(map[string][]byte)
@@ -176,10 +148,6 @@ func (p *Partition) compact(now TimeBounds, prefix int) error {
 	width := p.config.SegmentMessages
 	for sealed < len(p.tail) {
 		count := min(width, len(p.tail)-sealed)
-		sealPrefix := sealed == 0 && prefix != 0
-		if sealPrefix {
-			count = prefix
-		}
 		chunk := p.tail[sealed : sealed+count]
 		newest := chunk[0].PublishedAt
 		for _, msg := range chunk[1:] {
@@ -187,7 +155,7 @@ func (p *Partition) compact(now TimeBounds, prefix int) error {
 				newest = msg.PublishedAt
 			}
 		}
-		if !sealPrefix && count < width && now.Lower.Before(newest.Add(p.config.HistoryRetention)) {
+		if count < width && now.Lower.Before(newest.Add(p.config.HistoryRetention)) {
 			break
 		}
 		s := segment{Base: chunk[0].Offset, Count: count, Newest: newest}
@@ -229,7 +197,6 @@ func (p *Partition) compact(now TimeBounds, prefix int) error {
 		stats.encode += time.Since(start)
 		stats.tailFirst = p.tailOffset + uint64(sealed)
 		stats.tailRecords = len(image.Tail)
-		stats.tailBytes = 0
 		for _, msg := range image.Tail {
 			stats.tailBytes += len(msg.Body)
 		}
@@ -262,7 +229,6 @@ func (p *Partition) compact(now TimeBounds, prefix int) error {
 		p.tail = nil
 	}
 	p.tailOffset += uint64(sealed)
-	p.checkpointEnd = p.nextOffset()
 	p.firstOffset, p.segments = image.First, image.Segments
 	p.timeLower, p.checkpointBytes = image.TimeLower, int64(len(payload))
 	p.publishes, p.acknowledgments, p.dead = image.Publishes, image.Acks, image.Dead
