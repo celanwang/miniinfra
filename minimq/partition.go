@@ -184,12 +184,19 @@ type operationTiming struct {
 	syncCalls                 int
 	worker                    string
 	checkpoint                checkpointTiming
+	retry                     retryTiming
 }
 
 type checkpointTiming struct {
 	prepare, encode, frame, write, cleanup, cleanupSync time.Duration
 	tailFirst                                           uint64
 	tailRecords, tailBytes, imageBytes, stagedSegments  int
+}
+
+type retryTiming struct {
+	scan, order, read, prepare, commit time.Duration
+	visited, candidates, settled, dead int
+	deadBytes                          int
 }
 
 // An optional observer, installed before opening the workload to concurrent
@@ -199,6 +206,7 @@ type partitionTimings struct {
 	time             time.Duration
 	calls            int
 	checkpoint       checkpointTiming
+	retry            retryTiming
 	checkpointLocked func()
 }
 
@@ -221,6 +229,7 @@ func (p *Partition) beginOperation() operationTiming {
 	}
 	arrived := time.Now()
 	p.mu.Lock()
+	p.timings.retry = retryTiming{}
 	return operationTiming{
 		arrived: arrived, locked: time.Now(), syncTime: p.timings.time, syncCalls: p.timings.calls,
 	}
@@ -234,6 +243,7 @@ func (p *Partition) endOperation(operation string, sample operationTiming) {
 		if operation == "checkpoint" {
 			sample.checkpoint = timing.checkpoint
 		}
+		sample.retry = timing.retry
 		timing.record(operation, sample)
 	}
 	p.mu.Unlock()

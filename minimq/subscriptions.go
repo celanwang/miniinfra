@@ -199,8 +199,9 @@ func newToken() (string, error) {
 
 // Pull grants a batch of independent durable leases to worker.
 func (p *Partition) Pull(name, worker string, limit Limits) ([]Delivery, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	sample := p.beginOperation()
+	sample.worker = worker
+	defer p.endOperation("pull", sample)
 	if err := p.checkOpen(); err != nil {
 		return nil, err
 	}

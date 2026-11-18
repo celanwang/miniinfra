@@ -68,7 +68,14 @@ func (p *Partition) recordFailure(tx *transaction, reader *historyReader, update
 	task := p.redrives[update.Redrive]
 	msg := task.Message
 	if update.Redrive == "" {
+		var start time.Time
+		if p.timings != nil {
+			start = time.Now()
+		}
 		msg, err = p.readHistoryLocked(reader, update.Offset, p.locateHistory(update.Offset))
+		if p.timings != nil {
+			p.timings.retry.read += time.Since(start)
+		}
 		if err != nil {
 			return FailureResult{}, err
 		}
@@ -87,8 +94,8 @@ func (p *Partition) recordFailure(tx *transaction, reader *historyReader, update
 
 // AdvanceRetries settles a bounded batch of leases known to have expired.
 func (p *Partition) AdvanceRetries(limit Limits) (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	sample := p.beginOperation()
+	defer p.endOperation("retry", sample)
 	if err := p.checkOpen(); err != nil {
 		return 0, err
 	}
@@ -103,10 +110,19 @@ func (p *Partition) AdvanceRetries(limit Limits) (int, error) {
 }
 
 func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int, error) {
+	var stats *retryTiming
+	var start time.Time
+	if p.timings != nil {
+		stats = &p.timings.retry
+		start = time.Now()
+	}
 	var expired []taskUpdate
 	for subName, sub := range p.subscriptions {
 		if name != "" && name != subName {
 			continue
+		}
+		if stats != nil {
+			stats.visited += len(sub.Tasks)
 		}
 		for offset, state := range sub.Tasks {
 			if state.Lease.Token != "" && !now.Lower.Before(state.Lease.Deadline) {
@@ -114,11 +130,19 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 			}
 		}
 	}
+	if stats != nil {
+		stats.visited += len(p.redrives)
+	}
 	for _, task := range p.redrives {
 		if (name == "" || name == task.Subscription) && task.State.Lease.Token != "" &&
 			!now.Lower.Before(task.State.Lease.Deadline) {
 			expired = append(expired, task.update())
 		}
+	}
+	if stats != nil {
+		stats.scan = time.Since(start)
+		stats.candidates = len(expired)
+		start = time.Now()
 	}
 	sort.Slice(expired, func(i, j int) bool {
 		a, b := expired[i], expired[j]
@@ -130,6 +154,10 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 		}
 		return a.instance() < b.instance()
 	})
+	if stats != nil {
+		stats.order = time.Since(start)
+		start = time.Now()
+	}
 	tx := transaction{Lower: now.Lower}
 	reader := historyReader{dir: p.journal.Dir()}
 	defer reader.close()
@@ -148,7 +176,15 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 		if _, err := p.recordFailure(&tx, &reader, update, "lease expired", update.State.Lease.Deadline, now.Upper); err != nil {
 			return 0, err
 		}
+		if stats != nil {
+			stats.deadBytes += size
+		}
 		limit.Bytes -= size
+	}
+	if stats != nil {
+		stats.prepare = time.Since(start)
+		stats.settled, stats.dead = len(tx.Tasks), len(tx.Dead)
+		start = time.Now()
 	}
 	if len(tx.Tasks) == 0 {
 		if len(expired) > 0 {
@@ -156,7 +192,11 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 		}
 		return 0, nil
 	}
-	if err := p.commit(tx); err != nil {
+	err := p.commit(tx)
+	if stats != nil {
+		stats.commit = time.Since(start)
+	}
+	if err != nil {
 		return 0, err
 	}
 	return len(tx.Tasks), nil
