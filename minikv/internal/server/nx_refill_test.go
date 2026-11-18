@@ -3,10 +3,69 @@ package server
 import (
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestTCPRetryNXAfterLostStoredReply(t *testing.T) {
+	s := testServer(t, 1, func(c *Config) {
+		c.InboundBytes = 4
+		c.SweepInterval = time.Hour
+	})
+	address, _ := s.listenTestTCP(t)
+	proxy, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+	caller := dialTestTCP(t, proxy.Addr().String())
+	downstream, err := proxy.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer downstream.Close()
+	if err := downstream.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	upstream := dialTestTCP(t, address)
+	const ttl = 600 * time.Millisecond
+	set := fmt.Sprintf("SET 1 3 %d NX\nkold", ttl.Milliseconds())
+	caller.send(t, set)
+	forward := make([]byte, len(set))
+	if _, err := io.ReadFull(downstream, forward); err != nil {
+		t.Fatal(err)
+	}
+	upstream.exchange(t, string(forward), "STORED\n")
+	witnessed := time.Now()
+	if got := s.inbound.used.Load(); got != 0 {
+		t.Fatalf("STORED still holds %d inbound bytes", got)
+	}
+	// Drop the complete reply at the proxy and close the caller's connection.
+	_ = downstream.Close()
+	_ = upstream.Close()
+	caller.end(t)
+
+	fresh := dialTestTCP(t, address)
+	const get = "GET 1\nk"
+	fresh.send(t, get)
+	fresh.value(t, "old")
+	time.Sleep(time.Until(witnessed.Add(ttl / 2)))
+	fresh.exchange(t, set, "EXISTS\n")
+	fresh.exchange(t, "SET 1 3 NONE NX\nkbad", "EXISTS\n")
+	fresh.send(t, get)
+	fresh.value(t, "old")
+
+	// The first write has expired, while a renewed TTL would still be live.
+	time.Sleep(time.Until(witnessed.Add(ttl + 10*time.Millisecond)))
+	fresh.exchange(t, get, "MISS\n")
+	fresh.exchange(t, set, "STORED\n")
+	fresh.send(t, get)
+	fresh.value(t, "old")
+	waitBudget(t, &s.inbound, 0)
+	waitBudget(t, &s.outbound, 0)
+}
 
 func expiredTCPHotKey(t *testing.T) (*Server, string, *client) {
 	t.Helper()
