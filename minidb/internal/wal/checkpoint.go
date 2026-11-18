@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"syscall"
+	"time"
 
 	"github.com/celanwang/miniinfra/minidb/internal/disk"
 )
@@ -22,7 +23,19 @@ const (
 // publish and sync the checkpoint before returning nil. Commits queued behind
 // this operation are written after any successful rotation.
 func (log *Log) Checkpoint(install func(int64) error) error {
-	return log.submit(request{checkpoint: install})
+	return log.CheckpointWithTiming(install, nil)
+}
+
+// CheckpointTiming records the boundaries of a successful WAL barrier.
+type CheckpointTiming struct {
+	Enqueued, Started, Rotating, Finished time.Time
+}
+
+func (log *Log) CheckpointWithTiming(install func(int64) error, timing *CheckpointTiming) error {
+	if timing != nil {
+		*timing = CheckpointTiming{Enqueued: time.Now()}
+	}
+	return log.submit(request{checkpoint: install, checkpointTiming: timing})
 }
 
 func (log *Log) checkpoint(item request, end int64, failure error) error {
@@ -30,13 +43,22 @@ func (log *Log) checkpoint(item request, end int64, failure error) error {
 		item.result <- failure
 		return failure
 	}
+	if item.checkpointTiming != nil {
+		item.checkpointTiming.Started = time.Now()
+	}
 	if err := item.checkpoint(end); err != nil {
 		item.result <- fmt.Errorf("publish checkpoint: %w", err)
 		return nil
 	}
 	// Any replacement error may have happened after rename. Stop appending
 	// until restart has resolved which WAL generation is on disk.
+	if item.checkpointTiming != nil {
+		item.checkpointTiming.Rotating = time.Now()
+	}
 	failure = log.rotate(end)
+	if item.checkpointTiming != nil {
+		item.checkpointTiming.Finished = time.Now()
+	}
 	item.result <- failure
 	return failure
 }

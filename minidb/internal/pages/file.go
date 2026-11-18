@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"time"
 
 	"github.com/celanwang/miniinfra/minidb/internal/disk"
 )
@@ -26,6 +27,17 @@ type Metadata struct {
 }
 
 func Save(path string, meta Metadata, encode func(io.Writer) error) error {
+	return SaveWithTiming(path, meta, encode, nil)
+}
+
+// SaveTiming separates building the image, writing it to the staged file,
+// and publishing it. Publish includes sync of the file and directory.
+type SaveTiming struct {
+	Build, Write, Publish time.Duration
+	Writes                int
+}
+
+func SaveWithTiming(path string, meta Metadata, encode func(io.Writer) error, timing *SaveTiming) error {
 	file, err := disk.Stage(path)
 	if err != nil {
 		return err
@@ -35,7 +47,14 @@ func Save(path string, meta Metadata, encode func(io.Writer) error) error {
 	if _, err := file.Seek(Size, io.SeekStart); err != nil {
 		return err
 	}
-	writer := pageWriter{out: file}
+	var started time.Time
+	var out io.Writer = file
+	if timing != nil {
+		*timing = SaveTiming{}
+		out = timedPageOutput{file, timing}
+		started = time.Now()
+	}
+	writer := pageWriter{out: out}
 	if err := encode(&writer); err != nil {
 		return err
 	}
@@ -49,10 +68,36 @@ func Save(path string, meta Metadata, encode func(io.Writer) error) error {
 	binary.BigEndian.PutUint64(header[metadataOffset+16:], meta.LastRowID)
 	binary.BigEndian.PutUint64(header[metadataOffset+24:], writer.number)
 	seal(&header)
+	var headerStarted time.Time
+	if timing != nil {
+		headerStarted = time.Now()
+	}
 	if _, err := file.WriteAt(header[:], 0); err != nil {
 		return err
 	}
-	return disk.Publish(file, path)
+	if timing == nil {
+		return disk.Publish(file, path)
+	}
+	publishing := time.Now()
+	timing.Writes++
+	timing.Write += publishing.Sub(headerStarted)
+	timing.Build = publishing.Sub(started) - timing.Write
+	err = disk.Publish(file, path)
+	timing.Publish = time.Since(publishing)
+	return err
+}
+
+type timedPageOutput struct {
+	file   io.Writer
+	timing *SaveTiming
+}
+
+func (output timedPageOutput) Write(data []byte) (int, error) {
+	started := time.Now()
+	n, err := output.file.Write(data)
+	output.timing.Write += time.Since(started)
+	output.timing.Writes++
+	return n, err
 }
 
 // Load opens only the published generation. The LSN in its header covers
