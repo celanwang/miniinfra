@@ -74,6 +74,66 @@ func TestTCPOrderLookupIndexOrder(t *testing.T) {
 	}
 }
 
+func TestTCPOrderLookupPaths(t *testing.T) {
+	store, pool, _ := openTCP(t, t.TempDir())
+	store.PauseReclamationForScanProbe()
+	createLookupOrders(t, pool, false)
+	execSQL(t, pool, "insert into orders values (1,1,40,10),(2,1,41,20),(3,2,42,30),(4,1,null,40),(5,1,null,50)")
+	check := func(reader orderReader, tenant int, request any, wantID, wantAmount int) {
+		t.Helper()
+		if err := checkOrderLookup(t.Context(), reader, tenant, request, wantID, wantAmount); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(pool, 1, 40, 1, 10)
+	check(pool, 1, 99, 0, 0)
+	check(pool, 2, 40, 0, 0)
+	check(pool, 1, nil, 0, 0)
+	if amount := readQty(t, pool, "select amount from orders where tenant_id = ?", 2); amount != 30 {
+		t.Fatalf("ordinary index returned %d", amount)
+	}
+
+	tx := beginScanWriter(t, pool)
+	defer tx.Rollback()
+	execSQL(t, tx, orderUpdate, 1)
+	check(pool, 1, 40, 1, 10)
+	check(tx, 1, 40, 1, 11)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	check(pool, 1, 40, 1, 11)
+
+	tx = beginScanWriter(t, pool)
+	defer tx.Rollback()
+	execSQL(t, tx, "delete from orders where id = 1")
+	execSQL(t, tx, "insert into orders values (6,1,40,60)")
+	check(pool, 1, 40, 1, 11)
+	check(tx, 1, 40, 6, 60)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	check(pool, 1, 40, 6, 60)
+	if n, ok := store.IndexCandidates("orders", "request_no_key", []engine.Value{engine.Int(40)}); !ok || n != 3 {
+		t.Fatalf("expected three retained candidates for the same unique key, got %d", n)
+	}
+
+	execSQL(t, pool, "create table partitioned_orders (id int primary key, tenant_id int, request_no int, amount int, index by_tenant (tenant_id), unique (tenant_id, request_no))")
+	execSQL(t, pool, "insert into partitioned_orders values (1,1,40,10),(2,2,40,20),(3,2,null,30),(4,2,null,40)")
+	execSQL(t, pool, "create table requests (id int primary key, tenant_id int, request_no int)")
+	execSQL(t, pool, "insert into requests values (1,2,40),(2,1,99),(3,2,null)")
+	const join = "select o.amount from requests r join partitioned_orders o on o.request_no = r.request_no and o.tenant_id = r.tenant_id where r.id = ?"
+	if amount := readQty(t, pool, join, 1); amount != 20 {
+		t.Fatalf("composite join returned %d", amount)
+	}
+	for _, requestID := range []int{2, 3} {
+		var amount int
+		err := pool.QueryRowContext(t.Context(), join, requestID).Scan(&amount)
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("join for request %d returned %d, %v", requestID, amount, err)
+		}
+	}
+}
+
 func createLookupOrders(t *testing.T, pool *sql.DB, uniqueFirst bool) {
 	t.Helper()
 	indexes := "index by_tenant (tenant_id), unique (request_no)"
