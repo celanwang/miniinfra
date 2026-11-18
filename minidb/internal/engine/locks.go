@@ -20,8 +20,12 @@ type lockManager struct {
 }
 
 func (locks *lockManager) acquire(ctx context.Context, tx *Txn, r resource) error {
-	ctx, cancel := context.WithTimeout(ctx, tx.db.lockTimeout)
-	defer cancel()
+	deadline := time.Now().Add(tx.db.lockTimeout)
+	needsTimer := true
+	if callerDeadline, ok := ctx.Deadline(); ok && !callerDeadline.After(deadline) {
+		deadline = callerDeadline
+		needsTimer = false
+	}
 	for {
 		var started time.Time
 		if tx.timing != nil {
@@ -32,7 +36,11 @@ func (locks *lockManager) acquire(ctx context.Context, tx *Txn, r resource) erro
 			tx.timing.lockManagerWait += time.Since(started)
 		}
 		delete(locks.waiting, tx)
-		if err := ctx.Err(); err != nil {
+		err := ctx.Err()
+		if err == nil && !time.Now().Before(deadline) {
+			err = context.DeadlineExceeded
+		}
+		if err != nil {
 			locks.mu.Unlock()
 			return fmt.Errorf("%w: %w", ErrLockWait, err)
 		}
@@ -51,6 +59,13 @@ func (locks *lockManager) acquire(ctx context.Context, tx *Txn, r resource) erro
 		}
 		locks.waiting[tx] = owner
 		locks.mu.Unlock()
+		if needsTimer {
+			// Reuse the original deadline if another owner wins after a wake.
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, deadline)
+			defer cancel()
+			needsTimer = false
+		}
 		if tx.timing != nil {
 			started = time.Now()
 		}
