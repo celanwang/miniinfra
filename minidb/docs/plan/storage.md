@@ -272,3 +272,29 @@ done
 git -C "$scratch" apply --unidiff-zero \
   "$repo/minidb/internal/engine/testdata/lock-tail-observation.patch"
 ```
+
+## 普通二级索引的写入编码
+
+写事务在检查唯一冲突前先按索引定义排除普通索引。唯一键仍按相同顺序取得逻辑锁，写入前检查 NULL 和当前版本的可见性。应用 INSERT 和 UPDATE 时，`table.apply` 为每个索引编码并挂接新版本。普通索引在校验阶段原先做的一次重复编码由此消除。
+
+两条真实 TCP 连接各提交 600 笔不相交订单。每笔插入带唯一请求号的订单、更新两行库存，再插入两条明细。带普通索引的档位为库存添加复合文本位置索引，并为明细添加按订单号索引。仅有主键和唯一键的档位使用相同数据与 SQL。Apple M4 Max、darwin/arm64、`GOMAXPROCS=4`。两版、两档各跑两轮，使用共享磁盘基准锁并轮询已知 MiniKV、MiniMQ 进程。两版共用一份探针，基线通过 Go overlay 恢复 `d81052f` 的 `transactions.go`。
+
+| 每轮统计量 | 带普通索引，基线 → 提前跳过 | 仅有唯一索引，基线 → 提前跳过 |
+| --- | ---: | ---: |
+| 每单进程级分配次数 | 372.63–372.75 → 360.61–360.63 | 340.29–340.33 → 340.27–340.30 |
+| 每单进程级分配字节，KB | 26.20–26.25 → 25.88–25.93 | 25.23–25.24 → 25.26–25.30 |
+| 写语句合计中位，ms | 0.344–0.400 → 0.368–0.399 | 0.304–0.356 → 0.348–0.409 |
+| 首条库存 UPDATE 中位，µs | 86–98 → 92–97 | 77–88 → 87–102 |
+| COMMIT P99，ms | 11.78–12.33 → 9.55–9.65 | 10.50–10.66 → 9.65–9.97 |
+
+另用 128 笔 TCP 订单做分配剖析。带普通索引时，锁内校验的编码调用归因对象数为 2,849 → 1,571。仅有唯一键的对照两版均为 1,535。带普通索引每单稳定少约 12 次分配。写语句耗时的范围有重叠，COMMIT P99 的变化同时出现在无普通索引的对照，且伴随 WAL 刷盘波动。保留改动的依据是确定的编码和分配减少。
+
+TCP 回归让普通复合文本索引与唯一索引共存，核对重复普通键、带 NUL 的字符串、NULL 键、重复唯一键的 INSERT 和 UPDATE 拒绝、未提交与回滚的索引可见性，并分别重启验证纯 WAL 和检查点加 WAL 尾部。旧、新守护进程也从相同操作生成相同的页文件和 WAL，并交叉重启读取复合键和唯一键。
+
+在两版的 `minidb/` 目录分别构建测试二进制。将子用例换为 `unique_only` 可复跑对照。
+
+```sh
+GOWORK=off go test -c -o /tmp/minidb-secondary ./internal/engine
+MINIDB_SECONDARY_INDEX_ORDERS=600 GOMAXPROCS=4 /tmp/minidb-secondary \
+  -test.run '^TestTCPSecondaryIndexWriteLoad$/^with_secondary$' -test.count=1 -test.v
+```
