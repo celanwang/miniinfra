@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniMQ rebuilds pending delivery order in one heap pass when restoring a checkpoint.
 - MiniKV verifies that retrying a conditional write after a lost reply preserves its original value and expiry.
 - MiniDB skips index key encoding when reclaiming an old row version that can be unlinked directly.
 - MiniKV retries inbound byte reservations up to sixteen times to reduce contention-induced BUSY replies.
