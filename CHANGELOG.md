@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniKV sends values up to 512 bytes with their reply headers in one TCP write.
 - MiniDB verifies unknown commit results and same-disk recovery after a simulated group sync failure.
 - MiniMQ verifies ordinary publish, delivery, and acknowledgment receipts across a same-disk process restart.
 - MiniDB verifies frame size limits and ordered replies across large pipelined requests and TCP half-close.
