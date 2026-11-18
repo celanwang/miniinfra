@@ -243,3 +243,47 @@ for lengths in fixed repeated adjacent publish; do
         --server-cpus 0-1 --driver-cpus 2-5
 done
 ```
+
+### 同分片覆盖对照
+
+本轮将 256 次大写集中到一个现存键。16 条小读连接平均分组，各读 8 个已预热的 512 B 键。一组使用写入所在分片，另一组使用相邻分片，两组分别收到同一计划速率的半数请求。测试入口提供实际分片映射，发压器按映射选键。服务与驱动仍各自固定在 CPU 0–1 与 2–5，使用相同的 160 MiB 硬上限、2 秒小读计划及默认 Go 内存设置。每轮使用新容器，串行、交替顺序运行。正式对照每轮开始前均无其他运行中的 Docker 容器，宿主调度仍可能引入波动。
+
+先比较现有服务的 `publish-locality`（1 MiB 少 1 字节，锁内复制）与 `publish-aligned`（1 MiB，接收缓冲直接移交）。三对普通回放中，写 P99 中位数为 11.58 和 13.82 ms，同分片小读 P99 中位数为 13.70 和 14.54 ms，跨分片为 13.41 和 14.46 ms。对齐的一轮有 5 个调度晚发。普通端到端数据未复现先前双写键实验的写 P99 排序。
+
+带阻塞采样的独立轮次记录到局部成本。两次未对齐验收分别采到 79 和 103 次 `Store.Get` 的读锁阻塞，累计阻塞约 20.5 和 20.6 ms。对齐控制未采到该调用栈。这个对照通常同时移除了锁内分配和复制，采样能定位等待发生的位置，尚无法拆出分配、复制和调度各自的耗时。阻塞采样轮次用于归因，下面的 TCP 延迟来自关闭采样的回放。
+
+**候选方案。** 在读取值体前，对非 NX 等容量覆盖做一次读锁检查。命中时使用精确接收缓冲，按实际容量调整入站额度，读完值体后照常在写锁内检查当前状态并发布。这样能移除这一类覆盖的锁内复制，已有条目或容量的后续变化仍由原有路径裁决。未通过裁决的完整帧仍返回对应响应，缓冲归还遵守原额度。
+
+| 指标，五对普通回放的中位数 | 现有锁内复制 | 直接精确接收候选 |
+| --- | ---: | ---: |
+| 成功 SET P99 | 12.32 ms | 14.69 ms |
+| 同分片小读 P99 | 13.96 ms | 14.04 ms |
+| 跨分片小读 P99 | 12.87 ms | 14.08 ms |
+| 同分片小读 RTT P99 | 10.27 ms | 10.51 ms |
+| 跨分片小读 RTT P99 | 10.01 ms | 10.63 ms |
+| 写窗口累计分配 | 263.94 MiB | 256.77 MiB |
+| 写窗口 cgroup CPU | 58.75 ms | 56.27 ms |
+| cgroup 峰值 | 45.71 MiB | 37.31 MiB |
+| 进程 RSS 峰值 | 50.72 MiB | 42.99 MiB |
+| 空闲接收缓冲峰值 | 8 MiB | 1 MiB |
+
+每轮均成功完成 256 次覆盖，8 条写连接随后都能读取。每轮计划 20000 次小读，全部已发小读成功。候选的一轮有 7 次调度晚发，其余轮均完整发出。写入期间每组每轮有 930–1570 个小读样本。现有路径与候选的 SET P99 区间分别为 9.30–16.74 ms 和 12.13–19.08 ms，候选在五对中有四对更高。同分片小读无稳定收益，两组小读的高点常同时出现在同一轮。
+
+另做两对带阻塞采样的比较，现有服务分别记录 63 和 77 次 `Store.Get` 读锁阻塞，累计 16.6 和 124.1 ms。候选两轮均未采到该栈。固定、轮换和相邻互异的近满拒写回归各做两对，两侧均为每轮 256 个 `NO_SPACE`、20000 次小读完成、8 条连接可继续读，且 OOM 为 0。候选的专项竞态测试验证了旧响应不可变、读取值体期间容量变化后重新裁决，以及拒绝后原连接仍能读取。仓库的条件写入口为 `SET NX`。
+
+**保留现有实现。** 候选减少了采样中的读锁等待和这一成功覆盖场景的峰值内存，端到端小读收益欠稳定，写 P99 也偏高。保留实验补丁，以便用相同驱动验证这项取舍。下一步优先用执行跟踪分开计量网络收发、goroutine 唤醒和发布等待，解释同分片与跨分片尾延迟为什么同时变化。
+
+从最终版本的组件目录运行，同一驱动分别构建现有 peer 和临时目录中的候选 peer。正式测时去掉 `--block-profile`，归因时单独开启。也可把 `--pressure-lengths` 改为 `fixed`、`repeated` 或 `adjacent` 复跑近满回归。
+
+```sh
+peer_source=$(mktemp -d)
+patch_file="$PWD/experiments/equal-overwrite.patch"
+git -C .. archive b403cd0 minikv | tar -xf - -C "$peer_source"
+(cd "$peer_source" && git apply --unidiff-zero "$patch_file")
+GOWORK=off python3 experiments/capacity.py --profiles pressure --pressure-lengths publish-aligned \
+    --server-cpus 0-1 --driver-cpus 2-5
+GOWORK=off python3 experiments/capacity.py --profiles pressure --pressure-lengths publish-locality \
+    --server-cpus 0-1 --driver-cpus 2-5
+GOWORK=off python3 experiments/capacity.py --profiles pressure --pressure-lengths publish-locality \
+    --server-cpus 0-1 --driver-cpus 2-5 --peer-module "$peer_source/minikv"
+```
