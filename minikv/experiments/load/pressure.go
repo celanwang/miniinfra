@@ -29,7 +29,16 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 	result := make(map[string]any)
 	publish := strings.HasPrefix(lengths, "publish")
 	locality := lengths == "publish-locality" || lengths == "publish-aligned"
-	if !publish {
+	var business *businessPressure
+	if lengths == "business" {
+		var err error
+		business, err = prepareBusinessPressure(target)
+		if err != nil {
+			result["SetupError"] = err.Error()
+			return result
+		}
+		result["Prefill"] = business.prefill
+	} else if !publish {
 		prefill := fill(target, "fill", 32, 100000, 1024)
 		result["Prefill"] = prefill
 		if prefill[ok] != 100000 {
@@ -75,6 +84,12 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 				result["WarmWriteKeyError"] = status
 				return result
 			}
+		}
+	}
+	if business != nil {
+		if err := business.seedSuccessKeys(&warm); err != nil {
+			result["SetupError"] = err.Error()
+			return result
 		}
 	}
 	warm.close()
@@ -139,6 +154,8 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 	writeResults := make([]map[outcome]int, writers)
 	writeLatency := make([][]time.Duration, writers)
 	recovered := make([]bool, writers)
+	verified := make([]bool, writers)
+	unexpected := make([]int, writers)
 	value := bytes.Repeat([]byte("v"), largeSize)
 	var writes sync.WaitGroup
 	for i := range writers {
@@ -147,12 +164,33 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 			defer client.close()
 			statuses := make(map[outcome]int)
 			writeResults[i] = statuses
+			data := value
+			if business != nil {
+				data = bytes.Clone(value)
+			}
+			var lastPublished []byte
 			for k := i; k < pressureWriteCount(lengths); k += writers {
 				size := pressureWriteSize(lengths, k)
-				cmd := target.makeCommand(pressureWriteKey(lengths, k), value[:size], size)
+				key := pressureWriteKey(lengths, k)
+				var expected outcome
+				if business != nil {
+					key, size, expected = business.write(k)
+					if expected == ok {
+						data[0] = byte(k / writers)
+					}
+				}
+				cmd := target.makeCommand(key, data[:size], size)
 				started := time.Now()
 				_, status := client.execute(cmd, 0, 0)
 				statuses[status]++
+				if business != nil {
+					if expected != status {
+						unexpected[i]++
+					}
+					if expected == ok && status == ok {
+						lastPublished = data[:size]
+					}
+				}
 				if status == ok || status == noSpace {
 					writeLatency[i] = append(writeLatency[i], time.Since(started))
 				}
@@ -160,6 +198,9 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 			if previous := client.conn; previous != nil {
 				_, status := client.execute(hot[i], smallSize, 0)
 				recovered[i] = status == ok && client.conn == previous
+				if business != nil && recovered[i] && len(lastPublished) > 0 {
+					verified[i] = business.verify(&client, i, lastPublished) && client.conn == previous
+				}
 			}
 		})
 	}
@@ -201,6 +242,17 @@ func runPressure(target target, lengths string, blockProfile bool) map[string]an
 	result["WriteSamples"] = len(writeSamples)
 	result["WriteP99Microseconds"] = percentile(writeSamples, 990)
 	result["WriterConnectionsRecovered"] = recoveredCount
+	if business != nil {
+		var failures, verifiedCount int
+		for i, n := range unexpected {
+			failures += n
+			if verified[i] {
+				verifiedCount++
+			}
+		}
+		result["UnexpectedWrites"] = failures
+		result["VerifiedValues"] = verifiedCount
+	}
 	result["WriteSeconds"] = writeEnd.Sub(writeStart).Seconds()
 	result["RuntimeBefore"] = writeBefore
 	result["RuntimeAfter"] = writeAfter
@@ -246,19 +298,9 @@ func pressureReadKeys(writeKey string, readers int) ([]string, error) {
 	for i := 1; i < len(keys); i++ {
 		keys[i] = fmt.Sprintf("read%06d", i)
 	}
-	body, err := json.Marshal(keys)
+	routes, err := pressureKeyRoutes(keys)
 	if err != nil {
 		return nil, err
-	}
-	c := &http.Client{Timeout: time.Second}
-	resp, err := c.Post("http://127.0.0.1:9122/shards", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var routes []int
-	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&routes) != nil || len(routes) != len(keys) {
-		return nil, fmt.Errorf("invalid routes from fixture")
 	}
 	var same, cross []string
 	crossShard := (routes[0] + 1) % 16
@@ -274,6 +316,24 @@ func pressureReadKeys(writeKey string, readers int) ([]string, error) {
 		return nil, fmt.Errorf("could not choose read keys for shards %d and %d", routes[0], crossShard)
 	}
 	return append(same, cross...), nil
+}
+
+func pressureKeyRoutes(keys []string) ([]int, error) {
+	body, err := json.Marshal(keys)
+	if err != nil {
+		return nil, err
+	}
+	c := &http.Client{Timeout: time.Second}
+	resp, err := c.Post("http://127.0.0.1:9122/shards", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var routes []int
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&routes) != nil || len(routes) != len(keys) {
+		return nil, fmt.Errorf("invalid routes from fixture")
+	}
+	return routes, nil
 }
 
 func readBlockProfile() string {
