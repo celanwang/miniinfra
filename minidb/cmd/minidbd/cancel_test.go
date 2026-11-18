@@ -99,6 +99,9 @@ func TestCanceledOrderReleasesLocks(t *testing.T) {
 	released := time.Since(started)
 	t.Logf("cancel_to_client=%s cancel_to_competing_update=%s unrelated_durable_update=%s canceled_error=%v",
 		clientReturned, released, ordinary, bErr)
+	if released > time.Second {
+		t.Fatal("disconnect did not release locks before the server lock timeout")
+	}
 
 	if err := c.Rollback(); err != nil {
 		t.Fatal(err)
