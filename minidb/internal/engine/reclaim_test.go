@@ -97,3 +97,25 @@ func TestReclaimDropsEmptyIndexPagesAndDeletedIdentities(t *testing.T) {
 	wantStock(t, read, 0, Int(800), 3)
 	wantStock(t, read, 1, String("sku-1"), 3)
 }
+
+func TestReclaimStepRespectsHeapSlotBudget(t *testing.T) {
+	db := seedHistory(t, t.TempDir(), 1)
+	db.stopReclaimer()
+	<-db.reclaimerDone
+	for range reclaimBudget + 20 {
+		if err := cycleStock(t.Context(), db, 1, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	examined, removed := db.reclaimStep()
+	if examined != reclaimBudget || removed > examined {
+		t.Fatalf("examined %d and removed %d versions with a %d-slot budget", examined, removed, reclaimBudget)
+	}
+	// Slot swaps can leave some dead rows for the next pass.
+	for range 2 {
+		db.reclaimStep()
+	}
+	if got := historyFor(db, 1, "hot"); got != (historyCounts{1, 1, 1}) {
+		t.Fatalf("rollback backlog did not drain: %+v", got)
+	}
+}

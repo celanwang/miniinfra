@@ -131,15 +131,29 @@ func waitForHistory(t *testing.T, db *DB, want historyCounts) historyCounts {
 	return historyCounts{}
 }
 
-// Run with -benchtime=2400x. The hot worker alternates commits and rollbacks
-// while a second client updates a disjoint key and syncs every commit.
+// The hot worker alternates commits and rollbacks while a second client
+// updates a disjoint key and syncs every commit.
 func BenchmarkMixedVersionHistory(b *testing.B) {
+	b.Run("retained", func(b *testing.B) { mixedVersionHistory(b, false) })
+	b.Run("online", func(b *testing.B) { mixedVersionHistory(b, true) })
+}
+
+func mixedVersionHistory(b *testing.B, collect bool) {
 	db := seedHistory(b, b.TempDir(), 2)
+	db.stopReclaimer()
+	<-db.reclaimerDone
+
 	ctx := b.Context()
 	ordinary := make([]time.Duration, b.N)
 	var workers sync.WaitGroup
 	hotResult := make(chan error, 1)
 	start := make(chan struct{})
+	stop := make(chan struct{})
+	sweeps := make(chan sweepMeasurement, 1)
+	if collect {
+		go measureReclamation(db, start, stop, sweeps)
+	}
+
 	b.ResetTimer()
 	workers.Go(func() {
 		<-start
@@ -163,6 +177,15 @@ func BenchmarkMixedVersionHistory(b *testing.B) {
 	}
 	workers.Wait()
 	b.StopTimer()
+	close(stop)
+	if collect {
+		result := <-sweeps
+		if result.steps > 0 {
+			b.ReportMetric(float64(result.total.Nanoseconds())/float64(result.steps), "sweep-mean-ns")
+		}
+		b.ReportMetric(float64(result.slowest.Nanoseconds()), "sweep-max-ns")
+		b.ReportMetric(float64(result.removed), "versions-reclaimed")
+	}
 	if err := errors.Join(ordinaryErr, <-hotResult); err != nil {
 		b.Fatal(err)
 	}
@@ -172,4 +195,31 @@ func BenchmarkMixedVersionHistory(b *testing.B) {
 	b.ReportMetric(float64(counts.heap), "heap-versions")
 	b.ReportMetric(float64(counts.primary), "hot-primary")
 	b.ReportMetric(float64(counts.secondary), "hot-secondary")
+}
+
+type sweepMeasurement struct {
+	steps, removed int
+	total, slowest time.Duration
+}
+
+func measureReclamation(db *DB, start, stop <-chan struct{}, result chan<- sweepMeasurement) {
+	<-start
+	timer := time.NewTicker(reclaimInterval)
+	defer timer.Stop()
+	var measurement sweepMeasurement
+	for {
+		select {
+		case <-stop:
+			result <- measurement
+			return
+		case <-timer.C:
+			started := time.Now()
+			_, removed := db.reclaimStep()
+			duration := time.Since(started)
+			measurement.steps++
+			measurement.removed += removed
+			measurement.total += duration
+			measurement.slowest = max(measurement.slowest, duration)
+		}
+	}
 }
