@@ -108,3 +108,27 @@ GOWORK=off MINIMQ_WAL_RECOVERY_BINARY="$wal_compat_dir/original.test" go test -r
 ```
 
 All three boundaries also passed with the original binary. The TCP test runs the broker's actual listener and maintenance loop, confirms one full visible batch of 128, and checks the same IDs and bodies plus an ordinary ACK receipt after the daemon exits and restarts. These checks exercise process interruption and local recovery.
+
+## Redrive body ownership
+
+The experiment runs the real broker listener and sends requests over loopback TCP. The `distinct` case creates twelve 128 KiB dead letters through Publish, Pull and Fail, then redrives each once. The `same` case creates one letter and redrives it with twelve distinct operation IDs. Each case also repeats its first operation ID twelve times and verifies the original response, pending count, stored bytes and reservation.
+
+```sh
+GOWORK=off MINIMQ_REDRIVE_HEAP=distinct go test -run '^TestRedriveHeapOverTCP$' -count=1 -v ./cmd/minimqd
+GOWORK=off MINIMQ_REDRIVE_HEAP=same go test -run '^TestRedriveHeapOverTCP$' -count=1 -v ./cmd/minimqd
+```
+
+The daemon test subprocess takes heap snapshots after two garbage collections when the test sends a signal. The baseline snapshot follows reopening a directory containing the source messages and dead letters. Admission and idempotent retry snapshots follow the corresponding TCP traffic. A fresh process then reopens the same WAL before taking the last snapshot. `HeapAlloc` differences describe the live heap in this fixture. `TotalAlloc` differences include the broker's HTTP, journal and sampling allocations.
+
+The measured baseline is `959f8c7` with the original production behavior from `89fcf4d`. The candidate is `e82bc1d`. To compare revisions, compile separate `GOWORK=off go test -c -o <path> ./cmd/minimqd` binaries and alternate the binaries with the mode environment variable and `-test.run '^TestRedriveHeapOverTCP$' -test.v`. Four alternating trials per version and mode ran on macOS 15.5 arm64, Go 1.27.3 and local APFS under the shared benchmark lock. The one-minute load averages at trial starts were 3.2–3.4.
+
+| Twelve new instances | Live heap increase after admission | Total allocation during admission | Live heap increase after WAL reopen |
+| --- | ---: | ---: | ---: |
+| Twelve distinct source letters | 1,591,408 → 18,784 B | 6,875,680 → 5,307,236 B | 1,588,612 → 1,591,568 B |
+| One source letter, twelve operation IDs | 1,591,688 → 25,812 B | 6,999,052 → 5,231,364 B | 1,588,132 → 1,590,672 B |
+
+Each cell is a median across the four trials. Twelve idempotent retries added around 0.8–1.2 KB of live heap and 90–95 KB of process allocations at the medians. The admitted tasks had the same reservation increase of 3,538,944 bytes and the same stored byte increase per workload on both versions. Recovery decodes each recorded body independently. The sharing benefit applies while the admitting broker stays open.
+
+Keep the internal body reuse. Publish owns its input, and the history path supplies a copied or decoded body to the dead-letter record. Redrive can retain the immutable body already held by the partition. The public GetDeadLetter, ListDeadLetters and Pull paths still return copies. Failure, retry, expiry and ACK change task state or remove entries. Each durable redrive record still contains its complete body.
+
+The Go API regression overwrites returned bodies, tests capacity rejection and reserved bytes, and retries and ACKs one instance. It reclaims the original sealed segment before redrive, then checkpoints again when the source letter expires. One remaining instance is claimed in the same process. Another is claimed after reopening the checkpoint and ACK journal. The TCP regression also checkpoints after advancing past source retention, reopens the daemon, verifies the original history and letters were reclaimed, and acknowledges all twelve redrives with their original bodies.

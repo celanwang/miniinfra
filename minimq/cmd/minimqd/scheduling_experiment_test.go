@@ -36,6 +36,10 @@ func TestDueExperimentBroker(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
+	if path := os.Getenv(redriveHeapSampleEnv); path != "" {
+		stop := sampleRedriveBrokerHeap(ctx, path)
+		defer stop()
+	}
 	cfg := dueExperimentClock(origin)
 	if path := os.Getenv(dueExperimentClockFile); path != "" {
 		cfg.Clock = func() (minimq.TimeBounds, error) {
@@ -48,6 +52,17 @@ func TestDueExperimentBroker(t *testing.T) {
 		}
 	}
 	if err := run(ctx, dir, "127.0.0.1:0", cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setDueClockFile(t *testing.T, path string, now time.Time) {
+	t.Helper()
+	next := path + ".next"
+	if err := os.WriteFile(next, []byte(now.Format(time.RFC3339Nano)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(next, path); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -1,7 +1,6 @@
 package minimq
 
 import (
-	"bytes"
 	"fmt"
 	"time"
 )
@@ -80,7 +79,8 @@ func (p *Partition) Redrive(name, deadID, operationID string) (RedriveResult, er
 	}
 	result := RedriveResult{Instance: "redrive:" + token, SourceDeadLetterID: deadID}
 	reserve := sub.Config.taskReserve(len(dead.Message.Body))
-	dead.Message.Body = bytes.Clone(dead.Message.Body)
+	// Stored bodies are immutable. The task retains a reference in memory
+	// and carries the full body in its durable record.
 	tx := transaction{
 		Lower: now.Lower, ReserveDelta: reserve,
 		Redrive: &redriveAdmission{

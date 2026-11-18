@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -21,13 +20,7 @@ func TestCommittedDeliveryRepliesLostOverTCP(t *testing.T) {
 	dir, clock := filepath.Join(root, "data"), filepath.Join(root, "clock")
 	setTime := func(now time.Time) {
 		t.Helper()
-		next := clock + ".next"
-		if err := os.WriteFile(next, []byte(now.Format(time.RFC3339Nano)), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Rename(next, clock); err != nil {
-			t.Fatal(err)
-		}
+		setDueClockFile(t, clock, now)
 	}
 	setTime(dueExperimentEpoch)
 	start := func() *dueBroker {
