@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniKV returns BAD_REQUEST for an overflowing SET deadline before checking NX or shard capacity.
 - MiniMQ reuses immutable dead-letter bodies during redrive while keeping each durable record self-contained.
 - MiniDB allocates transaction lock state on the first grant, saving two allocations on point reads.
 - MiniKV allocates connection key buffers after admission and grows them to fit the keys received.
