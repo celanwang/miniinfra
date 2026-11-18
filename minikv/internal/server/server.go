@@ -254,7 +254,7 @@ func (s *Server) receive(reader *bufio.Reader, key []byte, req request, bufferSi
 		}
 		return nil, result, nil
 	}
-	value, result := s.cache.Get(string(key), func(n int64) bool {
+	value, result := s.cache.Get(key, func(n int64) bool {
 		return n <= s.config.OutboundPerConn && s.outbound.reserve(n)
 	})
 	return value, result, nil
