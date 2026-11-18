@@ -375,23 +375,24 @@ func (p *Partition) commit(tx transaction) error {
 	if err != nil {
 		return err
 	}
-	frame, err := journal.EncodeFrame(data)
+	frame, err := journal.PrepareFrame(data)
 	if timing != nil {
 		timing.commit.frame += time.Since(started)
-		timing.commit.bytes += len(frame)
+		timing.commit.bytes += frame.Size()
 	}
 	if err != nil {
 		return err
 	}
+	frameBytes := int64(frame.Size())
 	budget := p.config.CapacityBytes/2 - 4096
-	if int64(len(frame))+p.reserved+tx.ReserveDelta > budget-p.storageBytes() {
+	if frameBytes+p.reserved+tx.ReserveDelta > budget-p.storageBytes() {
 		return ErrCapacity
 	}
 	available, err := p.journal.Available()
 	if err != nil {
 		return err
 	}
-	if int64(len(frame))+p.reserved+tx.ReserveDelta+8192 > available {
+	if frameBytes+p.reserved+tx.ReserveDelta+8192 > available {
 		return ErrCapacity
 	}
 	var writeBefore time.Duration
