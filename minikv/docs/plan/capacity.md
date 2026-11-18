@@ -590,3 +590,47 @@ done
 ```
 
 从组件目录运行，每对可交换两个 peer 的顺序。比较输出中 `Engine` 为 `minikv` 的行。
+
+## 满载插入的单个淘汰候选
+
+基线 `26689fb` 对有界样本排序，再取刚好补足槽位和字节的前缀。候选先按同一个比较器线性寻找首选条目。若首选能腾出所需空间，直接返回它，否则对完整样本排序并取原前缀。确定性用例两版均通过，覆盖环绕采样、过期优先、写入顺序、排除覆盖目标、多个候选刚好补足、失败和游标推进。
+
+TCP 回放将 16 个分片各填到 4096 槽和 4 MiB。旧条目记账 912 B，9 B 键、903 B 值，均有效。8 条写连接各在不同分片按固定节拍插入 192 个新键。先做 120 次同尺寸插入，使每次都在满槽时回收一项。随后交错做 48 次需回收两项的插入与 24 次需回收十七项的尝试。样本上限为 16，采样窗在这轮里不绕回已移动的尾部条目。用分片计数核对真实淘汰量，并按组统计完整 SET 响应的 RTT。16 条读连接以 10k/s 计划发压，其中一半与写入同分片，热点槽位在采样覆盖区之外。写入约每毫秒四笔，读延迟按写入窗口统计。
+
+同一 Linux arm64 驱动和 160 MiB 上限，服务固定 CPU 0–1，驱动固定 CPU 2–5，三对交换先后。采用条件是单候选写入在至少两对的 P50 同时改善 10% 和 2 µs，或 P99 同时改善 10% 和 50 µs，并维持并发读、回退写入和拒绝的表现。初次突发回放验证了各类容量结果，正式对照按固定节拍发写，以取得更充足的同分片读样本。
+
+隔离的 Go 1.27.3 规划基准在 macOS arm64 上固定 4096 槽、每次采 16 个，包含过期和活项，每组五轮。中位数为下表，两种实现的三类路径都为 0 分配。
+
+| 规划结果 | 排序基线 | 先选首项 |
+| --- | ---: | ---: |
+| 单项够用 | 180.8 ns | 41.3 ns |
+| 需两项 | 180.2 ns | 211.1 ns |
+| 拒绝 | 188.2 ns | 217.1 ns |
+
+TCP 六轮均返回 1,344 次 `STORED` 和 192 次 `NO_SPACE`，与每轮 1,728 次活键淘汰相符。960 次满槽单项占全部尝试的 62.5%，占成功写入的 71.4%。其余为 384 次双项和 192 次拒绝。这个占比由回放设定。八条写连接都能继续读，已发 GET 全部命中，读计划完成率最低 99.79%。每轮写入窗口约 384–389 ms，其中约 1,900 次 GET 与写入同分片。
+
+| TCP 指标，三轮中位数 | 排序基线 | 先选首项 |
+| --- | ---: | ---: |
+| 单项 SET RTT P50 / P99 | 40.25 / 276.82 µs | 44.37 / 1,010.07 µs |
+| 双项 SET RTT P50 / P99 | 45.87 / 1,026.02 µs | 46.37 / 4,176.67 µs |
+| 拒绝 SET RTT P50 / P99 | 53.66 / 1,035.98 µs | 57.00 / 2,860.92 µs |
+| 同分片 GET 在线 / RTT P99 | 4.47 / 1.48 ms | 5.98 / 2.68 ms |
+| 跨分片 GET 在线 / RTT P99 | 4.47 / 1.72 ms | 6.24 / 2.69 ms |
+
+**保留现有排序。** 单项 SET P50 在三对均增加 4.1–5.4 µs，P99 仅一对减少 31.6 µs。局部单项规划的节省达到了纳秒级收益，回退到排序的两条路径多一次扫描。满载 TCP 结果未达到采用条件。候选以补丁保留供复跑。
+
+```sh
+peers=$(mktemp -d)
+for arm in baseline single; do
+    mkdir "$peers/$arm"
+    git -C .. archive 26689fb minikv | tar -x -C "$peers/$arm"
+    cp internal/store/plan_test.go "$peers/$arm/minikv/internal/store/"
+done
+git -C "$peers/single" apply --unidiff-zero "$PWD/experiments/single-victim.patch"
+for arm in baseline single; do
+    GOWORK=off GOMAXPROCS=1 go test -C "$peers/$arm/minikv" -run '^TestPlanPreservesSampleOrderAndPrefix$' \
+        -bench '^BenchmarkPlanFullShard' -benchmem -benchtime=250ms -count=5 ./internal/store
+    GOWORK=off python3 experiments/capacity.py --profiles pressure --pressure-lengths eviction \
+        --server-cpus 0-1 --driver-cpus 2-5 --peer-module "$peers/$arm/minikv"
+done
+```
