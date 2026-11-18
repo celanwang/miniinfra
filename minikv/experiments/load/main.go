@@ -247,7 +247,7 @@ func (l lane) run(queue <-chan arrival) (counts, sample) {
 	return res, timings
 }
 
-func schedule(start time.Time, window, tick time.Duration, rate int, ordinaryQ, backgroundQ chan arrival, ordinary, background *counts) {
+func schedule(start time.Time, window, tick time.Duration, rate, backgroundRate int, ordinaryQ, backgroundQ chan arrival, ordinary, background *counts) {
 	nextSmall, nextBackground := 0, 0
 	for elapsed := time.Duration(0); elapsed < window; elapsed += tick {
 		at := start.Add(elapsed)
@@ -257,7 +257,7 @@ func schedule(start time.Time, window, tick time.Duration, rate int, ordinaryQ, 
 		late := time.Since(at) > grace
 		through := min(elapsed+tick, window)
 		nextSmall = offer(ordinaryQ, ordinary, at, late, nextSmall, int(through*time.Duration(rate)/time.Second))
-		nextBackground = offer(backgroundQ, background, at, late, nextBackground, int(through*40/time.Second))
+		nextBackground = offer(backgroundQ, background, at, late, nextBackground, int(through*time.Duration(backgroundRate)/time.Second))
 	}
 	close(ordinaryQ)
 	close(backgroundQ)
@@ -356,7 +356,7 @@ func runLanes(lanes []lane, rate int, window, tick time.Duration) result {
 			laneCounts[i], timings[i] = l.run(queue)
 		})
 	}
-	schedule(start, window, tick, rate, ordinaryQ, backgroundQ, &aggregate.Ordinary, &aggregate.Background)
+	schedule(start, window, tick, rate, 40, ordinaryQ, backgroundQ, &aggregate.Ordinary, &aggregate.Background)
 	wg.Wait()
 	aggregate.ClientCPUSeconds = cpuSeconds() - before
 	aggregate.ServerCPUTicks = serverTicks() - serverBefore
@@ -484,16 +484,30 @@ func fillKeys(t target, clients, n, size int, key func(int) string) map[outcome]
 
 func main() {
 	redis := flag.Bool("redis", false, "use Redis RESP2")
-	profile := flag.String("profile", "small", "small, mixed, slow, capacity, or pressure")
+	profile := flag.String("profile", "small", "small, mixed, slow, capacity, pressure, ttl, or page")
 	rate := flag.Int("rate", 10000, "ordinary offered requests per second")
 	window := flag.Duration("duration", 6*time.Second, "offered workload duration")
 	tick := flag.Duration("tick", time.Millisecond, "fixed arrival batch interval")
 	lengths := flag.String("pressure-lengths", "fixed", "pressure write size and locality pattern")
 	blockProfile := flag.Bool("block-profile", false, "fetch a Go block profile from the fixture")
 	ttlPattern := flag.String("ttl-pattern", "clustered", "clustered, spread, byte-fit, or byte-limit TTL expiry")
+	pageWindow := flag.Int("page-window", 1, "outstanding GETs per page connection (1 or 4)")
 	flag.Parse()
 	t := target{address: "127.0.0.1:7321", redis: *redis}
 	encoder := json.NewEncoder(os.Stdout)
+	if *profile == "page" && !*redis {
+		if (*pageWindow != 1 && *pageWindow != 4) || *rate <= 0 || *window <= 0 || *tick <= 0 {
+			log.Fatal("invalid page profile parameters")
+		}
+		load, err := runPage(t, *pageWindow, *rate, *window, *tick)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := encoder.Encode(load); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if *profile == "ttl" && !*redis {
 		var result map[string]any
 		switch *ttlPattern {

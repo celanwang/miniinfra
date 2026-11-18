@@ -22,7 +22,7 @@ func TestOfferDistinguishesQueuePressureFromLateScheduler(t *testing.T) {
 func TestScheduleCountsPartialLastInterval(t *testing.T) {
 	var normal, auxiliary counts
 	start := time.Now().Add(-time.Minute)
-	schedule(start, 1250*time.Microsecond, 350*time.Microsecond, 100000,
+	schedule(start, 1250*time.Microsecond, 350*time.Microsecond, 100000, 40,
 		make(chan arrival, 1), make(chan arrival, 1), &normal, &auxiliary)
 	if normal.Offered != 125 || normal.Late != 125 || auxiliary.Offered != 0 {
 		t.Fatalf("normal = %+v, auxiliary = %+v", normal, auxiliary)
