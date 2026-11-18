@@ -112,13 +112,6 @@ func (p *Partition) Compact() error {
 	return p.compact(now)
 }
 
-func checkpointStart(stats *checkpointTiming) time.Time {
-	if stats != nil {
-		return time.Now()
-	}
-	return time.Time{}
-}
-
 func pruneCheckpointEntries[V any](entries map[string]V, expired func(string, V) bool) map[string]V {
 	var pruned map[string]V
 	for key, value := range entries {

@@ -1,6 +1,6 @@
 # MiniMQ
 
-MiniMQ currently runs one durable partition. Use the Go package directly or start the HTTP service.
+MiniMQ currently runs one durable partition. Start the HTTP service from the `minimq/` directory.
 
 ```sh
 go run ./cmd/minimqd -dir ./minimq-data
@@ -38,3 +38,11 @@ The [scheduled release experiment](docs/scheduling-experiment.md) covers simulta
 The [lease expiration experiment](docs/retry-experiment.md) measures lock contention during retry and dead-letter batches.
 
 The [dead-letter page experiment](docs/dead-letter-page-experiment.md) measures cursor pages and concurrent delivery traffic.
+
+## Source layout
+
+- Import `github.com/celanwang/miniinfra/minimq` and call `Open` to use a `Partition` directly. `partition.go` contains startup and the transaction logic shared by commits and replay. `history.go` handles page reads and segment references. `checkpoint.go` restores checkpoints and reclaims eligible history.
+- `internal/journal` handles WAL framing, the committed `HEAD`, and generation files.
+- `cmd/minimqd` serves the HTTP API and runs partition maintenance.
+
+For historical performance comparisons, build the experiment from the `minimq/` checkout at the revision named in the experiment notes.
