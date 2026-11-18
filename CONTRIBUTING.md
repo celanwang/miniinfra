@@ -6,10 +6,12 @@ Develop each component on its own branch off `main` (`dev/minidb`, `dev/minikv`,
 
 ## Commits
 
-Use one English line in the form `type(scope): description`. Use the component or area as the scope and start the description with an imperative verb.
+Use one English line in the form `type(scope): description`. Name the feature or subsystem you changed in the scope, and start the description with an imperative verb.
 
 ```text
-feat(minimq): add delayed delivery
+feat(wal): batch transaction flushes
+fix(leases): reject stale acknowledgments
+test(admission): compare cache policies under load
 ```
 
 ## Changelog
