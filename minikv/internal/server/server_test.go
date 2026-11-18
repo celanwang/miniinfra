@@ -214,15 +214,18 @@ func TestLargeTCPReplyReturnsOutboundBudget(t *testing.T) {
 			}
 			slow := s.testConn(t, conn, peer)
 
+			key := "tenant:product:detail:" + strings.Repeat("a", 40) + "\x00\n"
+			get := fmt.Sprintf("GET %d\n%s", len(key), key)
 			old := bytes.Repeat([]byte("o"), cfg.MaxValueBytes)
-			if cache.Set("k", old, 0, false) != store.Stored {
+			if cache.Set(key, old, 0, false) != store.Stored {
 				t.Fatal("could not store old value")
 			}
-			slow.exchange(t, "GET 1\nkSET 1 1 NONE\nzZ", fmt.Sprintf("VALUE %d\n", len(old)))
+			slow.exchange(t, get+"SET 1 1 NONE\nzZ", fmt.Sprintf("VALUE %d\n", len(old)))
 			waitBudget(t, &s.outbound, int64(len(old)))
-			other := s.pipe(t)
-			other.exchange(t, "SET 1 3 NONE\nknew", "STORED\n")
-			other.exchange(t, "GET 1\nk", "BUSY\n")
+			address, _ := s.listenTestTCP(t)
+			other := dialTestTCP(t, address)
+			other.exchange(t, fmt.Sprintf("SET %d 3 NONE\n%snew", len(key), key), "STORED\n")
+			other.exchange(t, get, "BUSY\n")
 			other.exchange(t, "GET 1\nz", "MISS\n")
 
 			switch ending {
@@ -244,7 +247,7 @@ func TestLargeTCPReplyReturnsOutboundBudget(t *testing.T) {
 				_ = slow.Close()
 			}
 			waitBudget(t, &s.outbound, 0)
-			other.send(t, "GET 1\nk")
+			other.send(t, get)
 			other.value(t, "new")
 		})
 	}

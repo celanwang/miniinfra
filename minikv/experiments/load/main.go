@@ -492,14 +492,15 @@ func main() {
 	blockProfile := flag.Bool("block-profile", false, "fetch a Go block profile from the fixture")
 	ttlPattern := flag.String("ttl-pattern", "clustered", "clustered, spread, byte-fit, or byte-limit TTL expiry")
 	pageWindow := flag.Int("page-window", 1, "outstanding GETs per page connection (1 or 4)")
+	pageKeyBytes := flag.Int("page-key-bytes", pageDefaultKey, "key length for the page profile (12–1024)")
 	flag.Parse()
 	t := target{address: "127.0.0.1:7321", redis: *redis}
 	encoder := json.NewEncoder(os.Stdout)
 	if *profile == "page" && !*redis {
-		if (*pageWindow != 1 && *pageWindow != 4) || *rate <= 0 || *window <= 0 || *tick <= 0 {
+		if (*pageWindow != 1 && *pageWindow != 4) || *pageKeyBytes < pageDefaultKey || *pageKeyBytes > 1024 || *rate <= 0 || *window <= 0 || *tick <= 0 {
 			log.Fatal("invalid page profile parameters")
 		}
-		load, err := runPage(t, *pageWindow, *rate, *window, *tick)
+		load, err := runPage(t, *pageWindow, *rate, *pageKeyBytes, *window, *tick)
 		if err != nil {
 			log.Fatal(err)
 		}

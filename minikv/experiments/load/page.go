@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -14,6 +16,7 @@ const (
 	pageConnections = 16
 	singleConns     = 16
 	singleRate      = 10000
+	pageDefaultKey  = 12
 )
 
 type pageObject struct {
@@ -39,12 +42,17 @@ func describePageLatency(times []time.Duration) pageLatency {
 	return pageLatency{percentile(times, 500), percentile(times, 990)}
 }
 
-func runPage(t target, depth, rate int, window, tick time.Duration) (map[string]any, error) {
+func runPage(t target, depth, rate, keyBytes int, window, tick time.Duration) (map[string]any, error) {
 	var objects [pageObjects]pageObject
+	prefix := "page-item-"
+	if keyBytes != pageDefaultKey {
+		const namespace = "tenant:000042:catalog:region:cn:product:detail:variant:public:"
+		prefix = strings.Repeat(namespace, (keyBytes+len(namespace)-1)/len(namespace))[:keyBytes-2]
+	}
 	warm := client{target: t}
 	defer warm.close()
 	for index := range objects {
-		key := fmt.Sprintf("page-item-%02d", index)
+		key := fmt.Sprintf("%s%02d", prefix, index)
 		value := bytes.Repeat([]byte{byte(index + 1)}, smallSize)
 		if _, status := warm.execute(t.makeCommand(key, value, len(value)), 0, 0); status != ok {
 			return nil, fmt.Errorf("page prefill: %s", status)
@@ -65,6 +73,8 @@ func runPage(t target, depth, rate int, window, tick time.Duration) (map[string]
 	var pageOffered, singleOffered counts
 	lanes := make([]pageLane, len(clients))
 	var wg sync.WaitGroup
+	admin := &http.Client{Timeout: time.Second}
+	runtimeBefore := readRuntime(admin)
 	start := time.Now().Add(200 * time.Millisecond)
 	for i := range clients {
 		wg.Go(func() {
@@ -107,6 +117,7 @@ func runPage(t target, depth, rate int, window, tick time.Duration) (map[string]
 	}
 	schedule(start, window, tick, rate, singleRate, pages, singles, &pageOffered, &singleOffered)
 	wg.Wait()
+	runtimeAfter := readRuntime(admin)
 
 	pageOffered.Responses = make(map[outcome]int)
 	singleOffered.Responses = make(map[outcome]int)
@@ -136,6 +147,7 @@ func runPage(t target, depth, rate int, window, tick time.Duration) (map[string]
 		"PageGETsSent": requestSent, "PageGETsVerified": len(requests), "PageGETLatency": describePageLatency(requests),
 		"PageOnline": describePageLatency(pageTimes.online), "PageActive": describePageLatency(pageTimes.rtt),
 		"SingleOnline": describePageLatency(singleTimes.online), "SingleRTT": describePageLatency(singleTimes.rtt),
+		"RuntimeBefore": runtimeBefore, "RuntimeAfter": runtimeAfter,
 	}, nil
 }
 

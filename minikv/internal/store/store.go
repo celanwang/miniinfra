@@ -109,12 +109,12 @@ func (s *Store) shardFor(key string) *shard {
 	return &s.shards[s.ShardIndex(key)]
 }
 
-// Get borrows an immutable value after reserve has approved its capacity.
+// Get borrows key for the lookup and returns an immutable value if reserved.
 // reserve runs under the read lock and must return without waiting on I/O.
-func (s *Store) Get(key string, reserve func(int64) bool) ([]byte, Result) {
-	sh := s.shardFor(key)
+func (s *Store) Get(key []byte, reserve func(int64) bool) ([]byte, Result) {
+	sh := &s.shards[maphash.Bytes(s.seed, key)%uint64(len(s.shards))]
 	sh.mu.RLock()
-	i, ok := sh.index[key]
+	i, ok := sh.index[string(key)]
 	if !ok || sh.entries[i].expired(s.now()) {
 		sh.mu.RUnlock()
 		return nil, Miss

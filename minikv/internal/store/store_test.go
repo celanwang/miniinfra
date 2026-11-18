@@ -27,7 +27,7 @@ func put(t *testing.T, s *Store, key, value string, ttl time.Duration, nx bool, 
 
 func read(t *testing.T, s *Store, key, wantValue string, want Result) {
 	t.Helper()
-	value, result := s.Get(key, func(int64) bool { return true })
+	value, result := s.Get([]byte(key), func(int64) bool { return true })
 	if result != want || string(value) != wantValue {
 		t.Fatalf("Get(%q) = %q, %d, want %q, %d", key, value, result, wantValue, want)
 	}
