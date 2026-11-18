@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniMQ assembles message frames directly in sealed segments to reduce checkpoint copying and allocations.
 - MiniKV measures same-shard and cross-shard read latency during large overwrites.
 - MiniMQ batches directory syncs for new checkpoint files before publishing the durable checkpoint head.
 - MiniDB shares its MVCC cleanup budget across tables so quiet tables do not delay reclamation on busy ones.
