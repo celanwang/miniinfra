@@ -100,3 +100,59 @@ func TestReplayRejectsCorruption(t *testing.T) {
 		t.Fatal("opened a WAL with a corrupted record")
 	}
 }
+
+func TestBatchIsWrittenBeforeFirstPublication(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := file.WriteString(magic); err != nil {
+		t.Fatal(err)
+	}
+	log := &Log{file: file, queue: make(chan request, 2), done: make(chan struct{})}
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	expectedEnd := int64(len(magic) + 2*headerSize + len("firstsecond"))
+	log.queue <- request{payload: []byte("first"), result: first, publish: func(end int64) {
+		info, err := os.Stat(path)
+		if err != nil || info.Size() != expectedEnd {
+			t.Errorf("first publication did not follow the batch write: %v %v", info, err)
+		}
+		if end != int64(len(magic)+headerSize+len("first")) {
+			t.Errorf("wrong first transaction end: %d", end)
+		}
+	}}
+	log.queue <- request{payload: []byte("second"), result: second, publish: func(end int64) {
+		if end != expectedEnd {
+			t.Errorf("wrong second transaction end: %d", end)
+		}
+	}}
+	go log.run(int64(len(magic)))
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(<-first, <-second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteFailurePreventsPublication(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal")
+	log, err := Open(path, func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := log.Commit([]byte("failed write"), func(int64) { t.Error("published a failed transaction") }); err == nil {
+			t.Fatal("acknowledged a failed write")
+		}
+	}
+	if err := log.Close(); err == nil {
+		t.Fatal("WAL did not report the write failure at close")
+	}
+}
