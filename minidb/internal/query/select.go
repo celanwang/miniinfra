@@ -92,14 +92,7 @@ func selectRows(ctx context.Context, view engine.Snapshot, stmt statement) (Resu
 		}
 		plan := scans[depth]
 		filters := slices.Concat(plan.on, where)
-		var columns []int
-		var values []engine.Value
-		for _, index := range plan.schema.Indexes {
-			if key, found := lookupValues(index.Columns, prefix, filters); found {
-				columns, values = index.Columns, key
-				break
-			}
-		}
+		columns, values := chooseEqualityLookup(plan.schema.Indexes, prefix, filters)
 		rows, _, err := view.RowsMatching(ctx, plan.table, columns, values, keep)
 		if err != nil {
 			return err
@@ -115,4 +108,25 @@ func selectRows(ctx context.Context, view engine.Snapshot, stmt statement) (Resu
 		return nil
 	}
 	return result, visit(nil, 0)
+}
+
+// Keep the first bound index as the fallback. A non-NULL unique key can have
+// at most one visible row, even when its index still contains older versions.
+func chooseEqualityLookup(indexes []engine.Index, prefix []engine.Value, filters []condition) (columns []int, values []engine.Value) {
+	for _, index := range indexes {
+		if columns != nil && !index.Unique {
+			continue
+		}
+		key, found := lookupValues(index.Columns, prefix, filters)
+		if !found {
+			continue
+		}
+		if index.Unique && !slices.ContainsFunc(key, func(value engine.Value) bool { return value.Kind == engine.Null }) {
+			return index.Columns, key
+		}
+		if columns == nil {
+			columns, values = index.Columns, key
+		}
+	}
+	return columns, values
 }
