@@ -102,9 +102,10 @@ func TestShortTailCheckpointExperiment(t *testing.T) {
 	}
 	var acks, checkpoints []operationTiming
 	p.observe(func(op string, timing operationTiming) {
-		if op == "ack" {
+		switch op {
+		case "ack":
 			acks = append(acks, timing)
-		} else {
+		case "checkpoint":
 			checkpoints = append(checkpoints, timing)
 		}
 	})

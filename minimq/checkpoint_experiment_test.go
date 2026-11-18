@@ -78,9 +78,10 @@ func TestCheckpointExperiment(t *testing.T) {
 	acks := make([]operationTiming, 0, checkpointPulseSize*pulses+queuedFastHistory+probeCount)
 	var checkpoints []operationTiming
 	p.observe(func(op string, timing operationTiming) {
-		if op == "ack" {
+		switch op {
+		case "ack":
 			acks = append(acks, timing)
-		} else {
+		case "checkpoint":
 			checkpoints = append(checkpoints, timing)
 		}
 	})

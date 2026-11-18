@@ -2,7 +2,8 @@ package minimq
 
 import (
 	"bytes"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -68,7 +69,14 @@ func (p *Partition) recordFailure(tx *transaction, reader *historyReader, update
 	task := p.redrives[update.Redrive]
 	msg := task.Message
 	if update.Redrive == "" {
+		var start time.Time
+		if p.timings != nil {
+			start = time.Now()
+		}
 		msg, err = p.readHistoryLocked(reader, update.Offset, p.locateHistory(update.Offset))
+		if p.timings != nil {
+			p.timings.retry.read += time.Since(start)
+		}
 		if err != nil {
 			return FailureResult{}, err
 		}
@@ -87,8 +95,8 @@ func (p *Partition) recordFailure(tx *transaction, reader *historyReader, update
 
 // AdvanceRetries settles a bounded batch of leases known to have expired.
 func (p *Partition) AdvanceRetries(limit Limits) (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	sample := p.beginOperation()
+	defer p.endOperation("retry", sample)
 	if err := p.checkOpen(); err != nil {
 		return 0, err
 	}
@@ -102,38 +110,87 @@ func (p *Partition) AdvanceRetries(limit Limits) (int, error) {
 	return p.expireLocked("", now, limit)
 }
 
+type expiredLease struct {
+	update   taskUpdate
+	instance string
+}
+
+func compareExpiredLeases(a, b expiredLease) int {
+	if deadline := a.update.State.Lease.Deadline.Compare(b.update.State.Lease.Deadline); deadline != 0 {
+		return deadline
+	}
+	if subscription := strings.Compare(a.update.Subscription, b.update.Subscription); subscription != 0 {
+		return subscription
+	}
+	return strings.Compare(a.instance, b.instance)
+}
+
 func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int, error) {
-	var expired []taskUpdate
+	var stats *retryTiming
+	var start time.Time
+	if p.timings != nil {
+		stats = &p.timings.retry
+		start = time.Now()
+	}
+	var expired []expiredLease
+	order := func() {
+		var began time.Time
+		if stats != nil {
+			began = time.Now()
+		}
+		slices.SortFunc(expired, compareExpiredLeases)
+		if stats != nil {
+			stats.order += time.Since(began)
+		}
+	}
+	collect := func(update taskUpdate) {
+		if stats != nil {
+			stats.candidates++
+		}
+		expired = append(expired, expiredLease{update: update, instance: update.instance()})
+		// A batch can only commit a prefix of this order. A candidate
+		// behind the first limit.Messages can never enter that prefix.
+		if len(expired) == 2*limit.Messages {
+			order()
+			clear(expired[limit.Messages:])
+			expired = expired[:limit.Messages]
+		}
+	}
 	for subName, sub := range p.subscriptions {
 		if name != "" && name != subName {
 			continue
 		}
+		if stats != nil {
+			stats.visited += len(sub.Tasks)
+		}
 		for offset, state := range sub.Tasks {
 			if state.Lease.Token != "" && !now.Lower.Before(state.Lease.Deadline) {
-				expired = append(expired, taskUpdate{Subscription: subName, Offset: offset, State: state})
+				collect(taskUpdate{Subscription: subName, Offset: offset, State: state})
 			}
 		}
+	}
+	if stats != nil {
+		stats.visited += len(p.redrives)
 	}
 	for _, task := range p.redrives {
 		if (name == "" || name == task.Subscription) && task.State.Lease.Token != "" &&
 			!now.Lower.Before(task.State.Lease.Deadline) {
-			expired = append(expired, task.update())
+			collect(task.update())
 		}
 	}
-	sort.Slice(expired, func(i, j int) bool {
-		a, b := expired[i], expired[j]
-		if !a.State.Lease.Deadline.Equal(b.State.Lease.Deadline) {
-			return a.State.Lease.Deadline.Before(b.State.Lease.Deadline)
-		}
-		if a.Subscription != b.Subscription {
-			return a.Subscription < b.Subscription
-		}
-		return a.instance() < b.instance()
-	})
+	if stats != nil {
+		stats.scan = time.Since(start) - stats.order
+	}
+	order()
+	expired = expired[:min(len(expired), limit.Messages)]
+	if stats != nil {
+		start = time.Now()
+	}
 	tx := transaction{Lower: now.Lower}
 	reader := historyReader{dir: p.journal.Dir()}
 	defer reader.close()
-	for _, update := range expired {
+	for _, candidate := range expired {
+		update := candidate.update
 		size := 0
 		if update.State.Attempts >= p.subscriptions[update.Subscription].Config.MaxAttempts {
 			if update.Redrive != "" {
@@ -142,13 +199,21 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 				size = p.locateHistory(update.Offset).record.bodyBytes
 			}
 		}
-		if len(tx.Tasks) == limit.Messages || size > limit.Bytes {
+		if size > limit.Bytes {
 			break
 		}
 		if _, err := p.recordFailure(&tx, &reader, update, "lease expired", update.State.Lease.Deadline, now.Upper); err != nil {
 			return 0, err
 		}
+		if stats != nil {
+			stats.deadBytes += size
+		}
 		limit.Bytes -= size
+	}
+	if stats != nil {
+		stats.prepare = time.Since(start)
+		stats.settled, stats.dead = len(tx.Tasks), len(tx.Dead)
+		start = time.Now()
 	}
 	if len(tx.Tasks) == 0 {
 		if len(expired) > 0 {
@@ -156,7 +221,11 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 		}
 		return 0, nil
 	}
-	if err := p.commit(tx); err != nil {
+	err := p.commit(tx)
+	if stats != nil {
+		stats.commit = time.Since(start)
+	}
+	if err != nil {
 		return 0, err
 	}
 	return len(tx.Tasks), nil
@@ -208,7 +277,7 @@ func (p *Partition) ListDeadLetters(name, after string, limit int) ([]DeadLetter
 			ids = append(ids, id)
 		}
 	}
-	sort.Strings(ids)
+	slices.Sort(ids)
 	var letters []DeadLetter
 	bytesLeft := MaxBatchBytes
 	for _, id := range ids[:min(limit, len(ids))] {
