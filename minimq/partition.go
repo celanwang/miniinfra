@@ -33,6 +33,7 @@ type Config struct {
 	CapacityBytes    int64
 	DedupRetention   time.Duration
 	HistoryRetention time.Duration
+	DeadRetention    time.Duration
 	SegmentMessages  int
 }
 
@@ -51,6 +52,9 @@ func (c Config) defaults() Config {
 	}
 	if c.HistoryRetention == 0 {
 		c.HistoryRetention = 24 * time.Hour
+	}
+	if c.DeadRetention == 0 {
+		c.DeadRetention = 7 * 24 * time.Hour
 	}
 	if c.SegmentMessages == 0 {
 		c.SegmentMessages = 256
@@ -120,6 +124,7 @@ type transaction struct {
 	Publish      *publication
 	Schedule     *scheduledPublication
 	Due          []publication
+	Dead         []DeadLetter
 	Register     *registration
 	Tasks        []taskUpdate
 	Ack          *ackReceipt
@@ -154,13 +159,14 @@ type Partition struct {
 	reserved        int64
 	scheduled       map[string]scheduledPublication
 	due             scheduleQueue
+	dead            map[string]DeadLetter
 }
 
 // Open loads the partition in dir and takes exclusive ownership until Close.
 func Open(dir string, config Config) (*Partition, error) {
 	config = config.defaults()
 	if config.CapacityBytes < 4096 || config.DedupRetention < 0 ||
-		config.HistoryRetention < 0 || config.SegmentMessages < 1 ||
+		config.HistoryRetention < 0 || config.DeadRetention < 0 || config.SegmentMessages < 1 ||
 		config.SegmentMessages > MaxBatchMessages {
 		return nil, ErrInvalid
 	}
@@ -169,6 +175,7 @@ func Open(dir string, config Config) (*Partition, error) {
 		subscriptions:   make(map[string]*subscription),
 		acknowledgments: make(map[string]ackReceipt),
 		scheduled:       make(map[string]scheduledPublication),
+		dead:            make(map[string]DeadLetter),
 	}
 	j, err := journal.Open(dir, func(string) error {
 		return fmt.Errorf("%w: unexpected checkpoint", ErrCorrupt)
@@ -222,6 +229,12 @@ func (p *Partition) apply(tx transaction) error {
 	}
 	if err := p.applySubscriptions(tx); err != nil {
 		return err
+	}
+	for _, letter := range tx.Dead {
+		if _, exists := p.dead[letter.ID]; exists {
+			return fmt.Errorf("%w: repeated dead letter", ErrCorrupt)
+		}
+		p.dead[letter.ID] = letter
 	}
 	p.reserved += tx.ReserveDelta
 	if p.reserved < 0 {

@@ -196,6 +196,9 @@ func (p *Partition) Pull(name, worker string, limit Limits) ([]Delivery, error) 
 	if err != nil {
 		return nil, err
 	}
+	if _, err := p.expireLocked(name, now, Limits{Messages: MaxBatchMessages, Bytes: MaxBatchBytes}); err != nil {
+		return nil, err
+	}
 	var deliveries []Delivery
 	tx := transaction{Lower: now.Lower}
 	end := min(p.nextOffset(), sub.Floor+sub.Config.Window)
@@ -204,7 +207,7 @@ func (p *Partition) Pull(name, worker string, limit Limits) ([]Delivery, error) 
 		state, known := sub.Tasks[offset]
 		if msg.AcceptedSequence <= sub.Registered || state.Finished ||
 			state.Attempts >= sub.Config.MaxAttempts ||
-			now.Lower.Before(state.Lease.Deadline) || now.Lower.Before(state.ReadyAt) {
+			state.Lease.Token != "" || now.Lower.Before(state.ReadyAt) {
 			continue
 		}
 		if len(msg.Body) > limit.Bytes {
@@ -239,6 +242,38 @@ func (p *Partition) Pull(name, worker string, limit Limits) ([]Delivery, error) 
 
 func historyInstance(offset uint64) string { return fmt.Sprintf("history:%d", offset) }
 
+func (p *Partition) lookupTask(name, instance string) (taskUpdate, error) {
+	sub := p.subscriptions[name]
+	if sub == nil {
+		return taskUpdate{}, ErrSubscription
+	}
+	var offset uint64
+	if _, err := fmt.Sscanf(instance, "history:%d", &offset); err != nil || historyInstance(offset) != instance {
+		return taskUpdate{}, ErrInvalid
+	}
+	state, exists := sub.Tasks[offset]
+	if !exists || state.Finished {
+		return taskUpdate{}, ErrOutcomeUnknown
+	}
+	return taskUpdate{Subscription: name, Offset: offset, State: state}, nil
+}
+
+func validateLease(current leaseState, now TimeBounds, clockErr error, worker, token string) error {
+	if current.Token == "" || current.Token != token || current.Worker != worker {
+		return ErrLeaseExpired
+	}
+	if clockErr != nil {
+		return clockErr
+	}
+	if !now.Lower.Before(current.Deadline) {
+		return ErrLeaseExpired
+	}
+	if !now.Upper.Before(current.Deadline) {
+		return ErrClockUncertain
+	}
+	return nil
+}
+
 // Ack confirms a single lease and can be retried with the same token.
 func (p *Partition) Ack(name, worker, instance, token string) (AckResult, error) {
 	p.mu.Lock()
@@ -257,29 +292,18 @@ func (p *Partition) Ack(name, worker, instance, token string) (AckResult, error)
 		}
 		return "", ErrOutcomeUnknown
 	}
-	var offset uint64
-	if _, err := fmt.Sscanf(instance, "history:%d", &offset); err != nil || historyInstance(offset) != instance {
-		return "", ErrInvalid
+	update, err := p.lookupTask(name, instance)
+	if err != nil {
+		return "", err
 	}
-	current, exists := sub.Tasks[offset]
-	if !exists || current.Finished {
-		return "", ErrOutcomeUnknown
+	if err := validateLease(update.State.Lease, now, clockErr, worker, token); err != nil {
+		return "", err
 	}
-	if current.Lease.Token == "" || current.Lease.Token != token || current.Lease.Worker != worker {
-		return "", ErrLeaseExpired
-	}
-	if clockErr != nil {
-		return "", clockErr
-	}
-	if !now.Lower.Before(current.Lease.Deadline) {
-		return "", ErrLeaseExpired
-	}
-	if !now.Upper.Before(current.Lease.Deadline) {
-		return "", ErrClockUncertain
-	}
+	remaining := update.State.Remaining
+	update.State = taskState{Finished: true}
 	tx := transaction{
-		Lower: now.Lower, ReserveDelta: -current.Remaining,
-		Tasks: []taskUpdate{{Subscription: name, Offset: offset, State: taskState{Finished: true}}},
+		Lower: now.Lower, ReserveDelta: -remaining,
+		Tasks: []taskUpdate{update},
 		Ack:   &ackReceipt{Subscription: name, Worker: worker, Instance: instance, Token: token, Expires: now.Upper.Add(p.config.DedupRetention)},
 	}
 	if err := p.commit(tx); err != nil {
