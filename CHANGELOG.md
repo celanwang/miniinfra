@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB allocates transaction lock state on the first grant, saving two allocations on point reads.
 - MiniKV allocates connection key buffers after admission and grows them to fit the keys received.
 - MiniMQ skips encoding tail segments reclaimed by the same checkpoint while preserving protected history and recovery.
 - MiniDB reuses snapshot rows during projection, saving one copy per root row in single-table queries and joins.
