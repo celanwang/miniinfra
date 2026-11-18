@@ -102,6 +102,12 @@ type HistoryPage struct {
 	Next     uint64
 }
 
+type PartitionStatus struct {
+	FirstOffset, NextOffset                 uint64
+	StoredBytes, ReservedBytes              int64
+	Scheduled, DeadLetters, PendingRedrives int
+}
+
 type OffsetGap struct {
 	Requested, First uint64
 }
@@ -372,4 +378,18 @@ func (p *Partition) Close() error {
 	}
 	p.closed = true
 	return p.journal.Close()
+}
+
+// Status reports committed state and physically accounted storage.
+func (p *Partition) Status() (PartitionStatus, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.checkOpen(); err != nil {
+		return PartitionStatus{}, err
+	}
+	return PartitionStatus{
+		FirstOffset: p.firstOffset, NextOffset: p.nextOffset(),
+		StoredBytes: p.storageBytes(), ReservedBytes: p.reserved,
+		Scheduled: len(p.scheduled), DeadLetters: len(p.dead), PendingRedrives: len(p.redrives),
+	}, nil
 }
