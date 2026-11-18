@@ -340,11 +340,12 @@ func TestTCPPipelinePreservesOrderAndContinuesAfterRejection(t *testing.T) {
 	address, _ := s.listenTestTCP(t)
 	c := dialTestTCP(t, address)
 	c.send(t, "SET 1 4 NONE\naold\n"+"GET 1\na"+"GET 1\nl"+
-		"SET 1 4 NONE NX\naBAD!"+"GET 1\nx"+"SET 1 4 NONE\nbnew\x00"+
+		"GET 1\nz"+"SET 1 4 NONE NX\naBAD!"+"GET 1\nx"+"SET 1 4 NONE\nbnew\x00"+
 		"GET 1\na"+"GET 1\nb")
 	c.line(t, "STORED\n")
 	c.value(t, "old\n")
 	c.value(t, large)
+	c.line(t, "MISS\n")
 	c.line(t, "EXISTS\n")
 	c.line(t, "BUSY\n")
 	c.line(t, "STORED\n")
@@ -385,6 +386,7 @@ func TestUnconsumedRequestClosesConnection(t *testing.T) {
 	s := testServer(t, 1, func(c *Config) {
 		c.MaxValueBytes = 16
 	})
+	address, _ := s.listenTestTCP(t)
 	for _, test := range []struct {
 		header string
 		status string
@@ -394,9 +396,34 @@ func TestUnconsumedRequestClosesConnection(t *testing.T) {
 		{"SET 1 3 9223372036855\n", "BAD_REQUEST\n"},
 		{strings.Repeat("X", headerBytes), "BAD_REQUEST\n"},
 	} {
-		c := s.pipe(t)
-		c.exchange(t, test.header, test.status)
+		c := dialTestTCP(t, address)
+		c.send(t, "SET 1 0 NONE\nk"+test.header)
+		c.line(t, "STORED\n")
+		c.line(t, test.status)
 		c.end(t)
 		waitBudget(t, &s.inbound, 0)
 	}
+}
+
+func TestStatusWriteDeadlineStopsPipeline(t *testing.T) {
+	s := testServer(t, 1, func(c *Config) { c.WriteTimeout = 40 * time.Millisecond })
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	if err := peer.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.serveConn(conn)
+	}()
+	c := &client{peer, bufio.NewReader(peer)}
+	c.send(t, "GET 1\nxSET 1 1 NONE\nkz")
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("status reply did not time out")
+	}
+	c.end(t)
+	s.pipe(t).exchange(t, "GET 1\nk", "MISS\n")
 }

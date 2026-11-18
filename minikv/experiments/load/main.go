@@ -164,6 +164,7 @@ func errorOutcome(err error) outcome {
 type entry struct {
 	get command
 	set command
+	nx  command
 }
 
 type scenario struct {
@@ -171,15 +172,23 @@ type scenario struct {
 	large []entry
 }
 
-func prepare(t target) scenario {
+func prepare(t target, profile string) scenario {
 	sizes := []int{smallSize, largeSize}
+	if profile == "status" {
+		sizes[0] = 0
+	}
 	tables := make([][]entry, len(sizes))
 	for i, n := range []int{smallKeys, largeKeys} {
 		value := bytes.Repeat([]byte("v"), sizes[i])
 		tables[i] = make([]entry, n)
 		for k := range tables[i] {
 			key := fmt.Sprintf("item%d-%05d", i, k)
-			tables[i][k] = entry{t.makeCommand(key, nil, len(value)), t.makeCommand(key, value, len(value))}
+			item := entry{get: t.makeCommand(key, nil, len(value)), set: t.makeCommand(key, value, len(value))}
+			if profile == "status" && i == 0 {
+				item.get = t.makeCommand("missing-"+key, nil, 0)
+				item.nx = ttlWrite(key, value, "NONE", true)
+			}
+			tables[i][k] = item
 		}
 	}
 	return scenario{tables[0], tables[1]}
@@ -203,6 +212,7 @@ type result struct {
 	Ordinary            counts
 	Background          counts
 	SmallGETs           int
+	StatusReplies       int `json:",omitempty"`
 	StoredSETs          int
 	P99Microseconds     float64
 	P999Microseconds    float64
@@ -246,7 +256,9 @@ func (l lane) run(queue <-chan arrival) (counts, sample) {
 		if set && response == ok {
 			timings.stored++
 		}
-		if !l.background && !set && response == ok {
+		successfulRead := !set && response == ok
+		statusReply := l.profile == "status" && (response == ok || response == miss || response == exists)
+		if !l.background && (successfulRead || statusReply) {
 			timings.online = append(timings.online, end.Sub(job.at))
 			timings.rtt = append(timings.rtt, end.Sub(began))
 		}
@@ -291,7 +303,7 @@ func (l lane) pick(index int) (entry, int, bool, time.Duration) {
 	// keeping each lane's offered sequence identical across engines.
 	mixed := uint64(index+1) * 11400714819323198485
 	seed := mixed ^ (mixed >> 31)
-	if l.background && l.profile != "small" {
+	if l.background && (l.profile == "mixed" || l.profile == "slow") {
 		if (seed>>16)%10 == 0 {
 			return l.load.large[seed%largeKeys], largeSize, true, 0
 		}
@@ -305,7 +317,19 @@ func (l lane) pick(index int) (entry, int, bool, time.Duration) {
 	if seed%5 != 0 {
 		key %= 8
 	}
-	return l.load.small[key], smallSize, (seed>>17)%20 == 0, 0
+	item := l.load.small[key]
+	if l.profile == "status" {
+		switch seed % 4 {
+		case 0:
+			return item, 0, true, 0
+		case 1:
+			item.set = item.nx
+			return item, 0, true, 0
+		default:
+			return item, 0, false, 0
+		}
+	}
+	return item, smallSize, l.profile != "hit" && (seed>>17)%20 == 0, 0
 }
 
 func percentile(times []time.Duration, perThousand int) float64 {
@@ -317,7 +341,7 @@ func percentile(times []time.Duration, perThousand int) float64 {
 }
 
 func runCurve(t target, profile string, rate int, window, tick time.Duration) (result, error) {
-	load := prepare(t)
+	load := prepare(t, profile)
 	warm := client{target: t}
 	defer warm.close()
 	for _, table := range [][]entry{load.small, load.large} {
@@ -397,7 +421,11 @@ func runLanes(lanes []lane, rate int, window, tick time.Duration) result {
 	}
 	slices.Sort(online)
 	slices.Sort(rtt)
-	aggregate.SmallGETs = len(online)
+	if lanes[0].profile == "status" {
+		aggregate.StatusReplies = len(online)
+	} else {
+		aggregate.SmallGETs = len(online)
+	}
 	aggregate.P99Microseconds = percentile(online, 990)
 	aggregate.P999Microseconds = percentile(online, 999)
 	aggregate.RTTP99Microseconds = percentile(rtt, 990)
@@ -499,7 +527,7 @@ func fillKeys(t target, clients, n, size int, key func(int) string) map[outcome]
 
 func main() {
 	redis := flag.Bool("redis", false, "use Redis RESP2")
-	profile := flag.String("profile", "small", "small, mixed, slow, capacity, pressure, ttl, or page")
+	profile := flag.String("profile", "small", "small, mixed, slow, status, hit, capacity, pressure, ttl, or page")
 	rate := flag.Int("rate", 10000, "ordinary offered requests per second")
 	window := flag.Duration("duration", 6*time.Second, "offered workload duration")
 	tick := flag.Duration("tick", time.Millisecond, "fixed arrival batch interval")
@@ -572,7 +600,16 @@ func main() {
 		}
 		return
 	}
-	if (*profile != "small" && *profile != "mixed" && *profile != "slow") || *rate <= 0 || *window <= 0 || *tick <= 0 {
+	switch *profile {
+	case "small", "mixed", "slow":
+	case "status", "hit":
+		if *redis {
+			log.Fatal("this profile requires MiniKV")
+		}
+	default:
+		log.Fatal("invalid profile")
+	}
+	if *rate <= 0 || *window <= 0 || *tick <= 0 {
 		log.Fatal("invalid profile, rate, or duration")
 	}
 	load, err := runCurve(t, *profile, *rate, *window, *tick)

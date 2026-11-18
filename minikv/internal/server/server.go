@@ -153,7 +153,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReaderSize(conn, headerBytes)
 	keyBuffer := make([]byte, s.config.MaxKeyBytes)
-	replyHeader := make([]byte, 0, 32)
+	reply := make([]byte, 0, 32)
 	for {
 		if conn.SetReadDeadline(time.Now().Add(s.config.ReadTimeout)) != nil {
 			return
@@ -161,26 +161,26 @@ func (s *Server) serveConn(conn net.Conn) {
 		line, err := reader.ReadSlice('\n')
 		if err != nil {
 			if errors.Is(err, bufio.ErrBufferFull) {
-				_ = s.writeStatus(conn, "BAD_REQUEST\n")
+				_ = s.writeStatus(conn, reply, "BAD_REQUEST\n")
 			}
 			return
 		}
 		req, err := parseHeader(line[:len(line)-1])
 		if err != nil {
-			_ = s.writeStatus(conn, "BAD_REQUEST\n")
+			_ = s.writeStatus(conn, reply, "BAD_REQUEST\n")
 			return
 		}
 		if req.keyBytes > len(keyBuffer) || req.valueBytes > s.config.MaxValueBytes {
-			_ = s.writeStatus(conn, "TOO_LARGE\n")
+			_ = s.writeStatus(conn, reply, "TOO_LARGE\n")
 			return
 		}
-		if !s.handle(conn, reader, keyBuffer[:req.keyBytes], replyHeader, req) {
+		if !s.handle(conn, reader, keyBuffer[:req.keyBytes], reply, req) {
 			return
 		}
 	}
 }
 
-func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, replyHeader []byte, req request) bool {
+func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, reply []byte, req request) bool {
 	bufferSize := s.writes.rounded(req.valueBytes, s.config.MaxValueBytes)
 	inBytes, reserved := s.reserveInbound(len(key), bufferSize)
 	if !reserved && bufferSize != req.valueBytes {
@@ -188,7 +188,7 @@ func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, replyHeader []
 		inBytes, reserved = s.reserveInbound(len(key), bufferSize)
 	}
 	if !reserved {
-		_ = s.writeStatus(conn, "BUSY\n")
+		_ = s.writeStatus(conn, reply, "BUSY\n")
 		return false
 	}
 
@@ -199,7 +199,7 @@ func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, replyHeader []
 	}
 	if result == store.Hit {
 		outBytes := int64(cap(value))
-		err = s.writeValue(conn, replyHeader, value)
+		err = s.writeValue(conn, reply, value)
 		value = nil
 		s.outbound.release(outBytes)
 		return err == nil
@@ -220,7 +220,7 @@ func (s *Server) handle(conn net.Conn, reader *bufio.Reader, key, replyHeader []
 	case store.Invalid:
 		response = "BAD_REQUEST\n"
 	}
-	return s.writeStatus(conn, response) == nil
+	return s.writeStatus(conn, reply, response) == nil
 }
 
 func (s *Server) reserveInbound(keySize, valueSize int) (int64, bool) {
@@ -260,11 +260,11 @@ func (s *Server) receive(reader *bufio.Reader, key []byte, req request, bufferSi
 	return value, result, nil
 }
 
-func (s *Server) writeStatus(conn net.Conn, status string) error {
+func (s *Server) writeStatus(conn net.Conn, reply []byte, status string) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout)); err != nil {
 		return err
 	}
-	_, err := io.WriteString(conn, status)
+	_, err := conn.Write(append(reply[:0], status...))
 	return err
 }
 
