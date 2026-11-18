@@ -29,8 +29,11 @@ func (db *DB) Checkpoint() error {
 }
 
 func (db *DB) saveCheckpoint(lsn int64) error {
-	meta := pages.Metadata{LSN: lsn, Sequence: db.published.Load(), LastRowID: db.rowID.Load()}
-	view := Snapshot{sequence: meta.Sequence}
+	db.reclaimMu.Lock()
+	defer db.reclaimMu.Unlock()
+	view := db.pinSnapshot(nil)
+	defer view.Close()
+	meta := pages.Metadata{LSN: lsn, Sequence: view.sequence, LastRowID: db.rowID.Load()}
 	db.catalog.RLock()
 	tables := maps.Clone(db.tables)
 	db.catalog.RUnlock()

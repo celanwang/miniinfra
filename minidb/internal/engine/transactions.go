@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"time"
+
+	"github.com/celanwang/miniinfra/minidb/internal/wal"
 )
 
 // A transaction belongs to one session. Calls within a session are sequential.
 type Txn struct {
+	timing   *transactionTiming
 	db       *DB
 	state    *transactionState
 	held     map[resource]bool
@@ -43,9 +47,13 @@ func (tx *Txn) Commit() error {
 	if len(tx.changes) == 0 {
 		return nil
 	}
+	var timing *wal.CommitTiming
+	if tx.timing != nil {
+		timing = &tx.timing.wal
+	}
 	return tx.db.persist(record{Changes: tx.changes}, func(sequence uint64) {
 		tx.state.sequence.Store(sequence)
-	})
+	}, timing)
 }
 
 func (tx *Txn) Rollback() {
@@ -56,6 +64,7 @@ func (tx *Txn) Rollback() {
 
 func (tx *Txn) finish() {
 	tx.finished = true
+	tx.state.sequence.CompareAndSwap(0, abortedSequence)
 	tx.db.locks.release(tx)
 	tx.changes = nil
 }
@@ -64,13 +73,14 @@ func (tx *Txn) finish() {
 type Snapshot struct {
 	tx       *Txn
 	sequence uint64
+	pin      *snapshotPin
 }
 
 func (tx *Txn) Snapshot() (Snapshot, error) {
 	if err := tx.active(); err != nil {
 		return Snapshot{}, err
 	}
-	return Snapshot{tx: tx, sequence: tx.db.published.Load()}, nil
+	return tx.db.pinSnapshot(tx), nil
 }
 
 func (view Snapshot) table(name string) (*table, error) {
@@ -97,10 +107,13 @@ func (view Snapshot) sees(state *transactionState) bool {
 	if state == nil {
 		return false
 	}
+	seq := state.sequence.Load()
+	if seq == abortedSequence {
+		return false
+	}
 	if view.tx != nil && state == view.tx.state {
 		return true
 	}
-	seq := state.sequence.Load()
 	return seq != 0 && seq <= view.sequence
 }
 
@@ -111,14 +124,14 @@ func (view Snapshot) Rows(name string, columns []int, values []Value) (rows [][]
 	if err != nil {
 		return nil, false, err
 	}
-	tbl.mu.RLock()
+	view.tx.lockTable(tbl.mu.RLock)
 	defer tbl.mu.RUnlock()
 	if len(columns) != 0 {
 		for i := range tbl.indexes {
 			if !slices.Equal(tbl.indexes[i].def.Columns, columns) {
 				continue
 			}
-			for _, row := range tbl.indexes[i].lookup(lookupKey(values)) {
+			for row := range tbl.indexes[i].lookup(lookupKey(values)) {
 				if view.visible(row) {
 					rows = append(rows, slices.Clone(row.values))
 				}
@@ -160,8 +173,8 @@ func (view Snapshot) Mutate(ctx context.Context, name string, primary []Value, e
 		return false, fmt.Errorf("%w: wrong number of primary key values", ErrSchema)
 	}
 	var id uint64
-	tbl.mu.RLock()
-	for _, row := range tbl.indexes[tbl.primary].lookup(lookupKey(primary)) {
+	view.tx.lockTable(tbl.mu.RLock)
+	for row := range tbl.indexes[tbl.primary].lookup(lookupKey(primary)) {
 		if view.visible(row) {
 			id = row.id
 			break
@@ -177,7 +190,7 @@ func (view Snapshot) Mutate(ctx context.Context, name string, primary []Value, e
 		return false, err
 	}
 	current := Snapshot{tx: tx, sequence: tx.db.published.Load()}
-	tbl.mu.RLock()
+	tx.lockTable(tbl.mu.RLock)
 	var old *version
 	for row := tbl.heads[id]; row != nil; row = row.previous {
 		if current.visible(row) {
@@ -239,7 +252,7 @@ func (tx *Txn) write(ctx context.Context, tbl *table, old *version, ch change) e
 		}
 	}
 
-	tbl.mu.Lock()
+	tx.lockTable(tbl.mu.Lock)
 	defer tbl.mu.Unlock()
 	if ch.Kind != "delete" {
 		current := Snapshot{tx: tx, sequence: tx.db.published.Load()}
@@ -249,7 +262,7 @@ func (tx *Txn) write(ctx context.Context, tbl *table, old *version, ch change) e
 			if !idx.def.Unique || null {
 				continue
 			}
-			for _, row := range idx.lookup(encoded) {
+			for row := range idx.lookup(encoded) {
 				if row.id != ch.ID && current.visible(row) {
 					return fmt.Errorf("%w: %s.%s", ErrUnique, tbl.schema.Name, idx.def.Name)
 				}
@@ -259,4 +272,19 @@ func (tx *Txn) write(ctx context.Context, tbl *table, old *version, ch change) e
 	tbl.apply(ch, tx.state, old)
 	tx.changes = append(tx.changes, ch)
 	return nil
+}
+
+type transactionTiming struct {
+	rowWait, uniqueWait, lockManagerWait, tableWait time.Duration
+	wal                                             wal.CommitTiming
+}
+
+func (tx *Txn) lockTable(lock func()) {
+	if tx.timing == nil {
+		lock()
+		return
+	}
+	start := time.Now()
+	lock()
+	tx.timing.tableWait += time.Since(start)
 }

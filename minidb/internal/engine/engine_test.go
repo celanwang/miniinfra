@@ -30,6 +30,7 @@ func snapshot(t *testing.T, tx *Txn) Snapshot {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(view.Close)
 	return view
 }
 
@@ -63,6 +64,7 @@ func seed(t *testing.T, db *DB) {
 		t.Fatal(err)
 	}
 	tx, view := start(t, db)
+	defer view.Close()
 	for i := range int64(800) {
 		insert(t, view, i+1, fmt.Sprintf("sku-%d", i+1), 1)
 	}
@@ -109,6 +111,7 @@ func TestRowWaitDoesNotBlockDisjointCommitAndRechecksStock(t *testing.T) {
 	reader, before := start(t, db)
 	first, firstView := start(t, db)
 	second, secondView := start(t, db)
+	second.timing = &transactionTiming{}
 	independent, independentView := start(t, db)
 	if changed, err := decrease(firstView, 1); !changed || err != nil {
 		t.Fatalf("first decrease: %v %v", changed, err)
@@ -132,6 +135,9 @@ func TestRowWaitDoesNotBlockDisjointCommitAndRechecksStock(t *testing.T) {
 	commit(t, first)
 	if err := <-result; err != nil {
 		t.Fatal(err)
+	}
+	if second.timing.rowWait <= 0 || second.timing.uniqueWait != 0 {
+		t.Fatalf("logical waits classified incorrectly: %+v", second.timing)
 	}
 	wantStock(t, before, 1, String("sku-1"), 1)
 	wantStock(t, snapshot(t, reader), 1, String("sku-1"), 0)

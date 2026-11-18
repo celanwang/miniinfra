@@ -3,9 +3,11 @@ package wal
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestCheckpointKeepsWALUntilPublication(t *testing.T) {
@@ -72,5 +74,62 @@ func TestCheckpointKeepsWALUntilPublication(t *testing.T) {
 	defer again.Close()
 	if len(recovered) != 1 || recovered[0] != "after" {
 		t.Fatalf("wrong records after rotation: %v", recovered)
+	}
+}
+
+func TestQueuedCommitsStayOnTheirSideOfCheckpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(magic); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+
+	log := &Log{file: file, path: path, queue: make(chan request, 3), done: make(chan struct{})}
+	first, checkpoint, second := make(chan error, 1), make(chan error, 1), make(chan error, 1)
+	enqueued := time.Now()
+	var published, base int64
+	var firstTiming, secondTiming CommitTiming
+	log.queue <- request{
+		payload: []byte("before"),
+		result:  first, timing: &firstTiming, enqueued: enqueued,
+		publish: func(end int64) { published = end },
+	}
+	log.queue <- request{result: checkpoint, checkpoint: func(end int64) error {
+		base = end
+		if published != base {
+			return fmt.Errorf("checkpoint ran before publication: %d != %d", published, base)
+		}
+		return nil
+	}}
+	log.queue <- request{
+		payload: []byte("after"),
+		result:  second, timing: &secondTiming, enqueued: enqueued,
+		publish: func(int64) {},
+	}
+	go log.run(int64(len(magic)))
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(<-first, <-checkpoint, <-second); err != nil {
+		t.Fatal(err)
+	}
+	if firstTiming.BatchSize != 1 || secondTiming.BatchSize != 1 {
+		t.Fatalf("batch crossed a checkpoint: %d, %d", firstTiming.BatchSize, secondTiming.BatchSize)
+	}
+	var records []string
+	log, err = OpenWithCheckpoint(path, func() (int64, error) { return base, nil }, func(payload []byte) error {
+		records = append(records, string(payload))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	if len(records) != 1 || records[0] != "after" {
+		t.Fatalf("incorrect checkpoint tail: %v", records)
 	}
 }

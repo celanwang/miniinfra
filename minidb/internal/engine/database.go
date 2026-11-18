@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,12 @@ type DB struct {
 	catalog        sync.RWMutex
 	ddl            sync.Mutex
 	tables         map[string]*table
+	tableOrder     []*table
+	snapshots      snapshotRegistry
+	reclaimMu      sync.Mutex
+	reclaimTable   int
+	stopReclaimer  context.CancelFunc
+	reclaimerDone  chan struct{}
 	locks          lockManager
 	lockTimeout    time.Duration
 	rowID          atomic.Uint64
@@ -32,21 +39,24 @@ type transactionState struct {
 }
 
 type version struct {
-	id       uint64
-	values   []Value
-	created  *transactionState
-	ended    *transactionState
-	previous *version
+	id         uint64
+	values     []Value
+	created    *transactionState
+	ended      *transactionState
+	previous   *version
+	next       *version
+	indexLinks []indexLink
 }
 
 type table struct {
-	mu      sync.RWMutex
-	schema  Schema
-	since   uint64
-	indexes []index
-	primary int
-	pages   [][]*version
-	heads   map[uint64]*version
+	mu          sync.RWMutex
+	schema      Schema
+	since       uint64
+	indexes     []index
+	primary     int
+	pages       [][]*version
+	heads       map[uint64]*version
+	reclaimSlot int
 }
 
 type change struct {
@@ -65,6 +75,8 @@ func Open(dir string) (*DB, error) {
 	db := &DB{
 		checkpointPath: filepath.Join(dir, checkpointFile),
 		tables:         make(map[string]*table),
+		snapshots:      snapshotRegistry{active: make(map[*snapshotPin]struct{})},
+		reclaimerDone:  make(chan struct{}),
 		locks:          lockManager{holders: make(map[resource]*Txn), waiting: make(map[*Txn]*Txn)},
 		lockTimeout:    defaultLockTimeout,
 	}
@@ -73,11 +85,16 @@ func Open(dir string) (*DB, error) {
 		return nil, err
 	}
 	db.log = log
+	ctx, cancel := context.WithCancel(context.Background())
+	db.stopReclaimer = cancel
+	go db.runReclaimer(ctx)
 	return db, nil
 }
 
 func (db *DB) Close() error {
 	db.closed.Store(true)
+	db.stopReclaimer()
+	<-db.reclaimerDone
 	return db.log.Close()
 }
 
@@ -100,19 +117,20 @@ func (db *DB) CreateTable(schema Schema) error {
 	}
 	return db.persist(record{Create: &schema}, func(sequence uint64) {
 		db.install(schema, sequence)
-	})
+	}, nil)
 }
 
 func (db *DB) install(schema Schema, sequence uint64) {
 	tbl := &table{schema: schema, since: sequence, heads: make(map[uint64]*version)}
 	for i, def := range schema.Indexes {
-		tbl.indexes = append(tbl.indexes, index{def: def, root: &indexPage{}})
+		tbl.indexes = append(tbl.indexes, index{def: def, root: &indexPage{}, slot: i})
 		if def.Primary {
 			tbl.primary = i
 		}
 	}
 	db.catalog.Lock()
 	db.tables[schema.Name] = tbl
+	db.tableOrder = append(db.tableOrder, tbl)
 	db.catalog.Unlock()
 }
 
@@ -130,16 +148,16 @@ func (db *DB) available() error {
 	return nil
 }
 
-func (db *DB) persist(change record, publish func(uint64)) error {
+func (db *DB) persist(change record, publish func(uint64), timing *wal.CommitTiming) error {
 	bytes, err := json.Marshal(change)
 	if err != nil {
 		return err
 	}
-	err = db.log.Commit(bytes, func(int64) {
+	err = db.log.CommitWithTiming(bytes, func(int64) {
 		next := db.published.Load() + 1
 		publish(next)
 		db.published.Store(next)
-	})
+	}, timing)
 	switch {
 	case err == nil, errors.Is(err, wal.ErrTooLarge), errors.Is(err, wal.ErrClosed):
 		return err
@@ -209,7 +227,13 @@ func (tbl *table) apply(ch change, state *transactionState, old *version) {
 	if ch.Kind == "delete" {
 		return
 	}
-	row := &version{id: ch.ID, values: ch.Values, created: state, previous: tbl.heads[ch.ID]}
+	row := &version{
+		id: ch.ID, values: ch.Values, created: state, previous: tbl.heads[ch.ID],
+		indexLinks: make([]indexLink, len(tbl.indexes)),
+	}
+	if row.previous != nil {
+		row.previous.next = row
+	}
 	if len(tbl.pages) == 0 || len(tbl.pages[len(tbl.pages)-1]) == heapPageRows {
 		tbl.pages = append(tbl.pages, make([]*version, 0, heapPageRows))
 	}
