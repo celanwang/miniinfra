@@ -175,9 +175,32 @@ func TestRedriveHeapOverTCP(t *testing.T) {
 		int64(repeated.HeapAlloc)-int64(admitted.HeapAlloc), repeated.TotalAlloc-admitted.TotalAlloc,
 		int64(reopened.HeapAlloc)-int64(before.HeapAlloc), after.ReservedBytes-initial.ReservedBytes, after.StoredBytes-initial.StoredBytes)
 
+	broker.stop(t)
+	client.CloseIdleConnections()
+	drainAt := dueExperimentEpoch.Add(8 * 24 * time.Hour)
+	setDueClockFile(t, clock, drainAt)
+	p, err := minimq.Open(dir, minimq.Config{Clock: func() (minimq.TimeBounds, error) {
+		return minimq.TimeBounds{Lower: drainAt, Upper: drainAt}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	broker = startDueBrokerWithClock(t, dir, time.Time{}, clock)
+	if status := redriveTCPStatus(t, client, broker.url); status.DeadLetters != 0 ||
+		status.FirstOffset != uint64(sources) || status.PendingRedrives != operations {
+		t.Fatalf("reopened checkpoint did not isolate tasks from their expired sources: %+v", status)
+	}
+
 	pull.Limit = minimq.Limits{Messages: 1, Bytes: bodyBytes}
 	for i, r := range results {
-		setDueClockFile(t, clock, dueExperimentEpoch.Add(time.Duration(i)*time.Second))
+		setDueClockFile(t, clock, drainAt.Add(time.Duration(i)*time.Second))
 		ds := requireDuePost[[]minimq.Delivery](t, client, broker.url, "/v1/deliveries/pull", pull)
 		if len(ds) != 1 || ds[0].Instance != r.Instance || ds[0].Attempt != 1 || !bytes.Equal(ds[0].Message.Body, body(i%sources)) {
 			t.Fatalf("recovered operation %d returned %d deliveries or wrong body/instance", i, len(ds))
