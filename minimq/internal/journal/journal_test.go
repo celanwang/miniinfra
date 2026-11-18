@@ -8,6 +8,29 @@ import (
 	"testing"
 )
 
+func BenchmarkPrepareWALFrame(b *testing.B) {
+	for _, workload := range []struct {
+		name string
+		size int
+	}{
+		{"ack", 564},
+		{"retry", 64_417},
+		{"dead-letter", 11_255_874},
+	} {
+		b.Run(workload.name, func(b *testing.B) {
+			payload := bytes.Repeat([]byte("A"), workload.size)
+			b.SetBytes(int64(len(payload)))
+			b.ReportAllocs()
+			for b.Loop() {
+				frame, err := EncodeFrame(payload)
+				if err != nil || len(frame) != len(payload)+FrameHeaderBytes {
+					b.Fatalf("frame size = %d, %v", len(frame), err)
+				}
+			}
+		})
+	}
+}
+
 func TestAppendFramePreservesLegacyBytes(t *testing.T) {
 	start := []byte("prefix")
 	frame, err := AppendFrame(start, []byte("abc"))

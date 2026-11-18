@@ -222,7 +222,7 @@ func (j *Journal) Append(frame []byte) error {
 }
 
 func (j *Journal) append(frame []byte) error {
-	if _, err := j.file.WriteAt(frame, j.end); err != nil {
+	if err := j.writeAt(frame, j.end); err != nil {
 		return err
 	}
 	if err := j.sync(j.file); err != nil {
@@ -234,6 +234,17 @@ func (j *Journal) append(frame []byte) error {
 	}
 	j.end = end
 	return nil
+}
+
+func (j *Journal) writeAt(data []byte, offset int64) error {
+	if j.ObserveWrite == nil {
+		_, err := j.file.WriteAt(data, offset)
+		return err
+	}
+	start := time.Now()
+	_, err := j.file.WriteAt(data, offset)
+	j.ObserveWrite(time.Since(start))
+	return err
 }
 
 func (j *Journal) installHead(generation uint64, end int64) error {

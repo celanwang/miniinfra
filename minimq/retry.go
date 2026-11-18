@@ -188,6 +188,9 @@ func (p *Partition) expireLocked(name string, now TimeBounds, limit Limits) (int
 	}
 	tx := transaction{Lower: now.Lower}
 	reader := historyReader{dir: p.journal.Dir()}
+	if stats != nil {
+		reader.decodeTime = &stats.decode
+	}
 	defer reader.close()
 	for _, candidate := range expired {
 		update := candidate.update
