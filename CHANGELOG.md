@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB creates lock wait timers only on contention, reducing allocations in transactions that acquire row and unique-key locks.
 - MiniMQ limits dead-letter page selection to the requested number of IDs, reducing allocations and time under the partition lock.
 - MiniKV copies a request key only when inserting a new entry, avoiding allocations on overwrites and rejected conditional writes.
 - MiniKV avoids copying long request keys during GET lookups, reducing allocations on reads.
