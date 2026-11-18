@@ -1,8 +1,10 @@
 package minimq
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +12,80 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCheckpointKeepsRecentTailInlineWithPendingAndSettledTasks(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	count := MaxBatchBytes / MaxMessageBytes
+	cfg := Config{Clock: testClock(&now), SegmentMessages: count + 1, HistoryRetention: time.Hour}
+	p := openTest(t, dir, cfg)
+	registerTest(t, p, "notify", SubscriptionConfig{})
+	body := bytes.Repeat([]byte{'x'}, MaxMessageBytes)
+	for i := range count {
+		if _, err := p.Publish(PublishRequest{ID: fmt.Sprintf("recent-%d", i), Body: body}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	leases, err := p.Pull("notify", "worker", Limits{Messages: 2, Bytes: 2 * len(body)})
+	if err != nil || len(leases) != 2 {
+		t.Fatalf("initial recent leases = %d, %v", len(leases), err)
+	}
+	ackTest(t, p, "notify", "worker", leases[0], AckAccepted)
+	compactInline := func() {
+		t.Helper()
+		if err := p.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if len(p.segments) != 0 || len(p.tail) != count {
+			t.Fatalf("recent tail layout: %d segments, %d inline records", len(p.segments), len(p.tail))
+		}
+		page, err := p.Read(uint64(count-1), Limits{Messages: 1, Bytes: len(body)})
+		if err != nil || len(page.Messages) != 1 || !bytes.Equal(page.Messages[0].Body, body) {
+			t.Fatalf("recent read = %d messages, %v", len(page.Messages), err)
+		}
+	}
+	compactInline()
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p = openTest(t, dir, cfg)
+	ackTest(t, p, "notify", "worker", leases[0], AckPreviouslyAccepted)
+	ackTest(t, p, "notify", "worker", leases[1], AckAccepted)
+	remaining, err := p.Pull("notify", "worker", Limits{Messages: count, Bytes: MaxBatchBytes})
+	if err != nil || len(remaining) != count-2 {
+		t.Fatalf("remaining recent deliveries = %d, %v", len(remaining), err)
+	}
+	for _, d := range remaining {
+		if !bytes.Equal(d.Message.Body, body) {
+			t.Fatalf("wrong body at offset %d", d.Message.Offset)
+		}
+		ackTest(t, p, "notify", "worker", d, AckAccepted)
+	}
+	compactInline()
+
+	if got := publishTest(t, p, "suffix"); got.Offset != uint64(count) {
+		t.Fatalf("suffix assigned offset %d", got.Offset)
+	}
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.segments) != 1 || p.segments[0].Count != count+1 || len(p.tail) != 0 {
+		t.Fatal("full segment did not seal")
+	}
+	d := pullTest(t, p, "notify", "worker", 1)[0]
+	ackTest(t, p, "notify", "worker", d, AckAccepted)
+	now = now.Add(time.Hour)
+	if err := p.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	var gap *OffsetGap
+	if _, err := p.Read(0, pageLimit); !errors.As(err, &gap) || gap.First != uint64(count+1) {
+		t.Fatalf("expired settled history = %v", err)
+	}
+}
 
 func TestCheckpointProcessExitAtSyncBoundaries(t *testing.T) {
 	const crashCode = 74

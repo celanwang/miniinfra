@@ -188,6 +188,8 @@ type operationTiming struct {
 
 type checkpointTiming struct {
 	prepare, encode, frame, write, cleanup, cleanupSync time.Duration
+	tailFirst                                           uint64
+	tailRecords, tailBytes, imageBytes, stagedSegments  int
 }
 
 // An optional observer, installed before opening the workload to concurrent
