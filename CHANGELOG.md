@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB copies only matching rows during single-table queries, reducing allocations and writer waits on selective scans.
 - MiniKV verifies large GET replies under TCP backpressure and records the latency cost of vector writes.
 - MiniMQ releases one extra bounded batch between maintenance ticks to shorten waits during scheduled delivery bursts.
 - MiniDB stops canceled row scans at bounded intervals so writers can regain the table lock promptly.
