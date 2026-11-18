@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniMQ releases idle map capacity when checkpoint pruning removes the last receipt or dead letter.
 - MiniMQ releases retired segment indexes after checkpoint reclamation while preserving in-flight history reads.
 - MiniDB reuses a 64 KiB WAL write buffer across commit batches and writes oversized payloads directly.
 - MiniMQ verifies that retrying a delayed publish after a lost reply preserves its receipt and produces one history entry across restarts.
