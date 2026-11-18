@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniDB skips index key encoding when reclaiming an old row version that can be unlinked directly.
 - MiniKV retries inbound byte reservations up to sixteen times to reduce contention-induced BUSY replies.
 - MiniMQ releases idle map capacity when checkpoint pruning removes the last receipt or dead letter.
 - MiniMQ releases retired segment indexes after checkpoint reclamation while preserving in-flight history reads.
