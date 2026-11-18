@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniMQ verifies ordinary publish, delivery, and acknowledgment receipts across a same-disk process restart.
 - MiniDB verifies frame size limits and ordered replies across large pipelined requests and TCP half-close.
 - MiniKV documents TCP completion rates, CPU cost, and memory use near the measured load limit.
 - MiniMQ skips unrelated redrive scans when a subscription has no pending redrives.
