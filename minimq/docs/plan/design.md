@@ -4,6 +4,15 @@ MiniMQ 是用 Go 构建的持久化消息队列，面向订单通知、Webhook �
 
 分段回读沿用 [Kafka 的分区日志思路](https://kafka.apache.org/42/design/design/)；单条领取和超时重投参考 [RocketMQ 的消息级分配](https://rocketmq.apache.org/docs/featureBehavior/08consumerloadbalance/)。选择把首次延迟移出历史日志，是因为长延迟正文可以长期阻塞按前缀清理，[Pulsar 的延迟投递说明](https://pulsar.apache.org/docs/4.0.x/concepts-messaging/#delayed-message-delivery)给出了这种情况。
 
+## 模块设计
+
+| 模块 | 设计问题 |
+| --- | --- |
+| [分区日志与受理](partition.md) | 消息何时取得位点，磁盘满时还能兑现哪些承诺？ |
+| [任务订阅与确认](subscriptions.md) | 谁能领取、确认和重领，窗口里的空洞如何保存？ |
+| [延迟发布、死信与补投](scheduling.md) | 已离开消费窗口的死信怎样再次交给 worker？ |
+| [持久化、复制与时间裁决](recovery.md) | 从什么状态接管，谁有权判断租约已经到期？ |
+
 ## 一条延迟订单通知
 
 订单服务在 10:00 提交“订单 731 已发货”，要求 10:15 起投递。通知本身的消息 ID 是生产者生成的 `notice-731-shipped`，路由 key 是订单号。订单号可以有多条通知，每个业务事件使用自己的消息 ID。假设消息进入分区 P2，受理时已有订阅 `notify`。
