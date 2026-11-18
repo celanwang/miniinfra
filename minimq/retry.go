@@ -259,8 +259,8 @@ func (p *Partition) deadLetter(name, id string, now TimeBounds) (DeadLetter, err
 
 // ListDeadLetters lists retained letters by ID, strictly after the supplied cursor.
 func (p *Partition) ListDeadLetters(name, after string, limit int) ([]DeadLetter, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	sample := p.beginOperation()
+	defer func() { p.endOperation("dead-list", sample) }()
 	if err := p.checkOpen(); err != nil {
 		return nil, err
 	}
@@ -274,6 +274,10 @@ func (p *Partition) ListDeadLetters(name, after string, limit int) ([]DeadLetter
 	if err != nil {
 		return nil, err
 	}
+	var started time.Time
+	if p.timings != nil {
+		started = time.Now()
+	}
 	var ids []string
 	for id, letter := range p.dead {
 		if id > after && letter.Subscription == name && now.Lower.Before(letter.Expires) {
@@ -281,6 +285,10 @@ func (p *Partition) ListDeadLetters(name, after string, limit int) ([]DeadLetter
 		}
 	}
 	slices.Sort(ids)
+	if p.timings != nil {
+		sample.page.selectIDs = time.Since(started)
+		started = time.Now()
+	}
 	var letters []DeadLetter
 	bytesLeft := MaxBatchBytes
 	for _, id := range ids[:min(limit, len(ids))] {
@@ -291,6 +299,9 @@ func (p *Partition) ListDeadLetters(name, after string, limit int) ([]DeadLetter
 		bytesLeft -= len(letter.Message.Body)
 		letter.Message.Body = bytes.Clone(letter.Message.Body)
 		letters = append(letters, letter)
+	}
+	if p.timings != nil {
+		sample.page.clone = time.Since(started)
 	}
 	return letters, nil
 }
