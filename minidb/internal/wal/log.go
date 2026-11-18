@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/celanwang/miniinfra/minidb/internal/disk"
 )
@@ -38,7 +39,16 @@ type Log struct {
 	closeErr error
 }
 
+// CommitTiming describes the durable write path of one successfully synced
+// request. Requests in a batch share its write and sync durations.
+type CommitTiming struct {
+	Queue, Write, Sync time.Duration
+	BatchSize          int
+}
+
 type request struct {
+	timing     *CommitTiming
+	enqueued   time.Time
 	checkpoint func(int64) error
 	payload    []byte
 	publish    func(end int64)
@@ -166,10 +176,21 @@ func scan(file *os.File, end int64, replay func([]byte) error) (int64, error) {
 }
 
 func (log *Log) Commit(payload []byte, publish func(end int64)) error {
+	return log.CommitWithTiming(payload, publish, nil)
+}
+
+// CommitWithTiming fills timing before returning. A nil timing avoids clocks
+// on the normal commit path.
+func (log *Log) CommitWithTiming(payload []byte, publish func(end int64), timing *CommitTiming) error {
 	if len(payload) == 0 || len(payload) > MaxPayload {
 		return ErrTooLarge
 	}
-	return log.submit(request{payload: payload, publish: publish})
+	item := request{payload: payload, publish: publish, timing: timing}
+	if timing != nil {
+		*timing = CommitTiming{}
+		item.enqueued = time.Now()
+	}
+	return log.submit(item)
 }
 
 func (log *Log) submit(item request) error {
@@ -231,6 +252,13 @@ func (log *Log) run(end int64) {
 }
 
 func (log *Log) sync(batch []request) error {
+	var started time.Time
+	for _, item := range batch {
+		if item.timing != nil {
+			started = time.Now()
+			break
+		}
+	}
 	// Bound staging memory even when the batch contains large transactions.
 	var header [headerSize]byte
 	var buffer bytes.Buffer
@@ -253,7 +281,25 @@ func (log *Log) sync(batch []request) error {
 	if _, err := buffer.WriteTo(log.file); err != nil {
 		return fmt.Errorf("write WAL: %w", err)
 	}
-	if err := log.file.Sync(); err != nil {
+	var flushing time.Time
+	if !started.IsZero() {
+		flushing = time.Now()
+	}
+	err := log.file.Sync()
+	if !started.IsZero() {
+		elapsed := time.Since(flushing)
+		for _, item := range batch {
+			if item.timing != nil {
+				*item.timing = CommitTiming{
+					Queue:     started.Sub(item.enqueued),
+					Write:     flushing.Sub(started),
+					Sync:      elapsed,
+					BatchSize: len(batch),
+				}
+			}
+		}
+	}
+	if err != nil {
 		return fmt.Errorf("sync WAL: %w", err)
 	}
 	return nil

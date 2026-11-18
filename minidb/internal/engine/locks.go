@@ -23,7 +23,14 @@ func (locks *lockManager) acquire(ctx context.Context, tx *Txn, r resource) erro
 	ctx, cancel := context.WithTimeout(ctx, tx.db.lockTimeout)
 	defer cancel()
 	for {
+		var started time.Time
+		if tx.timing != nil {
+			started = time.Now()
+		}
 		locks.mu.Lock()
+		if tx.timing != nil {
+			tx.timing.lockManagerWait += time.Since(started)
+		}
 		delete(locks.waiting, tx)
 		if err := ctx.Err(); err != nil {
 			locks.mu.Unlock()
@@ -44,9 +51,19 @@ func (locks *lockManager) acquire(ctx context.Context, tx *Txn, r resource) erro
 		}
 		locks.waiting[tx] = owner
 		locks.mu.Unlock()
+		if tx.timing != nil {
+			started = time.Now()
+		}
 		select {
 		case <-owner.done:
 		case <-ctx.Done():
+		}
+		if tx.timing != nil {
+			if r.namespace == "" {
+				tx.timing.rowWait += time.Since(started)
+			} else {
+				tx.timing.uniqueWait += time.Since(started)
+			}
 		}
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplayPreservesPublicationOrderAndTruncatesIncompleteTail(t *testing.T) {
@@ -115,7 +116,9 @@ func TestBatchIsWrittenBeforeFirstPublication(t *testing.T) {
 	first := make(chan error, 1)
 	second := make(chan error, 1)
 	expectedEnd := int64(len(magic) + 2*headerSize + len("firstsecond"))
-	log.queue <- request{payload: []byte("first"), result: first, publish: func(end int64) {
+	var firstTiming, secondTiming CommitTiming
+	enqueued := time.Now()
+	log.queue <- request{payload: []byte("first"), result: first, timing: &firstTiming, enqueued: enqueued, publish: func(end int64) {
 		info, err := os.Stat(path)
 		if err != nil || info.Size() != expectedEnd {
 			t.Errorf("first publication did not follow the batch write: %v %v", info, err)
@@ -124,7 +127,7 @@ func TestBatchIsWrittenBeforeFirstPublication(t *testing.T) {
 			t.Errorf("wrong first transaction end: %d", end)
 		}
 	}}
-	log.queue <- request{payload: []byte("second"), result: second, publish: func(end int64) {
+	log.queue <- request{payload: []byte("second"), result: second, timing: &secondTiming, enqueued: enqueued, publish: func(end int64) {
 		if end != expectedEnd {
 			t.Errorf("wrong second transaction end: %d", end)
 		}
@@ -135,6 +138,9 @@ func TestBatchIsWrittenBeforeFirstPublication(t *testing.T) {
 	}
 	if err := errors.Join(<-first, <-second); err != nil {
 		t.Fatal(err)
+	}
+	if firstTiming != secondTiming || firstTiming.BatchSize != 2 || firstTiming.Queue <= 0 || firstTiming.Write <= 0 || firstTiming.Sync <= 0 {
+		t.Fatalf("invalid batch timings: %+v and %+v", firstTiming, secondTiming)
 	}
 }
 

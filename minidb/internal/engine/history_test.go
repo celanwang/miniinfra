@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"slices"
@@ -66,11 +67,16 @@ func seedHistory(t testing.TB, dir string, count int) *DB {
 }
 
 func cycleStock(ctx context.Context, db *DB, sku int64, durable bool) error {
+	return cycleStockMeasured(ctx, db, sku, durable, nil)
+}
+
+func cycleStockMeasured(ctx context.Context, db *DB, sku int64, durable bool, timing *transactionTiming) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	tx.timing = timing
 	view, err := tx.Snapshot()
 	if err != nil {
 		return err
@@ -144,7 +150,7 @@ func mixedVersionHistory(b *testing.B, collect bool) {
 	<-db.reclaimerDone
 
 	ctx := b.Context()
-	ordinary := make([]time.Duration, b.N)
+	ordinary := make([]commitSample, b.N)
 	var workers sync.WaitGroup
 	hotResult := make(chan error, 1)
 	start := make(chan struct{})
@@ -169,8 +175,8 @@ func mixedVersionHistory(b *testing.B, collect bool) {
 	var ordinaryErr error
 	for i := range b.N {
 		now := time.Now()
-		ordinaryErr = cycleStock(ctx, db, 2, true)
-		ordinary[i] = time.Since(now)
+		ordinaryErr = cycleStockMeasured(ctx, db, 2, true, &ordinary[i].timing)
+		ordinary[i].total = time.Since(now)
 		if ordinaryErr != nil {
 			break
 		}
@@ -189,12 +195,56 @@ func mixedVersionHistory(b *testing.B, collect bool) {
 	if err := errors.Join(ordinaryErr, <-hotResult); err != nil {
 		b.Fatal(err)
 	}
-	slices.Sort(ordinary)
-	b.ReportMetric(float64(ordinary[(len(ordinary)-1)*99/100].Nanoseconds()), "ordinary-p99-ns")
+	reportCommitSamples(b, ordinary)
 	counts := historyFor(db, 1, "hot")
 	b.ReportMetric(float64(counts.heap), "heap-versions")
 	b.ReportMetric(float64(counts.primary), "hot-primary")
 	b.ReportMetric(float64(counts.secondary), "hot-secondary")
+}
+
+type commitSample struct {
+	total  time.Duration
+	timing transactionTiming
+}
+
+func reportCommitSamples(b *testing.B, samples []commitSample) {
+	slices.SortFunc(samples, func(a, b commitSample) int { return cmp.Compare(a.total, b.total) })
+	tail := samples[len(samples)-(len(samples)+99)/100:]
+	b.ReportMetric(float64(samples[(len(samples)*99+99)/100-1].total.Nanoseconds()), "ordinary-p99-ns")
+	var grouped int
+	for _, sample := range samples {
+		if sample.timing.wal.BatchSize > 1 {
+			grouped++
+		}
+	}
+	b.ReportMetric(100*float64(grouped)/float64(len(samples)), "grouped-%")
+
+	// Tail means refer to the same slow transactions, unlike summing
+	// independent p99s of stages that might peak on different requests.
+	for _, phase := range []struct {
+		name  string
+		value func(transactionTiming) time.Duration
+	}{
+		{"row-wait", func(t transactionTiming) time.Duration { return t.rowWait }},
+		{"unique-wait", func(t transactionTiming) time.Duration { return t.uniqueWait }},
+		{"lock-manager", func(t transactionTiming) time.Duration { return t.lockManagerWait }},
+		{"table-wait", func(t transactionTiming) time.Duration { return t.tableWait }},
+		{"wal-queue", func(t transactionTiming) time.Duration { return t.wal.Queue }},
+		{"wal-write", func(t transactionTiming) time.Duration { return t.wal.Write }},
+		{"wal-sync", func(t transactionTiming) time.Duration { return t.wal.Sync }},
+	} {
+		var sum time.Duration
+		durations := make([]time.Duration, len(samples))
+		for i, sample := range samples {
+			durations[i] = phase.value(sample.timing)
+		}
+		slices.Sort(durations)
+		b.ReportMetric(float64(durations[(len(samples)*99+99)/100-1].Nanoseconds()), phase.name+"-p99-ns")
+		for _, sample := range tail {
+			sum += phase.value(sample.timing)
+		}
+		b.ReportMetric(float64(sum.Nanoseconds())/float64(len(tail)), "tail-"+phase.name+"-ns")
+	}
 }
 
 type sweepMeasurement struct {

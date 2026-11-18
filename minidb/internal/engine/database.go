@@ -117,7 +117,7 @@ func (db *DB) CreateTable(schema Schema) error {
 	}
 	return db.persist(record{Create: &schema}, func(sequence uint64) {
 		db.install(schema, sequence)
-	})
+	}, nil)
 }
 
 func (db *DB) install(schema Schema, sequence uint64) {
@@ -148,16 +148,16 @@ func (db *DB) available() error {
 	return nil
 }
 
-func (db *DB) persist(change record, publish func(uint64)) error {
+func (db *DB) persist(change record, publish func(uint64), timing *wal.CommitTiming) error {
 	bytes, err := json.Marshal(change)
 	if err != nil {
 		return err
 	}
-	err = db.log.Commit(bytes, func(int64) {
+	err = db.log.CommitWithTiming(bytes, func(int64) {
 		next := db.published.Load() + 1
 		publish(next)
 		db.published.Store(next)
-	})
+	}, timing)
 	switch {
 	case err == nil, errors.Is(err, wal.ErrTooLarge), errors.Is(err, wal.ErrClosed):
 		return err

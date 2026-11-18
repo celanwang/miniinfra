@@ -111,6 +111,7 @@ func TestRowWaitDoesNotBlockDisjointCommitAndRechecksStock(t *testing.T) {
 	reader, before := start(t, db)
 	first, firstView := start(t, db)
 	second, secondView := start(t, db)
+	second.timing = &transactionTiming{}
 	independent, independentView := start(t, db)
 	if changed, err := decrease(firstView, 1); !changed || err != nil {
 		t.Fatalf("first decrease: %v %v", changed, err)
@@ -134,6 +135,9 @@ func TestRowWaitDoesNotBlockDisjointCommitAndRechecksStock(t *testing.T) {
 	commit(t, first)
 	if err := <-result; err != nil {
 		t.Fatal(err)
+	}
+	if second.timing.rowWait <= 0 || second.timing.uniqueWait != 0 {
+		t.Fatalf("logical waits classified incorrectly: %+v", second.timing)
 	}
 	wantStock(t, before, 1, String("sku-1"), 1)
 	wantStock(t, snapshot(t, reader), 1, String("sku-1"), 0)
