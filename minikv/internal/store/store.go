@@ -137,6 +137,16 @@ func (s *Store) Get(key string, reserve func(int64) bool) ([]byte, Result) {
 // Set takes ownership of value on success. Its backing array must be
 // immutable after publication. A zero TTL explicitly disables expiration.
 func (s *Store) Set(key string, value []byte, ttl time.Duration, onlyMissing bool) Result {
+	return s.set(key, value, ttl, onlyMissing, false)
+}
+
+// SetCopy borrows value during the call and allocates an exact-capacity copy
+// only if the write passes the shard's admission and capacity checks.
+func (s *Store) SetCopy(key string, value []byte, ttl time.Duration, onlyMissing bool) Result {
+	return s.set(key, value, ttl, onlyMissing, true)
+}
+
+func (s *Store) set(key string, value []byte, ttl time.Duration, onlyMissing, copyValue bool) Result {
 	if len(key) == 0 || ttl < 0 {
 		return Invalid
 	}
@@ -153,6 +163,9 @@ func (s *Store) Set(key string, value []byte, ttl time.Duration, onlyMissing boo
 
 	next := entry{key: key, value: value}
 	delta := next.bytes()
+	if copyValue {
+		delta -= int64(cap(value) - len(value))
+	}
 	if exists {
 		delta -= sh.entries[i].bytes()
 	}
@@ -164,16 +177,23 @@ func (s *Store) Set(key string, value []byte, ttl time.Duration, onlyMissing boo
 		return NoSpace
 	}
 
+	if ttl > time.Duration(math.MaxInt64)-now {
+		return Invalid
+	}
+	if onlyMissing && sh.admission != nil && len(victims) > 0 &&
+		!sh.entries[victims[len(victims)-1]].expired(now) && !sh.admission.seen(key, now) {
+		return NotCached
+	}
+	if copyValue {
+		next.value = make([]byte, len(value))
+		copy(next.value, value)
+	}
 	if ttl > 0 {
 		published := s.now()
 		if ttl > time.Duration(math.MaxInt64)-published {
 			return Invalid
 		}
 		next.deadline = published + ttl
-	}
-	if onlyMissing && sh.admission != nil && len(victims) > 0 &&
-		!sh.entries[victims[len(victims)-1]].expired(now) && !sh.admission.seen(key, now) {
-		return NotCached
 	}
 	sh.order++
 	next.order = sh.order

@@ -6,6 +6,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/metrics"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -44,6 +47,9 @@ func TestCapacityPeer(t *testing.T) {
 			OutboundPeak int64
 		}{shards, peak.Load()})
 	})
+	mux.HandleFunc("GET /runtime", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(pressureRuntime(s))
+	})
 	admin := &http.Server{Addr: "127.0.0.1:9122", Handler: mux, ReadHeaderTimeout: time.Second}
 	defer admin.Close()
 	go func() {
@@ -67,4 +73,52 @@ func TestCapacityPeer(t *testing.T) {
 	if err := s.Serve(context.Background(), listener); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func pressureRuntime(s *Server) map[string]float64 {
+	s.writes.mu.Lock()
+	idle := s.writes.bytes
+	s.writes.mu.Unlock()
+	values := map[string]float64{
+		"InboundBytes": float64(s.inbound.used.Load()), "OutboundBytes": float64(s.outbound.used.Load()), "IdleWriteBytes": float64(idle),
+	}
+	for file, fields := range map[string]map[string]string{
+		"/proc/self/status":            {"VmRSS:": "RSSKiB", "VmHWM:": "RSSPeakKiB"},
+		"/sys/fs/cgroup/cpu.stat":      {"usage_usec": "CPUUsec", "throttled_usec": "ThrottledUsec"},
+		"/sys/fs/cgroup/memory.events": {"oom": "OOM", "oom_kill": "OOMKill"},
+	} {
+		raw, _ := os.ReadFile(file)
+		for _, line := range strings.Split(string(raw), "\n") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				if name, ok := fields[parts[0]]; ok {
+					values[name], _ = strconv.ParseFloat(parts[1], 64)
+				}
+			}
+		}
+	}
+	for file, name := range map[string]string{"memory.current": "CgroupBytes", "memory.peak": "CgroupPeakBytes"} {
+		raw, err := os.ReadFile("/sys/fs/cgroup/" + file)
+		if err == nil {
+			values[name], _ = strconv.ParseFloat(strings.TrimSpace(string(raw)), 64)
+		}
+	}
+	samples := []metrics.Sample{
+		{Name: "/gc/cycles/total:gc-cycles"},
+		{Name: "/gc/heap/live:bytes"},
+		{Name: "/gc/heap/allocs:bytes"},
+		{Name: "/cpu/classes/gc/total:cpu-seconds"},
+		{Name: "/cpu/classes/gc/mark/assist:cpu-seconds"},
+	}
+	metrics.Read(samples)
+	for i, name := range []string{"GCCycles", "LiveHeapBytes", "AllocBytes", "GCCPUSeconds", "GCAssistSeconds"} {
+		value := samples[i].Value
+		switch value.Kind() {
+		case metrics.KindUint64:
+			values[name] = float64(value.Uint64())
+		case metrics.KindFloat64:
+			values[name] = value.Float64()
+		}
+	}
+	return values
 }

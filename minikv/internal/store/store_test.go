@@ -87,3 +87,17 @@ func TestSweepRespectsBatchAndReplacementDeadline(t *testing.T) {
 		t.Fatalf("unexpected stats: %+v", stats)
 	}
 }
+
+func TestSetCopyChecksPublishedCapacityAndDoesNotRetainScratch(t *testing.T) {
+	s, _ := testStore(t, 4, 1, 1)
+	scratch := make([]byte, 3, 128)
+	copy(scratch, "abc")
+	if got := s.SetCopy("k", scratch, 0, true); got != Stored {
+		t.Fatalf("SetCopy returned %v", got)
+	}
+	copy(scratch, "xxx")
+	read(t, s, "k", "abc", Hit)
+	if got := s.Stats(0).UsedBytes; got != slotBudget+4 {
+		t.Fatalf("charged %d bytes, want %d", got, slotBudget+4)
+	}
+}
