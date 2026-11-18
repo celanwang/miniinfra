@@ -76,8 +76,11 @@ func TestCapacityPeer(t *testing.T) {
 }
 
 func pressureRuntime(s *Server) map[string]float64 {
+	s.writes.mu.Lock()
+	idle := s.writes.bytes
+	s.writes.mu.Unlock()
 	values := map[string]float64{
-		"InboundBytes": float64(s.inbound.used.Load()), "OutboundBytes": float64(s.outbound.used.Load()),
+		"InboundBytes": float64(s.inbound.used.Load()), "OutboundBytes": float64(s.outbound.used.Load()), "IdleWriteBytes": float64(idle),
 	}
 	for file, fields := range map[string]map[string]string{
 		"/proc/self/status":            {"VmRSS:": "RSSKiB", "VmHWM:": "RSSPeakKiB"},

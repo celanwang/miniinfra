@@ -78,6 +78,7 @@ type Server struct {
 	config   Config
 	inbound  budget
 	outbound budget
+	writes   writeBuffers
 }
 
 func New(cache *store.Store, config Config) (*Server, error) {
@@ -93,6 +94,7 @@ func New(cache *store.Store, config Config) (*Server, error) {
 		config:   config,
 		inbound:  budget{limit: config.InboundBytes},
 		outbound: budget{limit: config.OutboundBytes},
+		writes:   writeBuffers{limit: min(config.InboundBytes/2, maxIdleWriteBytes)},
 	}, nil
 }
 
@@ -225,11 +227,16 @@ func (s *Server) receive(reader *bufio.Reader, key []byte, req request) ([]byte,
 		return nil, store.Invalid, err
 	}
 	if req.write {
-		value := make([]byte, req.valueBytes)
+		value := s.writes.take(req.valueBytes)
 		if _, err := io.ReadFull(reader, value); err != nil {
+			s.writes.put(value)
 			return nil, store.Invalid, err
 		}
-		return nil, s.cache.Set(string(key), value, req.ttl, req.onlyMiss), nil
+		result := s.cache.Set(string(key), value, req.ttl, req.onlyMiss)
+		if result != store.Stored {
+			s.writes.put(value)
+		}
+		return nil, result, nil
 	}
 	value, result := s.cache.Get(string(key), func(n int64) bool {
 		return n <= s.config.OutboundPerConn && s.outbound.reserve(n)
