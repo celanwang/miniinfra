@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"unicode/utf8"
 
 	"github.com/celanwang/miniinfra/minidb/internal/engine"
 	"github.com/celanwang/miniinfra/minidb/internal/query"
@@ -18,9 +19,10 @@ type Request struct {
 	Args []engine.Value
 }
 type Response struct {
-	Result  query.Result
-	Code    string
-	Message string
+	Result        query.Result
+	Code          string
+	Message       string
+	InTransaction *bool `json:",omitempty"`
 }
 
 func Failure(err error) Response {
@@ -55,7 +57,11 @@ func Read(reader *bufio.Scanner, dst any) error {
 		}
 		return io.EOF
 	}
-	return json.Unmarshal(reader.Bytes(), dst)
+	frame := reader.Bytes()
+	if !utf8.Valid(frame) {
+		return errors.New("protocol frame must be valid UTF-8")
+	}
+	return json.Unmarshal(frame, dst)
 }
 
 func Encode(message any) ([]byte, error) {

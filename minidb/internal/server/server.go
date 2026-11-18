@@ -70,6 +70,8 @@ func serveConnection(ctx context.Context, conn net.Conn, db *engine.DB) {
 		if err != nil {
 			response = wire.Failure(err)
 		}
+		inTx := session.InTransaction()
+		response.InTransaction = &inTx
 		if !send(conn, response) {
 			return
 		}

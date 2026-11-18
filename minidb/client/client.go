@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/celanwang/miniinfra/minidb/internal/engine"
 	"github.com/celanwang/miniinfra/minidb/internal/wire"
@@ -125,6 +126,9 @@ func (c *connection) request(ctx context.Context, sql string, args []driver.Name
 	if err := ctx.Err(); err != nil {
 		return wire.Response{}, err
 	}
+	if !utf8.ValidString(sql) {
+		return wire.Response{}, fmt.Errorf("MiniDB SQL must be valid UTF-8")
+	}
 	req := wire.Request{SQL: sql}
 	for _, arg := range args {
 		if arg.Name != "" {
@@ -136,6 +140,9 @@ func (c *connection) request(ctx context.Context, sql string, args []driver.Name
 		case int64:
 			req.Args = append(req.Args, engine.Int(value))
 		case string:
+			if !utf8.ValidString(value) {
+				return wire.Response{}, fmt.Errorf("MiniDB text parameter %d must be valid UTF-8", arg.Ordinal)
+			}
 			req.Args = append(req.Args, engine.String(value))
 		case bool:
 			req.Args = append(req.Args, engine.Bool(value))
@@ -177,14 +184,19 @@ func (c *connection) request(ctx context.Context, sql string, args []driver.Name
 	if err := wire.Read(c.reader, &response); err != nil {
 		return wire.Response{}, c.transportError(verb, err)
 	}
-	if verb == "commit" || verb == "rollback" {
-		c.inTx = false
+	if response.InTransaction != nil {
+		c.inTx = *response.InTransaction
+	} else if response.Code == "" {
+		// Older servers omit the session state.
+		switch verb {
+		case "begin":
+			c.inTx = true
+		case "commit", "rollback":
+			c.inTx = false
+		}
 	}
 	if response.Code != "" {
 		return wire.Response{}, &Error{Code: response.Code, Message: response.Message}
-	}
-	if verb == "begin" {
-		c.inTx = true
 	}
 	return response, nil
 }

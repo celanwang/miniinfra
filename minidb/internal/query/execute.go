@@ -29,6 +29,8 @@ type Session struct {
 
 func NewSession(db *engine.DB) *Session { return &Session{db: db} }
 
+func (s *Session) InTransaction() bool { return s.tx != nil || s.failed }
+
 func (s *Session) Close() {
 	s.failed = false
 	if s.tx != nil {

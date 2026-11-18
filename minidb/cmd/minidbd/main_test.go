@@ -170,6 +170,60 @@ func begin(t *testing.T, db *sql.DB) *sql.Tx {
 	return tx
 }
 
+func TestPoolResetsSessionAfterRejectedCommit(t *testing.T) {
+	addr, _ := launch(t, t.TempDir())
+	db := client.Open(addr)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	execute(t, db, "create table items (id int primary key)")
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	execute(t, conn, "begin")
+	execute(t, conn, "insert into items values (1)")
+	if _, err := conn.ExecContext(t.Context(), "commit typo"); err == nil {
+		t.Fatal("accepted malformed commit")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	execute(t, db, "insert into items values (1)")
+}
+
+func TestDriverPreservesUTF8Text(t *testing.T) {
+	addr, _ := launch(t, t.TempDir())
+	db := client.Open(addr)
+	defer db.Close()
+	execute(t, db, "create table names (name text primary key)")
+	invalid := string([]byte{0xff})
+	if _, err := db.ExecContext(t.Context(), "insert into names values (?)", invalid); err == nil {
+		t.Error("accepted an invalid UTF-8 parameter")
+	}
+	if _, err := db.ExecContext(t.Context(), "insert into names values ('x"+invalid+"')"); err == nil {
+		t.Error("accepted an invalid UTF-8 SQL literal")
+	}
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintf(conn, "{\"SQL\":\"insert into names values ('raw%s')\"}\n", invalid); err != nil {
+		t.Fatal(err)
+	}
+	var response wire.Response
+	if err := wire.Read(wire.Reader(conn), &response); err != nil || response.Code == "" {
+		t.Fatalf("response to invalid UTF-8 frame: %+v, %v", response, err)
+	}
+	execute(t, db, "insert into names values (?)", "�")
+	execute(t, db, "insert into names values (?)", "x�")
+	execute(t, db, "insert into names values (?)", "raw�")
+}
+
 func TestOrderSurvivesLostReplyAndAbruptRestart(t *testing.T) {
 	dir := t.TempDir()
 	addr, kill := launch(t, dir)
