@@ -22,6 +22,7 @@ var dueExperimentEpoch = time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 
 const dueExperimentLead = 630 * time.Millisecond
 const dueExperimentChild = "MINIMQ_DUE_CHILD_DIR"
+const dueExperimentClockFile = "MINIMQ_DUE_CHILD_CLOCK_FILE"
 
 // The child runs the same listener, HTTP routes and maintenance loop as minimqd.
 func TestDueExperimentBroker(t *testing.T) {
@@ -35,7 +36,18 @@ func TestDueExperimentBroker(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if err := run(ctx, dir, "127.0.0.1:0", dueExperimentClock(origin)); err != nil {
+	cfg := dueExperimentClock(origin)
+	if path := os.Getenv(dueExperimentClockFile); path != "" {
+		cfg.Clock = func() (minimq.TimeBounds, error) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return minimq.TimeBounds{}, err
+			}
+			now, err := time.Parse(time.RFC3339Nano, string(data))
+			return minimq.TimeBounds{Lower: now, Upper: now}, err
+		}
+	}
+	if err := run(ctx, dir, "127.0.0.1:0", cfg); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -58,8 +70,14 @@ type dueBroker struct {
 
 func startDueBroker(t *testing.T, dir string, origin time.Time) *dueBroker {
 	t.Helper()
+	return startDueBrokerWithClock(t, dir, origin, "")
+}
+
+func startDueBrokerWithClock(t *testing.T, dir string, origin time.Time, clockFile string) *dueBroker {
+	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestDueExperimentBroker$", "-test.v")
-	cmd.Env = append(os.Environ(), dueExperimentChild+"="+dir, "MINIMQ_DUE_CHILD_ORIGIN="+origin.Format(time.RFC3339Nano))
+	cmd.Env = append(os.Environ(), dueExperimentChild+"="+dir, "MINIMQ_DUE_CHILD_ORIGIN="+origin.Format(time.RFC3339Nano),
+		dueExperimentClockFile+"="+clockFile)
 	cmd.Stdout = os.Stdout
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
