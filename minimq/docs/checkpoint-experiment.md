@@ -113,3 +113,17 @@ For the segment microbenchmark, the executable order alternated across five pair
 The forced runs published 160 messages in each of three runs per binary. With segments of 256 messages, every checkpoint in this control retained its new messages in the short tail and frame assembly measured zero. Each run completed 192 ordinary ACKs, 80 probe ACKs and 40 history pages. All probes overlapped the checkpoints. Ordinary P99 ranges were 133.0–153.7 ms on the baseline and 120.8–142.0 ms on the candidate. Probe P99 ranges were 200.9–214.8 and 190.9–201.9 ms. Differences in this control show the run-to-run variation even without segment assembly.
 
 Keep the in-buffer frame path for its repeatable allocation and encoding benefit. JSON is the largest remaining measured non-sync phase. In the forced baseline, writing repeated short-tail checkpoints took 8.4–27.8 ms in JSON encoding alone. Measuring that repeated work separately from sealed-record encoding is the next constraint to investigate before changing lock boundaries.
+
+## Short tails with ACK-only and sparse traffic
+
+```sh
+GOWORK=off MINIMQ_SHORT_TAIL_EXPERIMENT=default go test -run '^TestShortTailCheckpointExperiment$' -count=1 -v
+GOWORK=off MINIMQ_SHORT_TAIL_EXPERIMENT=quiet go test -run '^TestShortTailCheckpointExperiment$' -count=1 -v
+GOWORK=off MINIMQ_SHORT_TAIL_EXPERIMENT=sparse go test -run '^TestShortTailCheckpointExperiment$' -count=1 -v
+```
+
+The setup installs 2,048 sealed messages and a short tail of 128 messages of 64 KiB each. One subscription pins history. A second takes leases via `Pull` and acknowledges them through the normal `Ack` path. The prepared delivery handles release their body buffers before the measured reopen.
+
+The initial checkpoint and reopen run outside the measured workload. Default mode uses the broker's 30-second schedule for three periods with only ACK updates. Quiet mode does the same work across six forced checkpoints. Sparse mode adds one 64 KiB publication before each of six forced checkpoints. The ordinary worker reads across the archive boundary and each checkpoint releases a separate cohort of pregranted ACKs. The test reopens the partition and checks history, durable ACKs and an outstanding lease. `MINIMQ_SHORT_TAIL_ROWS` changes the starting tail size.
+
+The output separates the first image encode from later encodes of overlapping immutable offsets. Repeated bytes count the raw bodies represented again in checkpoint images. Image bytes include JSON and base64 expansion. CPU is process user plus system time over the measured workload. Heap deltas are live Go heap after two garbage collections relative to the empty process before reopen. The raw tail count excludes payloads retained for independent delivery such as scheduled items and dead letters.

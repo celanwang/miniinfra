@@ -195,6 +195,13 @@ func (p *Partition) compact(now TimeBounds) error {
 	payload, err := json.Marshal(image)
 	if stats != nil {
 		stats.encode += time.Since(start)
+		stats.tailFirst = p.tailOffset + uint64(sealed)
+		stats.tailRecords = len(image.Tail)
+		for _, msg := range image.Tail {
+			stats.tailBytes += len(msg.Body)
+		}
+		stats.imageBytes = len(payload)
+		stats.stagedSegments = len(files)
 	}
 	if err != nil {
 		return err
