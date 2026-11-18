@@ -283,8 +283,11 @@ func (tx *Txn) write(ctx context.Context, tbl *table, old *version, ch change) e
 		current := Snapshot{tx: tx, sequence: tx.db.published.Load()}
 		for i := range tbl.indexes {
 			idx := &tbl.indexes[i]
+			if !idx.def.Unique {
+				continue
+			}
 			encoded, null := key(ch.Values, idx.def.Columns)
-			if !idx.def.Unique || null {
+			if null {
 				continue
 			}
 			for row := range idx.lookup(encoded) {
