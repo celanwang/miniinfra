@@ -30,6 +30,7 @@ func snapshot(t *testing.T, tx *Txn) Snapshot {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(view.Close)
 	return view
 }
 
@@ -63,6 +64,7 @@ func seed(t *testing.T, db *DB) {
 		t.Fatal(err)
 	}
 	tx, view := start(t, db)
+	defer view.Close()
 	for i := range int64(800) {
 		insert(t, view, i+1, fmt.Sprintf("sku-%d", i+1), 1)
 	}

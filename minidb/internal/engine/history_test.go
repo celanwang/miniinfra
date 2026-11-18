@@ -53,8 +53,9 @@ func seedHistory(t testing.TB, dir string, count int) *DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range count {
-		if err := view.Insert(t.Context(), schema.Name, []Value{Int(int64(i + 1)), String([]string{"hot", "ordinary"}[i]), Int(0)}); err != nil {
+	defer view.Close()
+	for i, label := range []string{"hot", "ordinary"}[:count] {
+		if err := view.Insert(t.Context(), schema.Name, []Value{Int(int64(i + 1)), String(label), Int(0)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -74,6 +75,7 @@ func cycleStock(ctx context.Context, db *DB, sku int64, durable bool) error {
 	if err != nil {
 		return err
 	}
+	defer view.Close()
 	changed, err := view.Mutate(ctx, schema.Name, []Value{Int(sku)}, func(row []Value) ([]Value, bool, error) {
 		row[2].Int++
 		return row, true, nil
@@ -98,26 +100,35 @@ func TestHotHistoryAcrossCheckpointAndRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	check := func(where string, db *DB, count int) {
-		t.Helper()
-		got := historyFor(db, 1, "hot")
-		t.Logf("%s: %+v", where, got)
-		if got != (historyCounts{count, count, count}) {
-			t.Fatalf("unexpected history size at %s: %+v", where, got)
-		}
-		_, view := start(t, db)
-		wantStock(t, view, 0, Int(1), historyUpdates/2)
-		wantStock(t, view, 1, String("hot"), historyUpdates/2)
-	}
-	check("before checkpoint", db, historyUpdates+1)
+	t.Logf("before checkpoint: %+v", historyFor(db, 1, "hot"))
 	if err := db.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
-	check("after checkpoint", db, historyUpdates+1)
+	counts := waitForHistory(t, db, historyCounts{1, 1, 1})
+	t.Logf("after online reclamation: %+v", counts)
+	_, view := start(t, db)
+	wantStock(t, view, 0, Int(1), historyUpdates/2)
+	wantStock(t, view, 1, String("hot"), historyUpdates/2)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	check("after restart", openInventory(t, dir), 1)
+	reopened := openInventory(t, dir)
+	_, fresh := start(t, reopened)
+	wantStock(t, fresh, 0, Int(1), historyUpdates/2)
+	wantStock(t, fresh, 1, String("hot"), historyUpdates/2)
+	t.Logf("after restart: %+v", waitForHistory(t, reopened, historyCounts{1, 1, 1}))
+}
+
+func waitForHistory(t *testing.T, db *DB, want historyCounts) historyCounts {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if counts := historyFor(db, 1, "hot"); counts == want {
+			return counts
+		}
+		time.Sleep(reclaimInterval)
+	}
+	t.Fatalf("history = %+v, want %+v", historyFor(db, 1, "hot"), want)
+	return historyCounts{}
 }
 
 // Run with -benchtime=2400x. The hot worker alternates commits and rollbacks

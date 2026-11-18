@@ -114,6 +114,7 @@ func (s *Session) Execute(ctx context.Context, sql string, args []engine.Value) 
 		case "update", "delete":
 			result, err = mutateRow(ctx, view, stmt)
 		}
+		view.Close()
 	}
 	if err != nil {
 		if implicit {

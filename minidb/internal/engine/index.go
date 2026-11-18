@@ -1,51 +1,75 @@
 package engine
 
 import (
+	"iter"
 	"slices"
 	"sort"
 )
 
 const indexPageKeys = 32
 
-// The leaves own index entries. Internal pages route lookups using the
-// first key of each right subtree.
+type indexLink struct {
+	previous, next *version
+}
+
+// A leaf has one list of candidates per key. Versions carry the links so
+// removing one candidate does not scan or copy a hot key's history.
 type indexPage struct {
 	keys     []string
-	rows     [][]*version
+	rows     []*version
 	children []*indexPage
 }
 
 type index struct {
 	def  Index
 	root *indexPage
+	slot int
 }
 
-func (idx *index) lookup(key string) []*version {
-	page := idx.root
+func (idx *index) lookup(key string) iter.Seq[*version] {
+	return func(yield func(*version) bool) {
+		page := idx.root.leaf(key)
+		at, found := slices.BinarySearch(page.keys, key)
+		if !found {
+			return
+		}
+		for row := page.rows[at]; row != nil; row = row.indexLinks[idx.slot].next {
+			if !yield(row) {
+				return
+			}
+		}
+	}
+}
+
+func (page *indexPage) child(key string) int {
+	return sort.Search(len(page.keys), func(i int) bool { return key < page.keys[i] })
+}
+
+func (page *indexPage) leaf(key string) *indexPage {
 	for len(page.children) != 0 {
-		page = page.children[sort.Search(len(page.keys), func(i int) bool { return key < page.keys[i] })]
+		page = page.children[page.child(key)]
 	}
-	if i, found := slices.BinarySearch(page.keys, key); found {
-		return page.rows[i]
-	}
-	return nil
+	return page
 }
 
 func (idx *index) add(key string, v *version) {
-	if split, right := idx.root.insert(key, v); right != nil {
+	if split, right := idx.root.insert(key, v, idx.slot); right != nil {
 		idx.root = &indexPage{keys: []string{split}, children: []*indexPage{idx.root, right}}
 	}
 }
 
-func (page *indexPage) insert(key string, v *version) (string, *indexPage) {
+func (page *indexPage) insert(key string, v *version, slot int) (string, *indexPage) {
 	if len(page.children) == 0 {
 		at, found := slices.BinarySearch(page.keys, key)
 		if found {
-			page.rows[at] = append(page.rows[at], v)
+			head := page.rows[at]
+			head.indexLinks[slot].previous = v
+			v.indexLinks[slot].next = head
+			page.rows[at] = v
 			return "", nil
 		}
 		page.keys = slices.Insert(page.keys, at, key)
-		page.rows = slices.Insert(page.rows, at, []*version{v})
+		page.rows = slices.Insert(page.rows, at, v)
 		if len(page.keys) <= indexPageKeys {
 			return "", nil
 		}
@@ -57,8 +81,8 @@ func (page *indexPage) insert(key string, v *version) (string, *indexPage) {
 		return right.keys[0], right
 	}
 
-	at := sort.Search(len(page.keys), func(i int) bool { return key < page.keys[i] })
-	split, right := page.children[at].insert(key, v)
+	at := page.child(key)
+	split, right := page.children[at].insert(key, v, slot)
 	if right == nil {
 		return "", nil
 	}
@@ -74,4 +98,46 @@ func (page *indexPage) insert(key string, v *version) (string, *indexPage) {
 	clear(page.children[mid+1:])
 	page.keys, page.children = page.keys[:mid], page.children[:mid+1]
 	return pivot, sibling
+}
+
+func (idx *index) remove(key string, row *version) {
+	link := &row.indexLinks[idx.slot]
+	switch {
+	case link.previous != nil:
+		link.previous.indexLinks[idx.slot].next = link.next
+	case link.next != nil:
+		page := idx.root.leaf(key)
+		at, _ := slices.BinarySearch(page.keys, key)
+		page.rows[at] = link.next
+	default:
+		idx.root.removeKey(key)
+		for len(idx.root.children) == 1 {
+			idx.root = idx.root.children[0]
+		}
+	}
+	if link.next != nil {
+		link.next.indexLinks[idx.slot].previous = link.previous
+	}
+	*link = indexLink{}
+}
+
+// Drop empty children. Separators between surviving children remain valid
+// routing bounds even if the minimum key in a leaf increases.
+func (page *indexPage) removeKey(key string) bool {
+	if len(page.children) == 0 {
+		at, _ := slices.BinarySearch(page.keys, key)
+		page.keys = slices.Delete(page.keys, at, at+1)
+		page.rows = slices.Delete(page.rows, at, at+1)
+		return len(page.keys) == 0
+	}
+	at := page.child(key)
+	if !page.children[at].removeKey(key) {
+		return false
+	}
+	page.children = slices.Delete(page.children, at, at+1)
+	if len(page.keys) != 0 {
+		boundary := max(0, at-1)
+		page.keys = slices.Delete(page.keys, boundary, boundary+1)
+	}
+	return len(page.children) == 0
 }

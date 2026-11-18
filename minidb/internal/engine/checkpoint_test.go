@@ -57,3 +57,41 @@ func TestCheckpointRecoversPagesAndReplaysOnlyLaterCommits(t *testing.T) {
 	_, latest := start(t, openInventory(t, dir))
 	wantStock(t, latest, 1, String("sku-1"), 0)
 }
+
+func TestCheckpointAndReclamationWithConcurrentUpdates(t *testing.T) {
+	dir := t.TempDir()
+	db := seedHistory(t, dir, 1)
+	reader, old := start(t, db)
+	const updates = 120
+	writes := make(chan error, 1)
+	go func() {
+		for i := range updates {
+			if err := cycleStock(t.Context(), db, 1, i%2 == 0); err != nil {
+				writes <- err
+				return
+			}
+		}
+		writes <- nil
+	}()
+	for range 8 {
+		if err := db.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+		wantStock(t, old, 1, String("hot"), 0)
+	}
+	if err := <-writes; err != nil {
+		t.Fatal(err)
+	}
+	wantStock(t, old, 0, Int(1), 0)
+	old.Close()
+	waitForHistory(t, db, historyCounts{1, 1, 1})
+	latest := snapshot(t, reader)
+	wantStock(t, latest, 0, Int(1), updates/2)
+	wantStock(t, latest, 1, String("hot"), updates/2)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, recovered := start(t, openInventory(t, dir))
+	wantStock(t, recovered, 0, Int(1), updates/2)
+	wantStock(t, recovered, 1, String("hot"), updates/2)
+}
