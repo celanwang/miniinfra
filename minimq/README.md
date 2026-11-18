@@ -8,6 +8,10 @@ go run ./cmd/minimqd -dir ./minimq-data
 
 The development service listens on loopback by default. The protocol uses JSON, with base64 for message bodies, RFC 3339 timestamps for absolute times, and nanoseconds for subscription durations.
 
+Pass settings as flags. The daemon reserves `-listen` before opening `-dir` and starts serving HTTP after recovery. Use `SIGINT` or `SIGTERM` to stop it and wait for the process to exit before restarting on the same address and data directory. HTTP shutdown gives active requests up to five seconds to finish before closing their connections. Maintenance stops before the partition closes.
+
+Same-disk restart recovers committed history and retained receipts, including after an abrupt process exit. Recovery assumes the filesystem preserves the committed files. If a stop interrupts a reply, use the status and retry rules below.
+
 ```sh
 curl -fsS localhost:7400/v1/subscriptions/register -d '{"Subscription":"notify"}'
 curl -fsS localhost:7400/v1/publish -d '{"ID":"order-731-shipped","Body":"c2hpcHBlZA=="}'
