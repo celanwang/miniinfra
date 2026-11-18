@@ -1,7 +1,6 @@
 package wal
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,6 +18,7 @@ const (
 	headerSize      = 12
 	MaxPayload      = 16 << 20
 	maxBatch        = 64
+	maxStagedBytes  = 64 << 10
 	groupCommitWait = 200 * time.Microsecond
 )
 
@@ -211,6 +211,7 @@ func (log *Log) submit(item request) error {
 
 func (log *Log) run(end int64) {
 	defer close(log.done)
+	var staging []byte
 	var failure error
 	var waitingDuringSync bool
 	for first := range log.queue {
@@ -233,7 +234,10 @@ func (log *Log) run(end int64) {
 			batch = append(batch, next)
 		}
 		if failure == nil {
-			failure = log.sync(batch)
+			if staging == nil {
+				staging = make([]byte, 0, maxStagedBytes)
+			}
+			failure = log.sync(batch, staging)
 		}
 		// Sample before waking the just-synced clients. A queued request
 		// signals overlap, while a lone client can only enqueue after its
@@ -276,7 +280,7 @@ func (log *Log) nextRequest(waitForPeer bool) (request, bool) {
 	}
 }
 
-func (log *Log) sync(batch []request) error {
+func (log *Log) sync(batch []request, staging []byte) error {
 	var started time.Time
 	for _, item := range batch {
 		if item.timing != nil {
@@ -284,26 +288,7 @@ func (log *Log) sync(batch []request) error {
 			break
 		}
 	}
-	// Bound staging memory even when the batch contains large transactions.
-	var header [headerSize]byte
-	var buffer bytes.Buffer
-	for _, item := range batch {
-		binary.BigEndian.PutUint32(header[:4], uint32(len(item.payload)))
-		binary.BigEndian.PutUint32(header[4:8], crc32.ChecksumIEEE(item.payload))
-		binary.BigEndian.PutUint32(header[8:], crc32.ChecksumIEEE(header[:8]))
-		buffer.Write(header[:])
-		if buffer.Len()+len(item.payload) > 64<<10 {
-			if _, err := buffer.WriteTo(log.file); err != nil {
-				return fmt.Errorf("write WAL: %w", err)
-			}
-			if _, err := log.file.Write(item.payload); err != nil {
-				return fmt.Errorf("write WAL: %w", err)
-			}
-			continue
-		}
-		buffer.Write(item.payload)
-	}
-	if _, err := buffer.WriteTo(log.file); err != nil {
+	if err := writeBatch(log.file, batch, staging); err != nil {
 		return fmt.Errorf("write WAL: %w", err)
 	}
 	var flushing time.Time
@@ -327,6 +312,39 @@ func (log *Log) sync(batch []request) error {
 	}
 	if err != nil {
 		return fmt.Errorf("sync WAL: %w", err)
+	}
+	return nil
+}
+
+func writeBatch(out io.Writer, batch []request, staging []byte) error {
+	var header [headerSize]byte
+	for _, item := range batch {
+		binary.BigEndian.PutUint32(header[:4], uint32(len(item.payload)))
+		binary.BigEndian.PutUint32(header[4:8], crc32.ChecksumIEEE(item.payload))
+		binary.BigEndian.PutUint32(header[8:], crc32.ChecksumIEEE(header[:8]))
+		// Check the header as well as the payload so append never grows staging.
+		if len(staging)+headerSize > cap(staging) {
+			if _, err := out.Write(staging); err != nil {
+				return err
+			}
+			staging = staging[:0]
+		}
+		staging = append(staging, header[:]...)
+		if len(staging)+len(item.payload) <= cap(staging) {
+			staging = append(staging, item.payload...)
+			continue
+		}
+		if _, err := out.Write(staging); err != nil {
+			return err
+		}
+		staging = staging[:0]
+		if _, err := out.Write(item.payload); err != nil {
+			return err
+		}
+	}
+	if len(staging) != 0 {
+		_, err := out.Write(staging)
+		return err
 	}
 	return nil
 }
