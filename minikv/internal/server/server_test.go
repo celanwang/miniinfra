@@ -300,6 +300,19 @@ func TestTCPCommandsAndShutdown(t *testing.T) {
 	get := fmt.Sprintf("GET %d\n%s", len(key), key)
 	c.exchange(t, get, "MISS\n")
 	c.exchange(t, fmt.Sprintf("SET %d 3 700 NX\n%sa\x00b", len(key), key), "STORED\n")
+	// The largest wire TTL has less than a millisecond of deadline headroom.
+	time.Sleep(time.Millisecond)
+	before := s.cache.Stats(0)
+	const overflowTTL = "9223372036854"
+	c.send(t, fmt.Sprintf("SET %d 3 %s\n%snew", len(key), overflowTTL, key)+
+		fmt.Sprintf("SET %d 3 %s NX\n%snew", len(key), overflowTTL, key)+
+		fmt.Sprintf("SET %d 1000 %s\n%s%s", len(key), overflowTTL, key, strings.Repeat("x", 1000)))
+	for range 3 {
+		c.line(t, "BAD_REQUEST\n")
+	}
+	if got := s.cache.Stats(0); got != before {
+		t.Fatalf("invalid SET changed stats: got %+v, want %+v", got, before)
+	}
 	c.exchange(t, fmt.Sprintf("SET %d 3 NONE NX\n%snew", len(key), key), "EXISTS\n")
 	c.exchange(t, fmt.Sprintf("SET %d 1000 NONE\n%s%s", len(key), key, strings.Repeat("x", 1000)), "NO_SPACE\n")
 	c.send(t, get)
