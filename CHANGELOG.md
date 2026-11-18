@@ -4,6 +4,10 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+## v0.1.0 (2026-11-18)
+
+First single-node release of MiniDB, MiniKV, and MiniMQ.
+
 - MiniKV checks its configuration and binds its address before allocating the cache.
 - MiniMQ binds its address before opening the partition and rejects unexpected positional arguments.
 - MiniDB validates startup and binds its address before opening database files.
@@ -17,13 +21,13 @@ Component changes are listed newest first as they land on `main`.
 - MiniKV documents TCP completion rates, CPU cost, and memory use near the measured load limit.
 - MiniMQ skips unrelated redrive scans when a subscription has no pending redrives.
 - MiniMQ rebuilds pending delivery order in one heap pass when restoring a checkpoint.
-- MiniKV verifies that retrying a conditional write after a lost reply preserves its original value and expiry.
+- MiniKV preserves a live entry's value and expiry when a client retries a conditional write after a lost reply.
 - MiniDB skips index key encoding when reclaiming an old row version that can be unlinked directly.
-- MiniKV retries inbound byte reservations up to sixteen times to reduce contention-induced BUSY replies.
+- MiniKV makes up to sixteen attempts to reserve inbound bytes, reducing contention-induced BUSY replies.
 - MiniMQ releases idle map capacity when checkpoint pruning removes the last receipt or dead letter.
 - MiniMQ releases retired segment indexes after checkpoint reclamation while preserving in-flight history reads.
 - MiniDB reuses a 64 KiB WAL write buffer across commit batches and writes oversized payloads directly.
-- MiniMQ verifies that retrying a delayed publish after a lost reply preserves its receipt and produces one history entry across restarts.
+- MiniMQ verifies that retrying a delayed publish within its deduplication window produces one history entry across restarts.
 - MiniKV returns BAD_REQUEST for an overflowing SET deadline before checking NX or shard capacity.
 - MiniMQ reuses immutable dead-letter bodies during redrive while keeping each durable record self-contained.
 - MiniDB allocates transaction lock state on the first grant, saving two allocations on point reads.

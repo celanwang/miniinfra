@@ -4,6 +4,8 @@ MiniDB 是独立运行的 Go 关系型数据库。当前实现验证短事务的
 
 ## 启动
 
+从 `minidb/` 目录启动服务。
+
 ```sh
 mkdir -p /tmp/minidb-data
 go run ./cmd/minidbd -listen 127.0.0.1:7432 -data /tmp/minidb-data
@@ -32,7 +34,7 @@ FROM orders o JOIN items i ON o.id = i.order_id
 WHERE o.request_id = 'r-42';
 ```
 
-提交连接断开时，驱动返回 `client.CommitUnknown`。重新连接后用原请求号查询或重试，同一个请求号只允许创建一笔已提交的订单。 [重试语义](docs/plan/execution.md#断线与重试)
+如果 `COMMIT` 或自动提交的写语句可能已发出，但连接在收到结果前断开，驱动返回的 `*client.Error` 带有 `client.CommitUnknown` 错误码。重新连接后按原请求号查询订单。重试时沿用该请求号，由唯一键保证只创建一笔订单。 [重试语义](docs/plan/execution.md#断线与重试)
 
 ## 验证
 

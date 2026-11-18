@@ -19,7 +19,7 @@ curl -fsS localhost:7400/v1/history/read -d '{"Offset":0,"Limit":{"Messages":10,
 curl -fsS localhost:7400/v1/deliveries/pull -d '{"Subscription":"notify","Worker":"mailer","Limit":{"Messages":10,"Bytes":4096}}'
 ```
 
-Send the returned `Instance` and `Token` to `POST /v1/deliveries/ack` along with the same `Subscription` and `Worker`. Send those fields and a `Reason` to `/v1/deliveries/fail` to report a failed attempt. A `DeliverAt` on publish schedules the first release. `POST /v1/publish/status` takes an `ID` and returns its visibility and offset.
+Send the returned `Instance` and `Token` to `POST /v1/deliveries/ack` along with the same `Subscription` and `Worker`. Send those fields and a `Reason` to `/v1/deliveries/fail` to report a failed attempt. A `DeliverAt` on publish schedules the first release. Query `POST /v1/publish/status` with the message `ID`. While delivery is scheduled, `Scheduled` is true and the message awaits its history offset. After release, the broker returns the offset while it retains the publish receipt.
 
 Treat a lost Pull reply as an unknown outcome. The broker may already have committed a lease, so the next Pull can return an empty batch. If attempts remain, the task becomes eligible after the lease deadline and retry delay. A new delivery carries the same `Instance`, a higher `Attempt`, and a new `Token`. Use that token to settle the new attempt.
 
