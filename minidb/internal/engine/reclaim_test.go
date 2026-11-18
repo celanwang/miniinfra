@@ -119,3 +119,45 @@ func TestReclaimStepRespectsHeapSlotBudget(t *testing.T) {
 		t.Fatalf("rollback backlog did not drain: %+v", got)
 	}
 }
+
+func TestReclaimSharesSlotBudgetAcrossSparseTables(t *testing.T) {
+	db := seedHistory(t, t.TempDir(), 1)
+	db.stopReclaimer()
+	<-db.reclaimerDone
+
+	empty := schema
+	empty.Name = "empty"
+	if err := db.CreateTable(empty); err != nil {
+		t.Fatal(err)
+	}
+	small := schema
+	small.Name = "small"
+	if err := db.CreateTable(small); err != nil {
+		t.Fatal(err)
+	}
+	tx, view := start(t, db)
+	if err := view.Insert(t.Context(), small.Name, []Value{Int(10), String("small"), Int(1)}); err != nil {
+		t.Fatal(err)
+	}
+	view.Close()
+	commit(t, tx)
+
+	for range reclaimBudget + 20 {
+		if err := cycleStock(t.Context(), db, 1, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Begin this sweep at the two quiet tables. The empty visit consumes
+	// budget without examining a heap slot. The busy table gets the rest.
+	db.reclaimTable = 1
+	examined, removed := db.reclaimStep()
+	if examined != reclaimBudget-1 || removed < reclaimBudget-3 {
+		t.Fatalf("scanned %d and removed %d across three tables", examined, removed)
+	}
+	for range 2 {
+		db.reclaimStep()
+	}
+	if got := historyFor(db, 1, "hot"); got != (historyCounts{1, 1, 1}) {
+		t.Fatalf("busy table did not converge: %+v", got)
+	}
+}

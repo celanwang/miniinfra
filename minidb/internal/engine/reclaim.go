@@ -26,8 +26,9 @@ func (db *DB) runReclaimer(ctx context.Context) {
 	}
 }
 
-// reclaimStep visits at most one page's worth of slots in a single table.
-// Checkpoint walks by page number, so it excludes moves of existing rows.
+// reclaimStep shares one page's worth of work across the catalog. A table
+// with no rows still consumes one unit so a sparse catalog cannot make a
+// sweep unbounded. Checkpoint excludes moves of existing heap slots.
 func (db *DB) reclaimStep() (examined, removed int) {
 	db.reclaimMu.Lock()
 	defer db.reclaimMu.Unlock()
@@ -37,21 +38,30 @@ func (db *DB) reclaimStep() (examined, removed int) {
 
 	oldest := db.oldestSnapshot()
 	db.catalog.RLock()
-	if len(db.tableOrder) == 0 {
-		db.catalog.RUnlock()
-		return 0, 0
-	}
-	tbl := db.tableOrder[db.reclaimTable]
-	db.reclaimTable = (db.reclaimTable + 1) % len(db.tableOrder)
+	// The catalog appends tables without changing existing entries.
+	tables := db.tableOrder
 	db.catalog.RUnlock()
 
+	budget := reclaimBudget
+	for visited := 0; budget > 0 && visited < len(tables); visited++ {
+		tbl := tables[db.reclaimTable]
+		db.reclaimTable = (db.reclaimTable + 1) % len(tables)
+		scanned, collected := tbl.reclaimWithin(oldest, budget)
+		examined += scanned
+		removed += collected
+		budget -= max(1, scanned)
+	}
+	return examined, removed
+}
+
+func (tbl *table) reclaimWithin(oldest uint64, budget int) (examined, removed int) {
 	tbl.mu.Lock()
 	defer tbl.mu.Unlock()
 	if len(tbl.pages) == 0 {
 		return 0, 0
 	}
 	size := (len(tbl.pages)-1)*heapPageRows + len(tbl.pages[len(tbl.pages)-1])
-	limit := min(reclaimBudget, size)
+	limit := min(budget, size)
 	for examined < limit && size != 0 {
 		if tbl.reclaimSlot >= size {
 			tbl.reclaimSlot = 0
