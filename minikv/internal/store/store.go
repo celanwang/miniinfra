@@ -36,6 +36,19 @@ type Config struct {
 	Samples         int
 }
 
+// Validate checks the shard limits without allocating the store.
+func (c Config) Validate() error {
+	if c.Shards < 1 || c.EntriesPerShard < 1 ||
+		int64(c.EntriesPerShard) > math.MaxUint32 ||
+		c.Samples < 1 || c.Samples > maxSamples {
+		return errors.New("invalid shard capacity or sample count")
+	}
+	if c.BytesPerShard <= int64(c.EntriesPerShard)*slotBudget {
+		return errors.New("shard byte budget must exceed metadata reservation")
+	}
+	return nil
+}
+
 type Store struct {
 	shards []shard
 	seed   maphash.Seed
@@ -73,17 +86,11 @@ type shard struct {
 }
 
 func New(config Config) (*Store, error) {
-	if config.Shards < 1 || config.EntriesPerShard < 1 ||
-		int64(config.EntriesPerShard) > math.MaxUint32 ||
-		config.Samples < 1 || config.Samples > maxSamples {
-		return nil, errors.New("invalid shard capacity or sample count")
+	if err := config.Validate(); err != nil {
+		return nil, err
 	}
 
 	reserved := int64(config.EntriesPerShard) * slotBudget
-	if config.BytesPerShard <= reserved {
-		return nil, errors.New("shard byte budget must exceed metadata reservation")
-	}
-
 	start := time.Now()
 	s := &Store{
 		shards: make([]shard, config.Shards),

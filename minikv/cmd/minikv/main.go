@@ -52,21 +52,30 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return errors.New("provide a positive shard count and use flags for all options")
 	}
 
-	cache, err := store.New(store.Config{
+	cacheConfig := store.Config{
 		Shards:          *shards,
 		BytesPerShard:   *cacheBytes / int64(*shards),
 		EntriesPerShard: *entries / *shards,
 		Samples:         *samples,
-	})
-	if err != nil {
+	}
+	if err := cacheConfig.Validate(); err != nil {
 		return err
 	}
-	s, err := server.New(cache, cfg)
-	if err != nil {
+	if err := cfg.Validate(); err != nil {
 		return err
 	}
 
 	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	cache, err := store.New(cacheConfig)
+	if err != nil {
+		return err
+	}
+	s, err := server.New(cache, cfg)
 	if err != nil {
 		return err
 	}
