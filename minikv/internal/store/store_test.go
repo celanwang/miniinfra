@@ -1,6 +1,7 @@
 package store
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -48,6 +49,75 @@ func TestRejectedOverwriteKeepsOriginalDeadlineAndCandidates(t *testing.T) {
 	put(t, s, "a", "new", time.Second, true, Stored)
 	put(t, s, "a", "ignored", time.Second, true, Exists)
 	read(t, s, "a", "new", Hit)
+}
+
+const maxWireTTL = time.Duration(math.MaxInt64/int64(time.Millisecond)) * time.Millisecond
+
+func TestOverflowingTTLPrecedesWriteDecisions(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, value string
+		nx               bool
+	}{
+		{"overwrite", "a", "new", false},
+		{"present NX", "a", "new", true},
+		{"would evict", "d", "ddd", false},
+		{"no space", "a", "evenlarger", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, now := testStore(t, 12, 3, 2)
+			put(t, s, "a", "old", time.Second, false, Stored)
+			put(t, s, "b", "bbb", 0, false, Stored)
+			put(t, s, "c", "ccc", 0, false, Stored)
+			*now = time.Millisecond
+			before := s.Stats(0)
+			sh := s.shardFor([]byte("a"))
+			sampleAt := sh.sampleAt
+
+			put(t, s, tc.key, tc.value, maxWireTTL, tc.nx, Invalid)
+			if got := s.Stats(0); got != before || sh.sampleAt != sampleAt {
+				t.Fatalf("invalid SET changed stats or sample cursor: stats %+v to %+v, cursor %d to %d", before, got, sampleAt, sh.sampleAt)
+			}
+			read(t, s, "b", "bbb", Hit)
+			read(t, s, "c", "ccc", Hit)
+			read(t, s, "d", "", Miss)
+			*now = time.Second - time.Nanosecond
+			read(t, s, "a", "old", Hit)
+			*now = time.Second
+			read(t, s, "a", "", Miss)
+		})
+	}
+}
+
+func TestTTLCanOverflowBeforePublication(t *testing.T) {
+	s, now := testStore(t, 8, 2, 2)
+	put(t, s, "a", "old", time.Second, false, Stored)
+	put(t, s, "b", "bbb", 0, false, Stored)
+	before := s.Stats(0)
+	lastValid := time.Duration(math.MaxInt64) - maxWireTTL
+	checks := 0
+	s.now = func() time.Duration {
+		checks++
+		if checks == 1 {
+			return lastValid
+		}
+		return lastValid + time.Nanosecond
+	}
+	scratch := make([]byte, 7, 32)
+	if got := s.SetCopy([]byte("a"), scratch, maxWireTTL, false); got != Invalid {
+		t.Fatalf("SetCopy returned %v, want %v", got, Invalid)
+	}
+	if checks != 2 {
+		t.Fatalf("checked time %d times, want an initial and a publication check", checks)
+	}
+	s.now = func() time.Duration { return *now }
+	if got := s.Stats(0); got != before {
+		t.Fatalf("invalid SET changed stats: got %+v, want %+v", got, before)
+	}
+	read(t, s, "b", "bbb", Hit)
+	*now = time.Second - time.Nanosecond
+	read(t, s, "a", "old", Hit)
+	*now = time.Second
+	read(t, s, "a", "", Miss)
 }
 
 func TestEvictionPrefersExpiredAndRepairsMovedIndices(t *testing.T) {
