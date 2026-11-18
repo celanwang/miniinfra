@@ -4,6 +4,7 @@ Component changes are listed newest first as they land on `main`.
 
 ## Unreleased
 
+- MiniMQ verifies that recent short tails stay inline for fast history reads across checkpoints and restarts.
 - MiniDB measures foreground lock waits during version reclamation under concurrent reads and writes.
 - MiniKV documents its memory limit under mixed-size writes and verifies successful and rejected requests in one workload.
 - MiniKV replaces idle buffers when write sizes change so near-full caches can reuse memory across workloads.
