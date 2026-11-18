@@ -162,4 +162,47 @@ The forced controls ran three times per variant in alternating order. Each large
 
 Final accounted disk use in the large-tail controls rose roughly 1–1.5 KiB. The 1 MiB control created no new segments in either variant. The capacity regression exercises a budget that fits the inline layout and rejects early-segment staging. The checkpoint falls back to the inline layout before any files from the failed attempt are written.
 
-Keep the large-prefix policy for the reduction in repeated encoding, later lock holds, and live heap under the default cadence. Overlapping ACK P99 and CPU did not improve in that default trial. Sealed records load and decode on subsequent reads, which can add work for applications that repeatedly read recent history. The next experiment should isolate that additional cost for history readers and active task pulls before widening the policy to smaller prefixes.
+The large-prefix candidate reduced repeated encoding, later lock holds, and live heap under the default cadence. Overlapping ACK P99 and CPU increased in that default trial. The recent-read comparison below determines the final policy.
+
+## Recent reads and delivery
+
+```sh
+GOWORK=off MINIMQ_SHORT_TAIL_EXPERIMENT=default MINIMQ_SHORT_TAIL_RECENT=1 go test -run '^TestShortTailCheckpointExperiment$' -count=1 -v
+GOWORK=off MINIMQ_SHORT_TAIL_EXPERIMENT=quiet MINIMQ_SHORT_TAIL_RECENT=1 go test -run '^TestShortTailCheckpointExperiment$' -count=1 -v
+```
+
+This variant adds a fixed 96-page recent history scan after each checkpoint. Each page reads four 64 KiB messages with the public `Read` method and verifies their offsets and bodies, for 24 MiB per scan. It then performs four actual two-message `Pull` batches and durably acknowledges the deliveries. The setup leaves some recent work unleased for those pulls and keeps a separate outstanding lease to verify recovery. The test retries a receipt from the real pull workload after reopening.
+
+Use `877e362` with the updated `short_tail_experiment_test.go` for the measured baseline, `638f007` for the early-seal candidate, and `2381ec8` for the restored policy. The baseline has the production behavior from `6b3c0db` and includes the checkpoint counters used by the harness. Build the binaries with `GOWORK=off go test -c`, then alternate the order of the variants in quiet mode to compare them on the same filesystem. Default mode uses the 30-second broker schedule.
+
+The quiet trials ran three times per binary in rotating order on macOS 15.5 arm64, Go 1.27.3, and local APFS. They used warm data on a shared host, with one-minute load averages of 2.2–2.6 at trial starts. Each run performed six checkpoints, 576 recent history pages, 24 Pull batches, 84 ordinary ACKs, and 36 overlapping probe ACKs. The history row reports the median and range of the 18 scans per binary. The other rows report the median of the three trials.
+
+| Quiet workload | Baseline | Early seal | Restored |
+| --- | ---: | ---: | ---: |
+| Recent Read, 96 pages (24 MiB) | 3.27 ms (1.51–7.91) | 61.00 ms (34.24–64.57) | 5.73 ms (1.57–8.13) |
+| Pull P99 | 16.02 ms | 15.08 ms | 16.02 ms |
+| Ordinary ACK P99 | 15.67 ms | 16.71 ms | 18.89 ms |
+| Overlapping probe ACK P99 | 134.20 ms | 126.80 ms | 139.43 ms |
+| Later checkpoint lock hold | 49.23 ms | 30.62 ms | 54.52 ms |
+| Process CPU | 388.79 ms | 656.08 ms | 497.09 ms |
+| Live heap delta after workload and GC | 8.75 MiB | 0.74 MiB | 8.75 MiB |
+
+Early sealing sends recent reads through the sealed-record path, which opens a segment, reads and verifies its frames, and decodes JSON and base64. Inline reads copy the body already in memory. The quiet trial's Pull P99 is the maximum of 24 batches and includes writing and syncing the delivery grant. The measured differences in Pull and ordinary ACK latency are small relative to the run-to-run spread. The repeatable change was in recent history reads.
+
+The default comparison ran once per policy with three 30-second periods, 288 recent history pages, 12 Pull batches, 48 ordinary ACKs, and 24 overlapping probe ACKs per run.
+
+| Default workload | Early seal | Restored |
+| --- | ---: | ---: |
+| Recent Read, 96 pages (24 MiB), median of three scans | 56.92 ms | 1.95 ms |
+| Pull P99 | 27.06 ms | 19.93 ms |
+| Ordinary ACK P99 | 32.93 ms | 25.90 ms |
+| Overlapping probe ACK P99 | 243.81 ms | 196.60 ms |
+| Later checkpoint lock hold, median of the last two | 41.33 ms | 46.43 ms |
+| Process CPU | 446.39 ms | 257.84 ms |
+| Live heap delta after workload and GC | 0.70 MiB | 8.71 MiB |
+
+The two default runs corroborate the recent-read penalty. The Pull and ACK percentiles reflect small samples in one run per policy. A separate restored sparse run completed six additional publications and verified the resulting history and receipts on reopen.
+
+Keep recent short tails inline and seal by the usual segment size and retention rules. Subscription progress governs task eligibility and retention. A later `Read` can still request a retained offset after every task has been acknowledged. A reader's temporary segment reference covers only its current operation. The existing task and reader state therefore provide no boundary for predicting future historical reads.
+
+The regression test checks the inline layout with an outstanding lease and after all recent tasks settle. It also verifies receipt recovery, normal sealing after additional publication, and an offset gap after retention. The restored binary opened a directory containing an actual early-sealed prefix and an inline suffix written by `69bce55`, and verified history and ACK receipts in that directory.
