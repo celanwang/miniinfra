@@ -298,3 +298,45 @@ GOWORK=off go test -c -o /tmp/minidb-secondary ./internal/engine
 MINIDB_SECONDARY_INDEX_ORDERS=600 GOMAXPROCS=4 /tmp/minidb-secondary \
   -test.run '^TestTCPSecondaryIndexWriteLoad$/^with_secondary$' -test.count=1 -test.v
 ```
+
+## 首次获锁时初始化持锁状态
+
+事务开始时分配 MVCC 状态。第一次取得行锁或唯一键锁时，锁管理器在发布持有者之前建立资源集合和唤醒信号。重复取锁共用同一个信号。等待边在取锁返回前清理，因此从未获锁的事务可以直接结束。持过锁的事务在提交和回滚时都会释放资源，即使条件更新影响零行，也会唤醒等待者。
+
+对照共用 `da02a8b` 的 TCP 探针。A 预先建立持锁状态，B 首次获锁时建立。两版使用默认 READ COMMITTED 和同步 WAL，在 Apple M4 Max、darwin/arm64、`GOMAXPROCS=4` 上按 A B B A A B 串行跑六轮。每轮分别执行 600 次隐式点查、600 次显式点查事务，以及 150 组混合事务。每组中一个连接点查四次，另一个连接在同一事务中先点查再更新另一行并同步提交。分配次数取整个测试进程的计数差，包含驱动和服务端。显式点查的延迟计入 BEGIN 和 COMMIT。
+
+| 每轮统计量 | A，事务开始时初始化 | B，首次获锁时初始化 |
+| --- | ---: | ---: |
+| 隐式点查，每次分配 | 64.16–64.19 | 62.15–62.22 |
+| 显式点查，每次分配 | 114.64–114.71 | 112.66–112.69 |
+| 混合负载，每组分配 | 448.20–448.39 | 440.08–440.63 |
+| 隐式点查 P99，µs | 74–86 | 70–105 |
+| 显式点查 P99，µs | 142–162 | 144–165 |
+| 混合负载点查 P99，µs | 126–128 | 126、140、676 |
+| 混合负载 COMMIT P99，ms | 4.83–4.91 | 4.83–7.82 |
+
+隐式和显式点查各少约两次分配，混合负载每组少约八次。混合负载有一轮点查尾部明显升高，有两轮的提交尾部与 WAL 同步尾部同时升高。主机未独占，数据未确认端到端延迟收益，也无法归因单轮峰值。
+
+用两个客户端各写 600 笔不相交订单再做纯写对照。两版交错各六轮，每单均为约 342.7 次分配。下表取逐轮统计量的中位数。
+
+| 纯写负载 | A | B |
+| --- | ---: | ---: |
+| 写语句合计中位，µs | 287 | 314 |
+| 写语句合计 P99，ms | 0.84 | 0.94 |
+| COMMIT P99，ms | 11.66 | 11.60 |
+| WAL 排队 P99，ms | 5.85 | 5.78 |
+| WAL 同步 P99，ms | 5.84 | 5.88 |
+
+六组相邻对照中，五组的写语句中位数偏高。为检查首次分配移入临界区的影响，用四个工作协程共享锁管理器，各自对独立键重复执行开始事务、首获锁、回滚。每次 40 万个操作，每版跑六次，A 为 483–490 ns/op，B 为 463–482 ns/op，两版均为 5 次分配。该隔离实验没有重现 TCP 里的写语句差距，原因待查。保留改动的依据是读路径分配的稳定下降和读事务结束时省下的管理器互斥。
+
+竞态回归覆盖了纯读结束时跳过锁管理器、首次等待被取消或超时后清除等待边、死锁处理后清理等待图，以及条件更新零行的持锁者重复取锁后，通过提交和回滚唤醒 TCP 等待者。
+
+在两版的 `minidb/` 目录分别编译二进制，交错运行。在包含探针的候选代码上，也可以用 Go overlay 将 `transactions.go` 和 `locks.go` 替换为 `da02a8b` 中的版本构建 A。共用磁盘基准锁，有已知 MiniKV 或 MiniMQ 测试重叠的轮次重跑。
+
+```sh
+GOWORK=off go test -c -o /tmp/minidb-read-lock ./internal/engine
+MINIDB_READ_LOCK_ROUNDS=600 GOMAXPROCS=4 /tmp/minidb-read-lock \
+  -test.run '^TestTCPReadLockStateLoad$' -test.count=1 -test.v
+MINIDB_LOCK_LOAD=1 MINIDB_LOCK_ORDERS=600 GOMAXPROCS=4 /tmp/minidb-read-lock \
+  -test.run '^TestTCPMultiRowLockLoad$/^disjoint$' -test.count=1 -test.v
+```

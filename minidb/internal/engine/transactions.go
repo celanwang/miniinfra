@@ -26,7 +26,7 @@ func (db *DB) Begin() (*Txn, error) {
 	if err := db.available(); err != nil {
 		return nil, err
 	}
-	return &Txn{db: db, state: &transactionState{}, held: make(map[resource]bool), done: make(chan struct{})}, nil
+	return &Txn{db: db, state: &transactionState{}}, nil
 }
 
 func (tx *Txn) active() error {
@@ -65,7 +65,11 @@ func (tx *Txn) Rollback() {
 func (tx *Txn) finish() {
 	tx.finished = true
 	tx.state.sequence.CompareAndSwap(0, abortedSequence)
-	tx.db.locks.release(tx)
+	// acquire removes its waiting edge before it returns. A transaction
+	// that never held a lock has no resources or waiters to release.
+	if tx.done != nil {
+		tx.db.locks.release(tx)
+	}
 	tx.changes = nil
 }
 
