@@ -188,6 +188,7 @@ func prepare(t target) scenario {
 type sample struct {
 	online []time.Duration
 	rtt    []time.Duration
+	stored int
 }
 
 type counts struct {
@@ -202,13 +203,16 @@ type result struct {
 	Ordinary            counts
 	Background          counts
 	SmallGETs           int
+	StoredSETs          int
 	P99Microseconds     float64
 	P999Microseconds    float64
 	RTTP99Microseconds  float64
 	RTTP999Microseconds float64
 	ClientCPUSeconds    float64
 	ServerCPUTicks      int64
-	ServerWriteCalls    *int64 `json:",omitempty"`
+	ServerWriteCalls    *int64             `json:",omitempty"`
+	RuntimeBefore       map[string]float64 `json:",omitempty"`
+	RuntimeAfter        map[string]float64 `json:",omitempty"`
 }
 
 type lane struct {
@@ -239,6 +243,9 @@ func (l lane) run(queue <-chan arrival) (counts, sample) {
 			res.Sent++
 		}
 		res.Responses[response]++
+		if set && response == ok {
+			timings.stored++
+		}
 		if !l.background && !set && response == ok {
 			timings.online = append(timings.online, end.Sub(job.at))
 			timings.rtt = append(timings.rtt, end.Sub(began))
@@ -330,7 +337,14 @@ func runCurve(t target, profile string, rate int, window, tick time.Duration) (r
 		}
 		lanes[i] = lane{client: c, load: load, profile: profile, background: i >= ordinary}
 	}
-	return runLanes(lanes, rate, window, tick), nil
+	if t.redis {
+		return runLanes(lanes, rate, window, tick), nil
+	}
+	admin := &http.Client{Timeout: time.Second}
+	before := readRuntime(admin)
+	loadResult := runLanes(lanes, rate, window, tick)
+	loadResult.RuntimeBefore, loadResult.RuntimeAfter = before, readRuntime(admin)
+	return loadResult, nil
 }
 
 func runLanes(lanes []lane, rate int, window, tick time.Duration) result {
@@ -379,6 +393,7 @@ func runLanes(lanes []lane, rate int, window, tick time.Duration) result {
 		}
 		online = append(online, timings[i].online...)
 		rtt = append(rtt, timings[i].rtt...)
+		aggregate.StoredSETs += timings[i].stored
 	}
 	slices.Sort(online)
 	slices.Sort(rtt)
