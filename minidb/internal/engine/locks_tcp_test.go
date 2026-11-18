@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -24,7 +25,14 @@ func TestTCPMultiRowLockLoad(t *testing.T) {
 	}
 	t.Run("disjoint", func(t *testing.T) {
 		_, pool, drain := openLockLoad(t)
-		const orders = 140
+		orders := 140
+		if raw := os.Getenv("MINIDB_LOCK_ORDERS"); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n <= 0 {
+				t.Fatalf("invalid MINIDB_LOCK_ORDERS %q", raw)
+			}
+			orders = n
+		}
 		start := make(chan struct{})
 		done := make(chan lockLoadResult, 2)
 		for worker := range 2 {
@@ -64,7 +72,7 @@ func TestTCPMultiRowLockLoad(t *testing.T) {
 		reportLockSQL(t, "disjoint", samples)
 		reportLockWAL(t, drain(), 2*orders)
 		for sku := 1; sku <= 4; sku++ {
-			if qty := readQty(t, pool, "select qty from lock_stock where id = ?", sku); qty != orders {
+			if qty := readQty(t, pool, "select qty from lock_stock where id = ?", sku); qty != int64(orders) {
 				t.Fatalf("stock %d has quantity %d", sku, qty)
 			}
 		}
